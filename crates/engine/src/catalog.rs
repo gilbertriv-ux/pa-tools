@@ -17,6 +17,7 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("File > Export > Sibelius...", "file.export_sibelius"),
     ("File > Send To... > Sibelius", "file.send_to_sibelius"),
     ("View > Transport > Ableton Link", "view.transport_ableton_link"),
+    ("View > Clip > ARA Note Overlay", "view.clip_ara_note_overlay"),
     ("Edit > Can't Undo", "edit.undo"),
     ("Edit > Can't Redo", "edit.redo"),
     ("Edit > Selection > Play Edit", "transport.play_selection"),
@@ -123,6 +124,22 @@ mod tests {
         for (path, id) in ALIASES.iter().chain(crate::catalog_more::ALIASES_MORE.iter()) {
             assert!(crate::find_command(id).is_some(), "{path} → unknown {id}");
             assert!(catalog().contains(path), "alias for unknown catalog entry {path}");
+        }
+    }
+
+    #[test]
+    fn renamed_commands_still_count_for_their_catalog_entries() {
+        for (path, id) in [
+            ("File > Export > Sibelius...", "file.export_sibelius"),
+            ("File > Send To... > Sibelius", "file.send_to_sibelius"),
+            ("View > Transport > Ableton Link", "view.transport_ableton_link"),
+            ("View > Clip > ARA Note Overlay", "view.clip_ara_note_overlay"),
+        ] {
+            assert_eq!(implemented_by(path, &[]).as_deref(), Some(id), "{path}");
+            let spec = crate::find_command(id).expect("command exists");
+            for mark in ["Sibelius", "Ableton", "ARA"] {
+                assert!(!spec.label.contains(mark), "{id} is labelled {:?}", spec.label);
+            }
         }
     }
 

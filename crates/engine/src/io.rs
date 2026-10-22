@@ -28,7 +28,7 @@ pub(crate) fn at_rate(mut buf: AudioBuffer, rate: u32, limit: usize) -> Option<A
 // ─── Checked file access ──────────────────────────────────────────────────────────────────────
 //
 // Every file a command names by path is read and written through the helpers below, so the
-// automation roots (`crate::file_access`, `soundcraft-cli mcp --automation-read-root` and
+// automation roots (`crate::file_access`, `pa-tools-cli mcp --automation-read-root` and
 // `--automation-write-root`) are checked in one place. A test in `file_access` keeps the rest of
 // the engine from calling `std::fs` itself. Audio is decoded into the session's pool the moment it
 // enters it (import, open, sampler load), so playback and bounce read nothing from disk and

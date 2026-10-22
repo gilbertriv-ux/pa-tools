@@ -148,7 +148,7 @@ pub fn specs() -> Vec<CommandSpec> {
         flag!("view.clip_gain_line", "Clip Gain Line", ["View", "Clip"], "view.clip.gain_line"),
         flag!("view.clip_gain_info", "Clip Gain Info", ["View", "Clip"], "view.clip.gain_info"),
         flag!("view.clip_effects_status", "Clip Effects Status", ["View", "Clip"], "view.clip.effects_status"),
-        flag!("view.clip_ara_note_overlay", "ARA Note Overlay", ["View", "Clip"], "view.clip.ara_note_overlay"),
+        flag!("view.clip_ara_note_overlay", "Note Overlay", ["View", "Clip"], "view.clip.ara_note_overlay"),
         radio!("view.clip_time_current", "Current Time", ["View", "Clip"], "view.clip.time.current", CLIP_TIME),
         radio!("view.clip_time_original", "Original Time Stamp", ["View", "Clip"], "view.clip.time.original", CLIP_TIME),
         radio!("view.clip_time_user", "User Time Stamp", ["View", "Clip"], "view.clip.time.user", CLIP_TIME),
