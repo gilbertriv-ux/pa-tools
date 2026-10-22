@@ -40,6 +40,7 @@ mod vst3;
 mod zoom_toggle;
 
 pub use file::bounce_job;
+pub use transcribe::{MAX_TRANSCRIPT_WORDS, TranscribeJob, TranscribeOutcome, transcribe_job};
 
 pub(crate) use edit::remember_selection;
 
