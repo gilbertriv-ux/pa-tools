@@ -6,8 +6,13 @@ Claude wires the engine/model/UI around this seam; Codex builds the crate to mat
 
 ## Crate identity
 - Directory `crates/pa-speech`, package **`soundcraft-pa-speech`**, short name `pa-speech`.
-- **Standalone, layer 0.** No `soundcraft-*` or `filmcraft-*` dependency. (The donor depends on
-  `filmcraft-time` and `filmcraft-project`; both are **inlined** here — see types below.)
+- **Standalone, layer 0.** No `soundcraft-*` or `filmcraft-*` dependency. The donor's only workspace
+  deps are **`filmcraft-time`** (`Tick`, `TICKS_PER_SECOND`) and **`filmcraft-project`** (`Transcript`,
+  `Word`, `Speaker`) — no `filmcraft-audio-io`, so `downmix(&[Vec<f32>]) -> Vec<f32>` and
+  `load(&Path, &str)` are already `f32`/path-pure. **Inline both crates throughout the port** — not just
+  `lib.rs`, but also `whisper/mod.rs`, `vad.rs` and `diarize.rs`, which all `use filmcraft_project::…` /
+  `filmcraft_time::…`. If any ported code reaches for another workspace type, inline it the same way
+  (times as `f64` seconds); add no `filmcraft-*`/`soundcraft-*` dependency.
 - `#![forbid(unsafe_code)]` (candle is pure Rust).
 
 ## Public API (port faithfully; inline the time/transcript types)
@@ -78,6 +83,15 @@ Do **not** add `pa-speech` to `UI_CRATES`, `EXEMPT`, or the `WASM` list (candle 
 ## Model
 Default id `whisper-base` (`openai/whisper-base` on HuggingFace, MIT). Don't commit weights — `.gitignore`
 them, document the download in the crate README.
+
+## Parity — the honest expectation (do not fabricate a +1)
+The incumbent menu tree in `crates/engine/catalog/menus.txt` already carries three transcription leaves:
+`Setup > Transcription Settings...` and `View > Track Transcription Lane` are **already implemented**
+(`setup.transcription_settings`, `view.track_transcription_lane`); `Window > Transcript` is **unimplemented**.
+There is **no "Transcribe" menu leaf** — actual speech-to-text is a new capability beyond the incumbent's tree.
+So: the `transcribe` engine command + MCP tool add real capability but flip **no** menu-parity leaf on their own
+(record 0 for them). Building the **Transcript window** (Claude's UI lane) is what flips `Window > Transcript`
+→ +1 at the app level. Record the delta that actually occurs; never invent a +1.
 
 ## Lane boundary
 Codex edits only `crates/pa-speech/**`, `ATTRIBUTION.md`, the one root-`Cargo.toml` members/deps line, and the
