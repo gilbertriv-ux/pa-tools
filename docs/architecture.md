@@ -2,11 +2,11 @@
 
 > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (delay compensation includes the master faders' inserts (#351); previously minor: bounces stream to disk) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
-SoundCraft is a Cargo workspace of small crates with enforced layering (`cargo xtask layers`).
+Pa Tools is a Cargo workspace of small crates with enforced layering (`cargo xtask layers`).
 Nothing below the UI knows about egui, so the interface can be replaced.
 
 The UI package pins `craft-ui` for common icon-button and track record-enable interactions.
-SoundCraft supplies each state's colors, border, radius and icon painter; selection and command
+Pa Tools supplies each state's colors, border, radius and icon painter; selection and command
 dispatch remain in the toolbar and track controls. The single-shape frame option preserves the
 existing fill/border blending when controls are disabled. Specialized transport Play/Stop/Record styling,
 nonlinear meters, faders, pan gestures, fonts and the live theme resolver remain local. Shared adapters read the current palette. The UI
@@ -21,7 +21,7 @@ L3  mix                                         (the mix engine)
 L4  engine      playback                        (commands, undo, I/O · audio devices)
 L5  automation                                  (MCP server, control-channel client)
 L6  ui-egui                                     (the user interface)
-    apps: soundcraft (desktop) · soundcraft-cli · soundcraft-web (wasm)
+    apps: soundcraft (desktop, binary pa-tools) · soundcraft-cli (binary pa-tools-cli) · soundcraft-web (wasm)
 ```
 
 ## The document
@@ -71,7 +71,7 @@ by the UI thread (see README › Logs).
 ## Agent control
 
 The desktop app's control channel (JSON lines over TCP) exposes engine commands, inspection,
-synthetic input and screenshots; `soundcraft-cli mcp` wraps either a headless engine or a running
+synthetic input and screenshots; `pa-tools-cli mcp` wraps either a headless engine or a running
 app as an MCP server. See `control-protocol.md` and `mcp.md`.
 
 ## Revision history

@@ -8,7 +8,7 @@
   Pa Tools, and Pa Tools offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
 
-  UpgradeCode and the component GUIDs are Pa Tools' own (not SoundCraft's): they must never change
+  UpgradeCode and the component GUIDs are Pa Tools' own (not upstream SoundCraft's): they must never change
   once a release is out, or Windows treats the next MSI as a different product.
   The ARP links point at the placeholder homepage (rebrand.sh HOMEPAGE).
 -->

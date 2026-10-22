@@ -1,9 +1,17 @@
 # Release playbook
 
-The release playbook shared by every crafting app lives in craftrules:
-[`../craftrules/release/playbook.md`](../../craftrules/release/playbook.md)
-(`storytold/craftrules`). It is the canonical copy; don't duplicate it here.
+Pa Tools has no separate shared playbook: the release procedure is [releasing.md](releasing.md).
+It builds on the playbook of the project Pa Tools is based on (upstream SoundCraft, whose own
+playbook lives in a repository that is not part of this tree).
 
-SoundCraft's implementation (`.github/workflows/release.yml`, `packaging/`,
-`cargo xtask version`) was copied from DesignCraft/PhotoCraft and renamed. SoundCraft-specific
-details are in [releasing.md](releasing.md).
+The Pa Tools specifics, in short:
+
+- Artifacts are built by the scripts in `packaging/` (macOS, Windows, Linux, FreeBSD, web); the
+  GitHub workflows are thin callers of reusable workflows that still have to be vendored
+  ([ci-notes-patools.md](ci-notes-patools.md)).
+- The version lives in one place, `[workspace.package] version` in the root `Cargo.toml`
+  (`cargo xtask version`).
+- The brand (name, ids, binaries, vendor, homepage) is set in `rebrand.sh` and `packaging/env.sh`.
+- Signing material is Gil's own and is never committed (macOS Developer ID and notarization
+  credentials, Windows certificate or Azure Trusted Signing); without it the builds are ad-hoc
+  signed on macOS and unsigned on Windows, which is fine for local use.

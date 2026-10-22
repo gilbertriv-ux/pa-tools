@@ -1,19 +1,25 @@
-# Releasing SoundCraft
+# Releasing Pa Tools
+
+> **Status (Pa Tools):** the workflows in `.github/workflows/` still call reusable workflows of the
+> upstream project, which are not part of this tree, so a push to `release` does not build anything
+> yet. What has to be vendored is listed in [ci-notes-patools.md](ci-notes-patools.md); until then
+> build the artifacts locally with the `packaging/` scripts. The description below is how the
+> release is meant to run once the workflows are in place.
 
 Every push to the `release` branch runs `.github/workflows/release.yml`. The workflow builds
 signed installers for macOS, Windows, Linux, FreeBSD and the web, then creates or updates a
-**draft** GitHub Release named `SoundCraft v<version>`. Nobody sees a draft until a maintainer
+**draft** GitHub Release named `Pa Tools v<version>`. Nobody sees a draft until a maintainer
 publishes it.
 
-This is SoundCraft's implementation of the shared [release playbook](release-playbook.md).
-User-facing names say **SoundCraft**. Files, binaries and ids stay lowercase
-(`soundcraft-<version>-<platform>-<arch>.<ext>`, `ai.storyteller.soundcraft`).
+This is Pa Tools' implementation of the shared [release playbook](release-playbook.md).
+User-facing names say **Pa Tools**. Files, binaries and ids stay lowercase
+(`patools-<version>-<platform>-<arch>.<ext>`, `com.imagescouture.patools`).
 
 ## Cutting a release
 
 1. **Bump the version** on `main`. The only place it lives is `[workspace.package] version` in
-   the root `Cargo.toml`; the app reads it from `CARGO_PKG_VERSION` (*About SoundCraft*,
-   `soundcraft --version`, `soundcraft-cli --version`).
+   the root `Cargo.toml`; the app reads it from `CARGO_PKG_VERSION` (*About Pa Tools*,
+   `pa-tools --version`, `pa-tools-cli --version`).
 
    ```sh
    cargo xtask version                 # prints the current version, e.g. 0.1.0
@@ -23,7 +29,7 @@ User-facing names say **SoundCraft**. Files, binaries and ids stay lowercase
    Commit the change (`Cargo.toml` + `Cargo.lock`) through the normal review flow.
 2. **Merge `main` into `release`** (or fast-forward it) and push. The workflow starts by itself.
 3. **Wait for the draft.** After about 30 to 60 minutes (notarization and the FreeBSD VM are the
-   slow parts), the Releases page has a draft `SoundCraft v0.2.0`, tagged `v0.2.0` on the pushed
+   slow parts), the Releases page has a draft `Pa Tools v0.2.0`, tagged `v0.2.0` on the pushed
    commit, with every artifact and `SHA256SUMS.txt`. The notes are generated from the merged PRs.
 4. **Check it.** Download an installer or two and look at the job summaries. Any `::warning::`
    there means a signing secret was missing and that artifact is unsigned.
@@ -44,25 +50,25 @@ web build and are checked, the signing jobs are refused, and no release is draft
 
 | Platform | Artifacts | Built on |
 |---|---|---|
-| macOS 11+ (universal: Apple silicon + Intel) | `soundcraft-<v>-macos-universal.dmg`, `soundcraft-cli-<v>-macos-universal.zip` | `macos-15` |
-| Windows 10+ x64 | `soundcraft-<v>-windows-x64.msi`, `soundcraft-<v>-windows-x64-portable.zip` | `windows-latest` |
-| Windows 10+ x86 (32-bit) | `soundcraft-<v>-windows-x86.msi`, `soundcraft-<v>-windows-x86-portable.zip` | `windows-latest` |
-| Windows 11 ARM64 | `soundcraft-<v>-windows-arm64.msi`, `soundcraft-<v>-windows-arm64-portable.zip` | `windows-latest` (cross-compiled; `windows-arm64.yml` installs and runs it on ARM64) |
-| Linux x86_64 | `soundcraft-<v>-linux-x86_64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04` |
-| Linux aarch64 | `soundcraft-<v>-linux-aarch64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04-arm` |
-| Linux riscv64 | `soundcraft-<v>-linux-riscv64.tar.gz` (glibc 2.39+) | `ubuntu-24.04` (cross-compiled; CLI smoke-tested under QEMU) |
-| AppImage updates | `soundcraft-<v>-linux-{x86_64,aarch64}.AppImage.zsync` | with the AppImage |
-| Flatpak x86_64, aarch64 | `soundcraft-<v>-linux-{x86_64,aarch64}.flatpak` | `ubuntu-24.04`, `ubuntu-24.04-arm` (repackages the Linux tarball) |
-| FreeBSD 14 x86_64 | `soundcraft-<v>-freebsd-x86_64.tar.gz` (a `/usr/local` tree) | FreeBSD 14.3 VM on `ubuntu-latest` |
-| Web | `soundcraft-web-<v>.zip` (static site; see [`packaging/web/README.md`](../packaging/web/README.md)) | `ubuntu-latest` |
+| macOS 11+ (universal: Apple silicon + Intel) | `patools-<v>-macos-universal.dmg`, `pa-tools-cli-<v>-macos-universal.zip` | `macos-15` |
+| Windows 10+ x64 | `patools-<v>-windows-x64.msi`, `patools-<v>-windows-x64-portable.zip` | `windows-latest` |
+| Windows 10+ x86 (32-bit) | `patools-<v>-windows-x86.msi`, `patools-<v>-windows-x86-portable.zip` | `windows-latest` |
+| Windows 11 ARM64 | `patools-<v>-windows-arm64.msi`, `patools-<v>-windows-arm64-portable.zip` | `windows-latest` (cross-compiled; `windows-arm64.yml` installs and runs it on ARM64) |
+| Linux x86_64 | `patools-<v>-linux-x86_64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04` |
+| Linux aarch64 | `patools-<v>-linux-aarch64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04-arm` |
+| Linux riscv64 | `patools-<v>-linux-riscv64.tar.gz` (glibc 2.39+) | `ubuntu-24.04` (cross-compiled; CLI smoke-tested under QEMU) |
+| AppImage updates | `patools-<v>-linux-{x86_64,aarch64}.AppImage.zsync` | with the AppImage |
+| Flatpak x86_64, aarch64 | `patools-<v>-linux-{x86_64,aarch64}.flatpak` | `ubuntu-24.04`, `ubuntu-24.04-arm` (repackages the Linux tarball) |
+| FreeBSD 14 x86_64 | `patools-<v>-freebsd-x86_64.tar.gz` (a `/usr/local` tree) | FreeBSD 14.3 VM on `ubuntu-latest` |
+| Web | `patools-web-<v>.zip` (static site; see [`packaging/web/README.md`](../packaging/web/README.md)) | `ubuntu-latest` |
 
-The from-source Flatpak manifest (`packaging/linux/flatpak/ai.storyteller.soundcraft.yml`) is
+The from-source Flatpak manifest (`packaging/linux/flatpak/com.imagescouture.patools.yml`) is
 kept ready for a Flathub submission; the release's `.flatpak` bundles come from
-`ai.storyteller.soundcraft.bundle.yml` (see Linux below).
+`com.imagescouture.patools.bundle.yml` (see Linux below).
 
 ### Audio libraries
 
-SoundCraft plays and records through [cpal](https://github.com/RustAudio/cpal): CoreAudio on
+Pa Tools plays and records through [cpal](https://github.com/RustAudio/cpal): CoreAudio on
 macOS, WASAPI on Windows, ALSA on Linux and FreeBSD (PulseAudio and PipeWire through their ALSA
 plugins), and WebAudio in the browser.
 
@@ -74,39 +80,42 @@ plugins), and WebAudio in the browser.
   silent clock, so the transport still runs.
 - **Flatpak**: alsa-lib and its PulseAudio plugin come with the freedesktop runtime; the
   manifests grant `--socket=pulseaudio` (PipeWire's pulse server answers on it). No raw ALSA
-  devices and no JACK: SoundCraft doesn't use either.
+  devices and no JACK: Pa Tools doesn't use either.
 - **Web**: browsers start audio only after a user gesture, so the first click in the page may be
   needed before sound plays. The web build has no recording.
 
 ### macOS
 
 `packaging/macos/package.sh` builds `aarch64-apple-darwin` and `x86_64-apple-darwin` with
-`MACOSX_DEPLOYMENT_TARGET=11.0`, joins them with `lipo`, and assembles `SoundCraft.app`:
+`MACOSX_DEPLOYMENT_TARGET=11.0`, joins them with `lipo`, and assembles `Pa Tools.app`:
 
-- `Info.plist` is generated from `Info.plist.in`. The bundle id is `ai.storyteller.soundcraft`.
-  It declares the `.scraft` session type (`ai.storyteller.soundcraft.session`, MIME
-  `application/x-soundcraft-session`, role Editor, rank Owner) and lists WAV, AIFF/AIFC, FLAC,
-  MP3 and MIDI as Viewer/Alternate, so SoundCraft appears under *Open With* without taking over
+- `Info.plist` is generated from `Info.plist.in`. The bundle id is `com.imagescouture.patools`.
+  It declares the `.scraft` session type (`com.imagescouture.patools.session`, MIME
+  `application/x-patools-session`, role Editor, rank Owner) and lists WAV, AIFF/AIFC, FLAC,
+  MP3 and MIDI as Viewer/Alternate, so Pa Tools appears under *Open With* without taking over
   the default player. `NSMicrophoneUsageDescription` explains the recording prompt.
 - **Signing** goes inside-out with the hardened runtime and a secure timestamp. The executable is
   signed first, then the bundle. There's no `--deep` on the final signature. `entitlements.plist`
-  holds a single exception, `com.apple.security.device.audio-input`, without which the hardened
-  runtime blocks recording.
+  holds two exceptions, each with its reason in the file: `com.apple.security.device.audio-input`,
+  without which the hardened runtime blocks recording, and
+  `com.apple.security.cs.disable-library-validation`, without which the hardened runtime (which an
+  ad-hoc signature also enables) refuses third-party VST3, CLAP and Audio Unit bundles (gap G-05).
 - **Notarization:** the app is zipped and sent with `xcrun notarytool submit --wait`, then the
   ticket is stapled to the app. The app goes on a DMG (`hdiutil`, with an `Applications` link).
   The DMG is signed, notarized and stapled too.
   Its Finder window (background, icon size and positions) comes from
-  [`packaging/macos/dmg/`](../packaging/macos/dmg/README.md), and its volume is named `SoundCraft`
+  [`packaging/macos/dmg/`](../packaging/macos/dmg/README.md), and its volume is named `Pa Tools`
   without the version, which the window's background needs; the DMG file name keeps the version.
-- **CLI:** the universal `soundcraft-cli` is signed with the hardened runtime, zipped and
-  notarized.
+- **CLI:** the universal `pa-tools-cli` is signed with the hardened runtime and the same
+  entitlements file (it hosts the same plugins headless), zipped and notarized.
 
 Locally, without certificates, the script signs ad-hoc (`codesign -s -`) and skips notarization:
 
 ```sh
 packaging/macos/package.sh                    # universal; needs both rustup targets
-packaging/macos/package.sh --arch aarch64     # quicker, host-only
-open dist/release/soundcraft-*-macos-*.dmg
+packaging/macos/package.sh --arch aarch64     # quicker, Apple silicon only
+packaging/macos/package.sh --arch x86_64      # Intel only (an Intel Mac, or Apple silicon with the x86_64 target)
+open dist/release/patools-*-macos-*.dmg
 ```
 
 ### Windows
@@ -115,17 +124,17 @@ open dist/release/soundcraft-*-macos-*.dmg
 (in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, so host build scripts aren't affected), so neither the MSI
 nor the portable zip needs the Visual C++ redistributable.
 
-- `apps/soundcraft/build.rs` embeds the icon (`assets/app-icon/soundcraft.ico`) and VERSIONINFO
+- `apps/soundcraft/build.rs` embeds the icon (`assets/app-icon/patools.ico`) and VERSIONINFO
   with `winresource`, only when targeting Windows. Release packaging sets
   `SOUNDCRAFT_REQUIRE_WINRES=1` so a missing resource compiler fails the build.
-- The script checks both PE headers: the machine type matches `-Arch`, `soundcraft.exe` is a GUI
-  app (no console window) and `soundcraft-cli.exe` a console app.
-- `soundcraft.wxs` (WiX v5) is a per-machine install into Program Files with an advertised Start
-  Menu shortcut. SoundCraft becomes the default app for `.scraft` and is listed under *Open with*
+- The script checks both PE headers: the machine type matches `-Arch`, `pa-tools.exe` is a GUI
+  app (no console window) and `pa-tools-cli.exe` a console app.
+- `patools.wxs` (WiX v5) is a per-machine install into Program Files with an advertised Start
+  Menu shortcut. Pa Tools becomes the default app for `.scraft` and is listed under *Open with*
   for `.wav`, `.aif`, `.aiff`, `.flac`, `.mp3`, `.mid` and `.midi`. It also registers App Paths
-  (Win+R `soundcraft`). The MSI version is the numeric `X.Y.Z`; same-version upgrades let release
-  candidates replace each other. The upgrade code `EE53D3E5-D0AE-40F9-808D-9417FDEBF61A` is fixed
-  forever.
+  (Win+R `pa-tools`). The MSI version is the numeric `X.Y.Z`; same-version upgrades let release
+  candidates replace each other. The upgrade code `1DEA60C7-CB3B-4232-ACD0-EA511738486C` is Pa Tools' own, not upstream's, and is
+  fixed forever.
 - **Signing:** `packaging/windows/sign.ps1` signs both `.exe` files and then the `.msi` with
   `signtool` (SHA-256, RFC 3161 timestamp), using a `.pfx` (`WINDOWS_CERTIFICATE*`) if present,
   otherwise Azure Trusted Signing (all six `AZURE_*`), otherwise nothing (a warning).
@@ -136,27 +145,27 @@ Locally on Windows: `dotnet tool install -g wix --version 5.0.2`, then
 ### Linux
 
 `packaging/linux/package.sh` stages one FHS tree and makes every format from it: both binaries,
-`ai.storyteller.soundcraft.desktop` (with `MimeType=` for sessions, WAV, AIFF, FLAC, MP3 and
+`com.imagescouture.patools.desktop` (with `MimeType=` for sessions, WAV, AIFF, FLAC, MP3 and
 MIDI), hicolor icons from 16 px to 512 px plus a scalable SVG, AppStream metainfo, and a
-shared-mime-info file declaring `application/x-soundcraft-session` (`*.scraft`).
+shared-mime-info file declaring `application/x-patools-session` (`*.scraft`).
 
 - **AppImage** (maintained `AppImage/appimagetool`, static runtime: no libfuse2 needed). Each
   embeds the update information
-  `gh-releases-zsync|storytold|soundcraft|latest|soundcraft-*-linux-<arch>.AppImage.zsync`, and
+  `gh-releases-zsync|gilbertriv-ux|pa-tools|latest|patools-*-linux-<arch>.AppImage.zsync`, and
   the `.zsync` next to it (written when `zsyncmake` from the `zsync` package is installed, as in
   CI) lets AppImageUpdate fetch only the changed blocks of the newest non-pre-release.
 - **.deb** and **.rpm** by [nfpm](https://nfpm.goreleaser.com/) from one `nfpm.yaml`; the
   `postinst.sh` hook refreshes the desktop, MIME and icon caches.
 - **.tar.gz** for people who manage their own `/opt` or `~/.local`.
 - **Flatpak**: the `flatpak` job runs `packaging/linux/flatpak-bundle.sh` on the Linux job's
-  tarball (no Rust build) with `flatpak/ai.storyteller.soundcraft.bundle.yml`, then installs the
-  bundle and runs `soundcraft-cli --version` in the sandbox. Install with
-  `flatpak install --user soundcraft-<v>-linux-<arch>.flatpak`. Both manifests use the freedesktop
+  tarball (no Rust build) with `flatpak/com.imagescouture.patools.bundle.yml`, then installs the
+  bundle and runs `pa-tools-cli --version` in the sandbox. Install with
+  `flatpak install --user patools-<v>-linux-<arch>.flatpak`. Both manifests use the freedesktop
   25.08 runtime with Wayland/X11, `dri`, PulseAudio and `xdg-music`; other files go through the
   portals. For the VST3 and CLAP hosts they grant `~/.vst3` and `~/.clap` read-only and mount
   Flathub's `org.freedesktop.LinuxAudio.Plugins` extensions (pointed to by `VST3_PATH` and
   `CLAP_PATH`); system plugin folders aren't visible in the sandbox.
-  `ai.storyteller.soundcraft.yml` builds from source for Flathub and needs vendored crates
+  `com.imagescouture.patools.yml` builds from source for Flathub and needs vendored crates
   (`cargo-sources.json` from `flatpak-cargo-generator.py`); the commands are in its header.
 
 Binaries are built on Ubuntu 22.04 and need **glibc ≥ 2.35**. X11, Wayland, xkbcommon, Vulkan
@@ -169,7 +178,7 @@ Locally (on Linux): install nfpm, then `packaging/linux/package.sh` (or `--forma
 GitHub has no FreeBSD runners, so the `freebsd` job builds inside a FreeBSD 14.3 VM
 (`vmactions/freebsd-vm`, pinned by commit) and runs `packaging/freebsd/package.sh`, which stages
 a `/usr/local`-style tree (binaries, desktop entry, MIME type, metainfo, icons, docs) as a
-`.tar.gz`. Install with `tar -xzf soundcraft-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local`.
+`.tar.gz`. Install with `tar -xzf patools-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local`.
 `.github/workflows/freebsd.yml` builds and tests the workspace there on every push to `main`.
 
 ### Web
@@ -190,27 +199,32 @@ are written with `umask 077` and deleted in `always()`/`finally` steps.
 
 | Secret | Used for |
 |---|---|
-| `APPLE_CERTIFICATE` | base64 `.p12` with "Developer ID Application: Learning Machines LLC (DJ6XS33FX8)" |
+| `APPLE_CERTIFICATE` | base64 `.p12` with Gil's own "Developer ID Application" certificate (needs an Apple Developer account; upstream's certificate is not usable) |
 | `APPLE_CERTIFICATE_PASSWORD` | password for that `.p12` |
 | `KEYCHAIN_PASSWORD` | password for the temporary CI keychain (random if unset) |
 | `APPLE_ID` | Apple ID used by `notarytool` |
 | `APPLE_PASSWORD` | app-specific password for that Apple ID |
-| `APPLE_TEAM_ID` | `DJ6XS33FX8` |
-| `WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD` | base64 `.pfx` (unused: Windows uses Azure) |
+| `APPLE_TEAM_ID` | the team id of that Apple Developer account |
+| `WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD` | base64 `.pfx` code-signing certificate (the simplest option for Pa Tools) |
 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | service principal for Azure Trusted Signing |
 | `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE` | Trusted Signing endpoint, account and profile |
 
-`GITHUB_TOKEN` creates the release. Only the final job gets `contents: write`. Provisioning the
-environment, ruleset and secrets for a new repo: craftrules `release/signing-setup.md`.
+`GITHUB_TOKEN` creates the release. Only the final job gets `contents: write`. For a new repository,
+create the `release` environment, restrict it to the `release` branch and add the secrets above as
+needed. Without any of them the builds are ad-hoc signed (macOS) or unsigned (Windows). Never commit
+signing material.
 
 ## Icons
 
-`assets/app-icon/icon.svg` is the canonical icon: a **placeholder** singing nightingale, drawn as
-original SVG in the three-colour icon palette (ink, paper, SoundCraft teal `#14a9c4`); see
-`assets/app-icon/README.md`. `packaging/icons.sh` regenerates the 1024 px PNG, the macOS 512 px
-window icon, the `.icns`, the `.ico` (packed by `cargo xtask ico`) and the hicolor PNGs from it.
-It needs `resvg`, plus `iconutil` on macOS. The outputs are committed, so packaging never needs
-those tools. `apps/soundcraft/src/main.rs` sets the runtime window/Dock/taskbar icon from them.
+`assets/app-icon/icon.svg` is the canonical icon: an original gold "Pa" wordmark over a waveform on
+a black tile, with small "TOOLS" lettering, in three colours (black `#0b0b0c`, gold `#C8A24B`, silver
+`#D8D4C8`); see `assets/app-icon/README.md`. `packaging/icons.sh` regenerates the 1024 px PNG
+(`patools-1024.png`), the macOS 512 px window icon (`patools-macos-512.png`), the `Pa Tools.iconset`
+folder and `Pa Tools.icns`, `patools.ico` and the hicolor PNGs from it. It needs `resvg` and python3
+(`packaging/icons.py` packs the `.ico` and, without macOS, the `.icns`; `iconutil` makes the
+canonical `.icns` on a Mac, and `ICO_PACKER=xtask` uses `cargo xtask ico`). The outputs are
+committed, so packaging never needs those tools. `apps/soundcraft/src/main.rs` sets the runtime
+window/Dock/taskbar icon from them.
 
 ## Checks
 

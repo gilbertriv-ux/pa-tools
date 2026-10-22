@@ -1,8 +1,8 @@
-# Target-app parity: SoundCraft vs Avid Pro Tools
+# Target-app parity: Pa Tools vs Avid Pro Tools
 
 > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (hours to ~95 % for each audience; full number confirmed as an additive weighted sum) · **Target:** Avid Pro Tools Ultimate 2026.4.1 (bundle 26.4.1.179, macOS)
 
-The authoritative assessment of how close SoundCraft is to Pro Tools. [`ROADMAP.md`](../ROADMAP.md)
+The authoritative assessment of how close Pa Tools is to Pro Tools. [`ROADMAP.md`](../ROADMAP.md)
 summarizes it, [`gaps.md`](gaps.md) itemizes every shortfall, and the per-dimension docs go deeper:
 [`ui-parity.md`](ui-parity.md), [`file-format-parity.md`](file-format-parity.md),
 [`hardware-parity.md`](hardware-parity.md), [`plugin-parity.md`](plugin-parity.md),
@@ -91,12 +91,12 @@ post-production, tracking) can switch. "Ready" is depth, correctness and fidelit
 | AI features | 1 % | **~5 %** | estimated | 30–50 | [gaps.md](gaps.md) | Pro Tools has speech-to-text transcription (upgraded in 2026.4); we have only an audio-to-MIDI pitch tracker |
 | **Weighted** | 100 % | **~40 %** | | **~950–1,450** (overlaps removed) | | |
 
-Agent control is not weighted (Pro Tools has only its scripting SDK); SoundCraft is ahead there:
+Agent control is not weighted (Pro Tools has only its scripting SDK); Pa Tools is ahead there:
 every command is reachable from the CLI, the JSON control channel and MCP.
 
 ## Mainstream practitioner and essentials user
 
-Both use the method in craftrules `standards/progress-docs.md`. Each multiplies a weighted depth
+Both use the same method. Each multiplies a weighted depth
 average by written-down discounts. Depths come from the [Feature areas](#feature-areas) table and
 the evidence there; issue numbers are `storytold/soundcraft` GitHub issues.
 

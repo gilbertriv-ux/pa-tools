@@ -12,7 +12,7 @@
 #   CARGO_TARGET_DIR        cargo's target dir (default: $ROOT/target)
 #
 # The SOUNDCRAFT_* variable names are upstream's and stay (UPSTREAM.md): scripts and CI written for
-# SoundCraft keep working. Cargo package names (`-p soundcraft`, `-p soundcraft-cli`) also stay;
+# upstream SoundCraft keep working. Cargo package names (`-p soundcraft`, `-p soundcraft-cli`) also stay;
 # only the binaries they produce are renamed (`pa-tools`, `pa-tools-cli`, set by [[bin]] in
 # apps/soundcraft*/Cargo.toml).
 
