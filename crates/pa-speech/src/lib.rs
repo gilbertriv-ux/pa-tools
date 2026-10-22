@@ -12,6 +12,8 @@
 //!   own transcript); words past the clip's end are dropped. No model.
 //! - [`models`]: the catalogue of downloadable Whisper models (source pinned to a revision,
 //!   SHA-256, size, licence) and where they live. Weights are **never** bundled or committed.
+//! - [`discover`]: finds installed model weights at run time ([`ModelSearch`], [`resolve_models_dir`]):
+//!   `$PA_SPEECH_MODELS_DIR`, then the app bundle's resources, then the user's application data folder.
 //! - [`load`]: builds the Whisper transcriber (feature `whisper`).
 //!
 //! Feature `whisper` adds candle Whisper inference (`whisper/`), the log-mel front end (`mel`),
@@ -21,6 +23,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod discover;
 pub mod models;
 
 #[cfg(feature = "whisper")]
@@ -35,6 +38,8 @@ mod tick;
 mod vad;
 #[cfg(feature = "whisper")]
 pub mod whisper;
+
+pub use discover::{ModelSearch, Platform, resolve_models_dir};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +90,9 @@ pub enum SpeechError {
     Cancelled,
     #[error("the speech model `{0}` is not downloaded")]
     NotInstalled(String),
+    /// No searched folder has the model; the text names the model and every place looked in.
+    #[error("{0}")]
+    ModelUnavailable(String),
     #[error("unknown speech model `{0}`")]
     UnknownModel(String),
     #[error("speech-to-text is not available in this build ({0})")]
