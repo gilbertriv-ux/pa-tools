@@ -742,9 +742,12 @@ impl SoundApp {
         self.panic_rev = self.engine.revision;
         let saved = self.engine.is_dirty() && self.write_autosave();
         self.ui.status = if saved {
-            "SoundCraft hit an internal error (see the log). Your changes were autosaved: save them, then restart SoundCraft.".into()
+            format!(
+                "{app} hit an internal error (see the log). Your changes were autosaved: save them, then restart {app}.",
+                app = soundcraft_brand::APP_NAME
+            )
         } else {
-            "SoundCraft hit an internal error (see the log). Restart SoundCraft to be safe.".into()
+            format!("{app} hit an internal error (see the log). Restart {app} to be safe.", app = soundcraft_brand::APP_NAME)
         };
     }
 
@@ -845,12 +848,14 @@ impl SoundApp {
         let (cause, then) = match trouble {
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
-                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
+                format!("Use Reconnect audio device in Setup ▸ Playback Engine, or restart {}.", soundcraft_brand::APP_NAME),
             ),
             OutputTrouble::Gone => {
-                (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")
+                (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.".to_string())
             }
-            OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine."),
+            OutputTrouble::Stalled => {
+                (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine.".to_string())
+            }
         };
         let (recording, playing) = (self.engine.transport.recording, self.engine.transport.playing);
         if recording || playing {

@@ -1,7 +1,8 @@
-//! The About window's credits: every contributor (GitHub login always; display and real names only
-//! with recorded consent) and the AI models that helped. The tables are baked into the binary by
+//! The About window's credits: every contributor to the open-source code Pa Tools is based on, by
+//! GitHub login only, and the AI models that helped. The tables are baked into the binary by
 //! build.rs from contributors/contributors.json (craftrules standards/contributors.md); nothing is
-//! read at run time.
+//! read at run time. Display and real names exist in the data model but build.rs never fills them:
+//! the consent behind them covered the upstream project's own About window.
 
 use std::cmp::Ordering;
 
@@ -215,13 +216,6 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
     let id = egui::Id::new("credits_view");
     let mut v = ui.data_mut(|d| d.get_temp::<View>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label("Show");
-        for m in NameMode::ALL {
-            if ui.selectable_label(v.names == m, m.label()).clicked() {
-                v.names = m;
-            }
-        }
-        ui.separator();
         ui.label("Sort");
         egui::ComboBox::from_id_salt("credits_sort").selected_text(v.key.label().0).show_ui(ui, |ui| {
             for k in SortKey::ALL {
@@ -243,7 +237,16 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
         }
     });
     let list = sorted(CONTRIBUTORS, v.names, v.key, v.ascending);
-    ui.label(RichText::new(format!("{} contributors · {} commits", list.len(), group(TOTAL_COMMITS))).small().weak());
+    ui.label(
+        RichText::new(format!(
+            "{} contributors to the open-source code {} is based on, by GitHub username · {} commits",
+            list.len(),
+            soundcraft_brand::APP_NAME,
+            group(TOTAL_COMMITS)
+        ))
+        .small()
+        .weak(),
+    );
     ui.separator();
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         if list.is_empty() {

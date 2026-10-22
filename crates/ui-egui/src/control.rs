@@ -129,14 +129,27 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             v["edit_layout"] = json!(app.edit_layout);
             ok(v)
         }
-        "ui.menu.list" => ok(json!(
-            soundcraft_engine::catalog::catalog()
-                .iter()
-                .map(|e| json!({"path": e, "command": soundcraft_engine::catalog::implemented_by(e, &crate::menus::ui_aliases())}))
-                .collect::<Vec<_>>()
-        )),
+        "ui.menu.list" => {
+            // `path` is the incumbent's catalog path (the parity measure compares against it);
+            // `shown_as` is the Pa Tools menu path when the menu names the item differently.
+            let aliases = crate::menus::parity_aliases();
+            ok(json!(
+                soundcraft_engine::catalog::catalog()
+                    .iter()
+                    .map(|e| {
+                        let mut item = json!({"path": e, "command": soundcraft_engine::catalog::implemented_by(e, &aliases)});
+                        let shown = crate::menus::display_path(e);
+                        if shown != *e {
+                            item["shown_as"] = json!(shown);
+                        }
+                        item
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        }
         "ui.menu.invoke" => {
-            let path = p.get("path").and_then(Value::as_str).unwrap_or("");
+            // Either spelling of a renamed item works: the catalog path or the path the menu shows.
+            let path = crate::menus::display_path(p.get("path").and_then(Value::as_str).unwrap_or(""));
             let id = p
                 .get("id")
                 .and_then(Value::as_str)

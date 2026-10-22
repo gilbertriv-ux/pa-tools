@@ -23,7 +23,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.narrow_mix", "Narrow Mix", "View > Narrow Mix", Some("Cmd+Alt+M")),
     ("window.session_info", "Session Info", "", None),
     ("window.audio_health", "Session Audio Health", "", None),
-    ("window.about", "About SoundCraft", "", None),
+    ("window.about", "About Pa Tools", "", None),
     ("window.close", "Close Window", "Window > Close Window", Some("Cmd+W")),
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
@@ -40,7 +40,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.midi_keyboard", "MIDI Keyboard", "Window > MIDI Keyboard", Some("Shift+K")),
     ("window.workspace", "Workspace", "Window > New Workspace > Default", Some("Alt+I")),
     ("window.workspace_presets", "Workspace", "Window > New Workspace > Track Presets", None),
-    ("window.workspace_sounds", "Workspace", "Window > New Workspace > Soundbase", None),
+    ("window.workspace_sounds", "Workspace", "Window > New Workspace > Sound Browser", None),
     ("window.workspace_front", "Workspaces to Front", "Window > Workspaces > Bring to Front", Some("Alt+J")),
     ("window.workspace_close", "Close All Workspaces", "Window > Workspaces > Close All Workspaces", None),
     ("window.configurations", "Window Configuration List", "Window > Configurations > Window Configuration List", Some("Cmd+Alt+J")),
@@ -57,7 +57,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
     ("window.clip_effects", "Clip Effects", "Window > Clip Effects", None),
     ("window.clip_effects_dock", "Clip Effects", "View > Other Displays > Lower Dock > Clip Effects", Some("Alt+6")),
-    ("window.search", "Search", "Window > Pro Tools Search", Some("Cmd+Ctrl+S")),
+    ("window.search", "Search", "Window > Pa Tools Search", Some("Cmd+Ctrl+S")),
     ("window.score", "Score Editor", "Window > Score Editor", Some("Cmd+Ctrl+=")),
     ("window.beat_detective", "Beat Detective", "", None),
     ("window.tempo_ops", "Tempo Operations", "", None),
@@ -75,13 +75,74 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("ui.theme", "Appearance", "", None),
 ];
 
-/// Extra catalog mappings handled by the UI layer.
+/// Extra mappings handled by the UI layer, keyed by the paths the Pa Tools menu shows (see [`RENAMED`]).
+/// Menu rendering, the native menu bar and menu-style invocation use these.
 pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&str, &str)> = UI_COMMANDS.iter().filter(|c| !c.2.is_empty()).map(|c| (c.2, c.0)).collect();
     v.extend(mix_view_aliases().iter().copied());
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
     v.extend(MENU_WINDOWS.iter().copied());
     v
+}
+
+/// The same mappings keyed by the incumbent's catalog paths. Only the parity accounting
+/// (`engine.parity`, `ui.menu.list`) uses these: the catalog stays factual, so the measure compares
+/// the menu tree of the target with what we implement, whatever we call the items.
+pub fn parity_aliases() -> Vec<(&'static str, &'static str)> {
+    let mut v: Vec<(&str, &str)> = UI_COMMANDS.iter().filter(|c| !c.2.is_empty()).map(|c| (catalog_path(c.2), c.0)).collect();
+    v.extend(mix_view_aliases().iter().copied());
+    v.extend(PARITY_ALIASES.iter().copied());
+    v.extend(MENU_WINDOWS.iter().copied());
+    v
+}
+
+/// The path the Pa Tools menu shows for a catalog path (the same path when it is not renamed).
+pub fn display_path(catalog_path: &str) -> &str {
+    RENAMED.iter().find(|(c, _)| *c == catalog_path).map_or(catalog_path, |(_, d)| *d)
+}
+
+/// The catalog path behind a path the Pa Tools menu shows (the same path when it is not renamed).
+pub fn catalog_path(menu_path: &str) -> &str {
+    RENAMED.iter().find(|(_, d)| *d == menu_path).map_or(menu_path, |(c, _)| *c)
+}
+
+/// Names of other companies' products and trademarks. A catalog leaf that carries one and that no
+/// command implements is left out of the menu bar; the catalog and the parity report keep it.
+const THIRD_PARTY_MARKS: &[&str] = &[
+    "Dolby",
+    "Atmos",
+    "Melodyne",
+    "Splice",
+    "SoundFlow",
+    "HEAT",
+    "Sketch",
+    "Media Composer",
+    "Avid",
+    "Pro Tools",
+    "Sibelius",
+    "Ableton",
+    "Soundbase",
+];
+
+/// Whether a menu label carries another company's product name or trademark (`ARA` counts as a whole word).
+pub fn is_third_party_mark(label: &str) -> bool {
+    THIRD_PARTY_MARKS.iter().any(|m| label.contains(m)) || label.split(|c: char| !c.is_alphanumeric()).any(|w| w == "ARA")
+}
+
+/// Catalog leaves the menu bar leaves out: unimplemented and named after someone else's product.
+/// Decided once, from static data.
+fn hidden_leaves() -> &'static std::collections::HashSet<&'static str> {
+    static HIDDEN: std::sync::OnceLock<std::collections::HashSet<&'static str>> = std::sync::OnceLock::new();
+    HIDDEN.get_or_init(|| {
+        let aliases = parity_aliases();
+        catalog::catalog()
+            .into_iter()
+            .filter(|line| {
+                let shown = display_path(line);
+                is_third_party_mark(shown.rsplit(" > ").next().unwrap_or(shown)) && catalog::implemented_by(line, &aliases).is_none()
+            })
+            .collect()
+    })
 }
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
@@ -113,28 +174,30 @@ fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
     })
 }
 
-/// AudioSuite catalog entries → our processes (functional equivalents, our own plugins).
+/// AudioSuite menu entries → our processes (functional equivalents, our own plugins, our own names).
+/// Keyed by the path the Pa Tools menu shows; [`RENAMED`] and [`PARITY_ALIASES`] hold the incumbent's
+/// catalog paths for the same entries.
 pub const AUDIOSUITE: &[(&str, &str)] = &[
     ("AudioSuite > EQ > Channel Strip", "channel_strip"),
-    ("AudioSuite > EQ > EQ3 1-Band", "eq_1band"),
-    ("AudioSuite > EQ > EQ3 7-Band", "eq_7band"),
-    ("AudioSuite > Dynamics > BF-76", "compressor"),
+    ("AudioSuite > EQ > Pa EQ 1-Band", "eq_1band"),
+    ("AudioSuite > EQ > Pa EQ 7-Band", "eq_7band"),
+    ("AudioSuite > Dynamics > Pa Comp 76", "compressor"),
     ("AudioSuite > Dynamics > Channel Strip", "channel_strip"),
-    ("AudioSuite > Dynamics > Dyn3 Compressor/Limiter", "compressor"),
-    ("AudioSuite > Dynamics > Dyn3 De-Esser", "de_esser"),
-    ("AudioSuite > Dynamics > Dyn3 Expander/Gate", "expander_gate"),
-    ("AudioSuite > Dynamics > Maxim", "maximizer"),
-    ("AudioSuite > Pitch Shift > Pitch II", "pitch_shift"),
-    ("AudioSuite > Pitch Shift > Pitch Shift Legacy", "pitch_shift"),
+    ("AudioSuite > Dynamics > Pa Dynamics Compressor/Limiter", "compressor"),
+    ("AudioSuite > Dynamics > Pa De-Esser", "de_esser"),
+    ("AudioSuite > Dynamics > Pa Expander/Gate", "expander_gate"),
+    ("AudioSuite > Dynamics > Pa Maximizer", "maximizer"),
+    ("AudioSuite > Pitch Shift > Pa Pitch", "pitch_shift"),
+    ("AudioSuite > Pitch Shift > Pa Pitch Shift (classic)", "pitch_shift"),
     ("AudioSuite > Pitch Shift > Time Shift", "time_stretch"),
-    ("AudioSuite > Pitch Shift > Vari-Fi", "varispeed"),
-    ("AudioSuite > Reverb > D-Verb", "room_reverb"),
-    ("AudioSuite > Delay > Mod Delay III", "mod_delay"),
-    ("AudioSuite > Modulation > Sci-Fi", "flanger"),
-    ("AudioSuite > Harmonic > Eleven Lite", "saturator"),
+    ("AudioSuite > Pitch Shift > Pa Varispeed", "varispeed"),
+    ("AudioSuite > Reverb > Pa Reverb", "room_reverb"),
+    ("AudioSuite > Delay > Pa Mod Delay", "mod_delay"),
+    ("AudioSuite > Modulation > Pa Flanger FX", "flanger"),
+    ("AudioSuite > Harmonic > Pa Amp Drive", "saturator"),
     ("AudioSuite > Harmonic > Lo-Fi", "lofi"),
-    ("AudioSuite > Harmonic > Recti-Fi", "rectifier"),
-    ("AudioSuite > Harmonic > SansAmp PSA-1", "saturator"),
+    ("AudioSuite > Harmonic > Pa Rectifier", "rectifier"),
+    ("AudioSuite > Harmonic > Pa Saturator", "saturator"),
     ("AudioSuite > Other > DC Offset Removal", "dc_offset_removal"),
     ("AudioSuite > Other > Duplicate", "duplicate"),
     ("AudioSuite > Other > Gain", "gain"),
@@ -143,6 +206,68 @@ pub const AUDIOSUITE: &[(&str, &str)] = &[
     ("AudioSuite > Other > Reverse", "reverse"),
     ("AudioSuite > Other > Signal Generator", "signal_generator"),
     ("AudioSuite > Other > Time Compression Expansion", "time_stretch"),
+];
+
+/// Menu entries the incumbent's catalog names with someone else's product or trademark, which the Pa
+/// Tools menu shows under its own name: (catalog path, Pa Tools menu path). The catalog itself
+/// (`crates/engine/catalog/menus.txt`) is factual data about the target and stays untouched, so the
+/// parity measure still compares like with like; [`display_path`] and [`catalog_path`] translate.
+pub const RENAMED: &[(&str, &str)] = &[
+    ("AudioSuite > EQ > EQ3 1-Band", "AudioSuite > EQ > Pa EQ 1-Band"),
+    ("AudioSuite > EQ > EQ3 7-Band", "AudioSuite > EQ > Pa EQ 7-Band"),
+    ("AudioSuite > Dynamics > BF-76", "AudioSuite > Dynamics > Pa Comp 76"),
+    ("AudioSuite > Dynamics > Dyn3 Compressor/Limiter", "AudioSuite > Dynamics > Pa Dynamics Compressor/Limiter"),
+    ("AudioSuite > Dynamics > Dyn3 De-Esser", "AudioSuite > Dynamics > Pa De-Esser"),
+    ("AudioSuite > Dynamics > Dyn3 Expander/Gate", "AudioSuite > Dynamics > Pa Expander/Gate"),
+    ("AudioSuite > Dynamics > Maxim", "AudioSuite > Dynamics > Pa Maximizer"),
+    ("AudioSuite > Pitch Shift > Pitch II", "AudioSuite > Pitch Shift > Pa Pitch"),
+    ("AudioSuite > Pitch Shift > Pitch Shift Legacy", "AudioSuite > Pitch Shift > Pa Pitch Shift (classic)"),
+    ("AudioSuite > Pitch Shift > Vari-Fi", "AudioSuite > Pitch Shift > Pa Varispeed"),
+    ("AudioSuite > Reverb > D-Verb", "AudioSuite > Reverb > Pa Reverb"),
+    ("AudioSuite > Delay > Mod Delay III", "AudioSuite > Delay > Pa Mod Delay"),
+    ("AudioSuite > Modulation > Sci-Fi", "AudioSuite > Modulation > Pa Flanger FX"),
+    ("AudioSuite > Harmonic > Eleven Lite", "AudioSuite > Harmonic > Pa Amp Drive"),
+    ("AudioSuite > Harmonic > Recti-Fi", "AudioSuite > Harmonic > Pa Rectifier"),
+    ("AudioSuite > Harmonic > SansAmp PSA-1", "AudioSuite > Harmonic > Pa Saturator"),
+    ("File > Export > Sibelius...", "File > Export > Notation Program (MusicXML)..."),
+    ("File > Send To... > Sibelius", "File > Send To... > Notation Program"),
+    ("View > Transport > Ableton Link", "View > Transport > Link Sync"),
+    ("View > Clip > ARA Note Overlay", "View > Clip > Note Overlay"),
+    ("Window > New Workspace > Soundbase", "Window > New Workspace > Sound Browser"),
+    ("Window > Pro Tools Search", "Window > Pa Tools Search"),
+];
+
+/// The AudioSuite entries under their catalog paths, for the parity accounting only. The menu itself
+/// uses [`AUDIOSUITE`]; counting these keeps "implemented / 512" honest after the renames.
+pub const PARITY_ALIASES: &[(&str, &str)] = &[
+    ("AudioSuite > EQ > Channel Strip", "audiosuite.process"),
+    ("AudioSuite > EQ > EQ3 1-Band", "audiosuite.process"),
+    ("AudioSuite > EQ > EQ3 7-Band", "audiosuite.process"),
+    ("AudioSuite > Dynamics > BF-76", "audiosuite.process"),
+    ("AudioSuite > Dynamics > Channel Strip", "audiosuite.process"),
+    ("AudioSuite > Dynamics > Dyn3 Compressor/Limiter", "audiosuite.process"),
+    ("AudioSuite > Dynamics > Dyn3 De-Esser", "audiosuite.process"),
+    ("AudioSuite > Dynamics > Dyn3 Expander/Gate", "audiosuite.process"),
+    ("AudioSuite > Dynamics > Maxim", "audiosuite.process"),
+    ("AudioSuite > Pitch Shift > Pitch II", "audiosuite.process"),
+    ("AudioSuite > Pitch Shift > Pitch Shift Legacy", "audiosuite.process"),
+    ("AudioSuite > Pitch Shift > Time Shift", "audiosuite.process"),
+    ("AudioSuite > Pitch Shift > Vari-Fi", "audiosuite.process"),
+    ("AudioSuite > Reverb > D-Verb", "audiosuite.process"),
+    ("AudioSuite > Delay > Mod Delay III", "audiosuite.process"),
+    ("AudioSuite > Modulation > Sci-Fi", "audiosuite.process"),
+    ("AudioSuite > Harmonic > Eleven Lite", "audiosuite.process"),
+    ("AudioSuite > Harmonic > Lo-Fi", "audiosuite.process"),
+    ("AudioSuite > Harmonic > Recti-Fi", "audiosuite.process"),
+    ("AudioSuite > Harmonic > SansAmp PSA-1", "audiosuite.process"),
+    ("AudioSuite > Other > DC Offset Removal", "audiosuite.process"),
+    ("AudioSuite > Other > Duplicate", "audiosuite.process"),
+    ("AudioSuite > Other > Gain", "audiosuite.process"),
+    ("AudioSuite > Other > Invert", "audiosuite.process"),
+    ("AudioSuite > Other > Normalize", "audiosuite.process"),
+    ("AudioSuite > Other > Reverse", "audiosuite.process"),
+    ("AudioSuite > Other > Signal Generator", "audiosuite.process"),
+    ("AudioSuite > Other > Time Compression Expansion", "audiosuite.process"),
 ];
 
 /// Commands that open a dialog when invoked from a menu (programmatic calls never do).
@@ -198,8 +323,11 @@ fn insert_path(roots: &mut Vec<MenuNode>, line: &str) {
 
 pub fn tree() -> Vec<MenuNode> {
     let mut roots: Vec<MenuNode> = Vec::new();
+    let hidden = hidden_leaves();
     for line in catalog::catalog() {
-        insert_path(&mut roots, line);
+        if !hidden.contains(line) {
+            insert_path(&mut roots, display_path(line));
+        }
     }
     insert_path(&mut roots, "Window > Reset Panel Layout");
     // Not in the observed catalog either; Pro Tools lists it right under Identify Sync Point.
@@ -225,8 +353,8 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
         ui,
         |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("SoundCraft", |ui| {
-                    if ui.button("About SoundCraft").clicked() {
+                ui.menu_button(soundcraft_brand::APP_NAME, |ui| {
+                    if ui.button(format!("About {}", soundcraft_brand::APP_NAME)).clicked() {
                         app.ui.show_about = true;
                     }
                     if ui.button("Session Info").clicked() {
@@ -425,12 +553,15 @@ fn params_for(path: &str, id: &str) -> Value {
         "clip.rating" => json!({"rating": leaf.parse::<u8>().unwrap_or(0)}),
         "track.change_width" => json!({"format": leaf}),
         "view.mix_section" => json!({"section": mix_section_id(leaf)}),
-        "audiosuite.process" => json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == path).map_or("", |(_, x)| *x)}),
+        "audiosuite.process" => {
+            let shown = display_path(path);
+            json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == shown).map_or("", |(_, x)| *x)})
+        }
         _ => json!({}),
     }
 }
 
-/// Menu items that open a SoundCraft window when clicked (programmatic calls still run the command).
+/// Menu items that open a Pa Tools window when clicked (programmatic calls still run the command).
 const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > Appearance", "window.ui_customization"),
     ("Setup > Hardware...", "window.playback_engine"),
@@ -462,6 +593,7 @@ pub fn live_label(app: &SoundApp, id: Option<&str>) -> Option<String> {
 
 /// Menu-style invocation: may open a dialog.
 pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
+    let path = display_path(path);
     if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path)
         && w.starts_with("window.")
     {
@@ -691,7 +823,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
 
 /// Parity including UI-layer commands.
 pub fn parity() -> Value {
-    let extra = ui_aliases();
+    let extra = parity_aliases();
     catalog::parity_with(&extra)
 }
 
@@ -699,6 +831,210 @@ pub fn parity() -> Value {
 mod tests {
     use super::*;
     use crate::{Services, SoundApp};
+
+    fn leaves(nodes: &[MenuNode], out: &mut Vec<String>) {
+        for n in nodes {
+            if n.children.is_empty() {
+                out.push(n.path.clone());
+            } else {
+                leaves(&n.children, out);
+            }
+        }
+    }
+
+    fn labels(nodes: &[MenuNode], out: &mut Vec<String>) {
+        for n in nodes {
+            out.push(n.label.clone());
+            labels(&n.children, out);
+        }
+    }
+
+    /// App-level parity (engine plus UI aliases) before the rebrand: 482 / 512. It only ever rises.
+    const PARITY_FLOOR: u64 = 482;
+
+    /// Incumbent plug-in and product names that must not reach a Pa Tools menu.
+    const INCUMBENT_NAMES: &[&str] = &[
+        "EQ3",
+        "BF-76",
+        "Dyn3",
+        "Maxim",
+        "Pitch II",
+        "Pitch Shift Legacy",
+        "Vari-Fi",
+        "D-Verb",
+        "Mod Delay III",
+        "Sci-Fi",
+        "Eleven",
+        "Recti-Fi",
+        "SansAmp",
+        "Sibelius",
+        "Ableton",
+        "Soundbase",
+        "Pro Tools",
+        "Melodyne",
+        "Dolby",
+        "Avid",
+        "SoundCraft",
+        "ArtCraft",
+    ];
+
+    /// `name` appears in `text` as a whole word ("Maxim" is not in "Maximizer").
+    fn mentions(text: &str, name: &str) -> bool {
+        text.match_indices(name).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    }
+
+    #[test]
+    fn renamed_entries_are_consistent_with_the_catalog() {
+        let catalog = catalog::catalog();
+        for (cat, shown) in RENAMED {
+            assert!(catalog.contains(cat), "{cat} is not a catalog entry");
+            assert!(!catalog.contains(shown), "{shown} must not be a catalog entry");
+            assert_eq!(display_path(cat), *shown);
+            assert_eq!(catalog_path(shown), *cat);
+            assert!(!is_third_party_mark(shown), "{shown} still names a third party");
+        }
+        assert_eq!(display_path("File > Save Session"), "File > Save Session", "unrenamed paths pass through");
+        assert_eq!(catalog_path("File > Save Session"), "File > Save Session");
+        assert_eq!((AUDIOSUITE.len(), PARITY_ALIASES.len()), (28, 28));
+        for ((shown, process), (cat, id)) in AUDIOSUITE.iter().zip(PARITY_ALIASES) {
+            assert!(catalog.contains(cat), "{cat} is not a catalog entry");
+            assert_eq!(*id, "audiosuite.process");
+            assert_eq!(display_path(cat), *shown, "AUDIOSUITE and PARITY_ALIASES list the same entries in the same order");
+            assert!(!process.is_empty());
+        }
+        // 16 incumbent AudioSuite names, the 6 other renames in `RENAMED`.
+        assert_eq!(RENAMED.len(), 22);
+        assert_eq!(RENAMED.iter().filter(|(c, _)| c.starts_with("AudioSuite")).count(), 16);
+    }
+
+    #[test]
+    fn audiosuite_menu_shows_only_our_own_names() {
+        for (shown, _) in AUDIOSUITE {
+            for bad in INCUMBENT_NAMES {
+                assert!(!mentions(shown, bad), "{shown} contains {bad}");
+            }
+        }
+        let mut shown = Vec::new();
+        leaves(&tree(), &mut shown);
+        for process in ["AudioSuite > EQ > Pa EQ 1-Band", "AudioSuite > Harmonic > Pa Saturator", "AudioSuite > Pitch Shift > Pa Varispeed"] {
+            assert!(shown.iter().any(|p| p == process), "{process} missing from the menu");
+        }
+        assert!(!shown.iter().any(|p| p.contains("D-Verb") || p.contains("SansAmp")));
+        assert!(mentions("AudioSuite > Dynamics > Maxim", "Maxim") && !mentions("Pa Maximizer", "Maxim"));
+    }
+
+    #[test]
+    fn the_menu_tree_carries_no_third_party_marks() {
+        let mut all = Vec::new();
+        labels(&tree(), &mut all);
+        for label in &all {
+            assert!(!is_third_party_mark(label), "menu label {label:?} names a third party");
+            for bad in INCUMBENT_NAMES {
+                assert!(!mentions(label, bad), "menu label {label:?} contains {bad}");
+            }
+        }
+        // The same filter keeps ordinary items: nothing implemented was dropped.
+        let mut shown = Vec::new();
+        leaves(&tree(), &mut shown);
+        let hidden = hidden_leaves();
+        let mut list: Vec<&str> = hidden.iter().copied().collect();
+        list.sort_unstable();
+        let mut expected = vec![
+            "Clip > ARA Plugins > Melodyne",
+            "Edit > Automation > Duplicate Dolby Atmos Plugin Automation to Pan Automation",
+            "Edit > Automation > Duplicate Pan Automation to Dolby Atmos Plugin Automation",
+            "File > Export > Selected Tracks as New Media Composer Compatible Session...",
+            "File > Open > Sketch...",
+            "Options > Activate HEAT",
+            "Track > ARA Plugins > Melodyne",
+            "View > Mix Window Views > HEAT",
+            "Window > ARA Plugins",
+            "Window > Collaboration > Pro Tools Projects",
+            "Window > Sketch to Front",
+            "Window > SoundFlow",
+            "Window > Splice",
+        ];
+        expected.sort_unstable();
+        assert_eq!(list, expected, "the leaves left out of the menu bar");
+        for path in hidden {
+            assert!(catalog::implemented_by(path, &parity_aliases()).is_none(), "{path} is implemented but hidden");
+        }
+        let kept = catalog::catalog().iter().filter(|c| !hidden.contains(*c)).count();
+        // Catalog leaves shown, plus the UI-only items `tree()` adds beyond the catalog.
+        assert!(shown.len() >= kept, "{} shown, {kept} expected", shown.len());
+        for implemented in [
+            "File > Export > Notation Program (MusicXML)...",
+            "File > Send To... > Notation Program",
+            "View > Transport > Link Sync",
+            "View > Clip > Note Overlay",
+        ] {
+            assert!(shown.iter().any(|p| p == implemented), "{implemented} missing");
+            assert!(command_for_path(implemented, &ui_aliases()).is_some(), "{implemented} lost its command");
+        }
+        for window in ["Window > Pa Tools Search", "Window > New Workspace > Sound Browser"] {
+            assert!(command_for_path(window, &ui_aliases()).is_some(), "{window} lost its command");
+        }
+    }
+
+    #[test]
+    fn third_party_marks_are_found() {
+        for label in
+            ["Dolby Atmos Plugin", "Activate HEAT", "Sketch...", "Splice", "SoundFlow", "Pro Tools Projects", "Melodyne", "ARA Plugins", "Soundbase"]
+        {
+            assert!(is_third_party_mark(label), "{label}");
+        }
+        for label in ["Link Sync", "Pa Tools Search", "Notation Program", "Heat Map", "Paragraph", "Gain", "Track Color", "AUDIO"] {
+            assert!(!is_third_party_mark(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn renaming_does_not_lower_the_parity_measure() {
+        let catalog = catalog::catalog();
+        let aliases = parity_aliases();
+        for (cat, _) in PARITY_ALIASES {
+            assert_eq!(catalog::implemented_by(cat, &aliases).as_deref(), Some("audiosuite.process"), "{cat}");
+        }
+        for cat in
+            ["File > Export > Sibelius...", "File > Send To... > Sibelius", "View > Transport > Ableton Link", "View > Clip > ARA Note Overlay"]
+        {
+            assert!(catalog::implemented_by(cat, &aliases).is_some(), "{cat} stopped counting");
+        }
+        for cat in ["Window > Pro Tools Search", "Window > New Workspace > Soundbase"] {
+            assert!(catalog::implemented_by(cat, &aliases).is_some(), "{cat} stopped counting");
+        }
+        let p = parity();
+        assert_eq!(p["total"], catalog.len());
+        assert_eq!(p["total"], 512, "the catalog is untouched");
+        assert!(p["implemented"].as_u64().unwrap() >= PARITY_FLOOR, "app-level parity regressed: {}", p["implemented"]);
+        // The menu-facing aliases are keyed by our names, so they do not count catalog items by themselves.
+        let by_display = catalog::parity_with(&ui_aliases());
+        assert!(by_display["implemented"].as_u64().unwrap() < p["implemented"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn both_spellings_of_a_renamed_audiosuite_item_run_the_same_process() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        invoke_menu(&mut app, "audiosuite.process", "AudioSuite > Harmonic > SansAmp PSA-1");
+        assert_eq!(app.ui.audiosuite.as_deref(), Some("saturator"));
+        app.ui.audiosuite = None;
+        invoke_menu(&mut app, "audiosuite.process", "AudioSuite > Harmonic > Pa Saturator");
+        assert_eq!(app.ui.audiosuite.as_deref(), Some("saturator"));
+        invoke_menu(&mut app, "audiosuite.process", "AudioSuite > Dynamics > Pa Maximizer");
+        assert_eq!(app.ui.audiosuite.as_deref(), Some("maximizer"));
+    }
+
+    #[test]
+    fn the_about_item_carries_the_product_name() {
+        let about = UI_COMMANDS.iter().find(|c| c.0 == "window.about").map(|c| c.1);
+        assert_eq!(about, Some(format!("About {}", soundcraft_brand::APP_NAME).as_str()));
+        let search = UI_COMMANDS.iter().find(|c| c.0 == "window.search").map(|c| c.2);
+        assert_eq!(search, Some("Window > Pa Tools Search"));
+    }
 
     #[test]
     fn mix_view_aliases_are_allocated_once() {
