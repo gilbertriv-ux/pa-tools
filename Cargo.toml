@@ -8,7 +8,7 @@ version = "0.11.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
-repository = "https://github.com/storytold/soundcraft"
+repository = "https://github.com/gilbertriv-ux/pa-tools"  # placeholder until the repo exists; upstream: https://github.com/storytold/soundcraft
 
 [workspace.dependencies]
 # internal
