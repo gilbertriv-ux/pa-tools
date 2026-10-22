@@ -3,7 +3,7 @@
 use crate::clip::{bound, bound_sequence};
 use crate::{
     Bus, BusId, ChannelFormat, Clip, ClipId, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
-    TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
+    TRACK_COLORS, Track, TrackId, TrackKind, Transcript, VideoSource,
 };
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
@@ -317,6 +317,9 @@ pub struct Session {
     pub outputs: Vec<OutputPath>,
     pub markers: Vec<MemoryLocation>,
     pub groups: Vec<Group>,
+    /// Per-track speech transcripts (Text ▸ Transcript), produced by `soundcraft-pa-speech`.
+    #[serde(default)]
+    pub transcripts: Vec<Transcript>,
     pub edit: EditState,
     pub next_id: u64,
     #[serde(default)]
@@ -358,6 +361,7 @@ impl Session {
             outputs: vec![OutputPath { name: "Out 1-2".into(), first_channel: 0, format: ChannelFormat::Stereo }],
             markers: Vec::new(),
             groups: Vec::new(),
+            transcripts: Vec::new(),
             edit: EditState::default(),
             next_id: 1,
             comments: String::new(),
@@ -411,6 +415,20 @@ impl Session {
     }
     pub fn marker(&self, id: MarkerId) -> Option<&MemoryLocation> {
         self.markers.iter().find(|m| m.id == id)
+    }
+
+    /// The transcript for `track`, if one has been produced.
+    pub fn transcript(&self, track: TrackId) -> Option<&Transcript> {
+        self.transcripts.iter().find(|t| t.track == track)
+    }
+
+    /// Store `t`, replacing any existing transcript for the same track.
+    pub fn set_transcript(&mut self, t: Transcript) {
+        if let Some(existing) = self.transcripts.iter_mut().find(|x| x.track == t.track) {
+            *existing = t;
+        } else {
+            self.transcripts.push(t);
+        }
     }
 
     /// Find a clip anywhere (active playlists).

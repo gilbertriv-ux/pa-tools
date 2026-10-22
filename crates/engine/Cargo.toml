@@ -18,6 +18,7 @@ soundcraft-vst3-host.workspace = true
 soundcraft-au-host.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
+soundcraft-pa-speech.workspace = true
 soundcraft-video.workspace = true
 serde.workspace = true
 serde_json.workspace = true

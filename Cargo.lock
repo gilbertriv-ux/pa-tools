@@ -3680,6 +3680,7 @@ dependencies = [
  "soundcraft-midi",
  "soundcraft-mix",
  "soundcraft-model",
+ "soundcraft-pa-speech",
  "soundcraft-time",
  "soundcraft-video",
  "soundcraft-vst3-host",

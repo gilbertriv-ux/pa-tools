@@ -1,3 +1,15 @@
+> **CURRENT STATE — read first (updated after the skeleton + wiring landed).**
+> `crates/pa-speech` ALREADY EXISTS on this branch as a compiling, tested skeleton: the seam types
+> below, `FixedTranscriber`, `downmix`, `word_error_rate`, the pinned model `catalogue` in
+> `models.rs`, a gated `load()`, the no-model test, README and `.gitignore`. It is clippy-clean and
+> `cargo xtask layers` passes. The engine/model wiring (the `track.transcribe` command + the
+> `Transcript` store in `crates/model`) is also built and green. **Codex's remaining job is the
+> feature-gated FLESH-OUT, not creating the crate:** port the donor's `whisper/` module + `mel.rs` +
+> `vad.rs` + `diarize.rs` behind the `whisper` feature (converting the donor's `Tick` times to this
+> crate's `f64` seconds), the HTTPS downloader behind the `download` feature, and the gated
+> `whisper_model` test. Do NOT recreate the seam types or change their public shapes — the engine
+> depends on them. Everything below is the fixed contract.
+
 # G-18 seam — `crates/pa-speech` (authoritative contract for the Codex port)
 
 This file is the exact contract the Codex assistant builds to. It was derived by reading the
