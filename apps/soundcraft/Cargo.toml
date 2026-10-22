@@ -1,11 +1,16 @@
 [package]
 name = "soundcraft"
-description = "SoundCraft desktop app"
+description = "Pa Tools desktop app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-default-run = "soundcraft"
+default-run = "pa-tools"
+
+# The shipped executable is `pa-tools`; the package keeps its upstream name so merges stay small.
+[[bin]]
+name = "pa-tools"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -15,6 +20,7 @@ workspace = true
 asio = ["soundcraft-playback/asio"]
 
 [dependencies]
+soundcraft-brand.workspace = true
 soundcraft-engine.workspace = true
 soundcraft-ui-egui.workspace = true
 soundcraft-playback.workspace = true
@@ -27,7 +33,8 @@ log.workspace = true
 rfd.workspace = true
 
 [build-dependencies]
-# Icon + VERSIONINFO for soundcraft.exe; build.rs only uses it when the target is Windows.
+soundcraft-brand.workspace = true
+# Icon + VERSIONINFO for pa-tools.exe; build.rs only uses it when the target is Windows.
 winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

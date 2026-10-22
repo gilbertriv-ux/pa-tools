@@ -1,5 +1,5 @@
 //! Loopback JSON-lines control server: one request per line, one reply per line.
-//! This is the transport the MCP server (`soundcraft-cli mcp --connect PORT`) wraps.
+//! This is the transport the MCP server (`pa-tools-cli mcp --connect PORT`) wraps.
 //!
 //! Lines are bounded ([`MAX_LINE`]): a longer one is refused and the connection closed, without
 //! buffering the rest. So is the number of connections served at once ([`MAX_CONNECTIONS`]).
@@ -34,7 +34,9 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
     };
     let actual = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     log::info!("control server listening on 127.0.0.1:{actual}");
-    println!("SOUNDCRAFT_CONTROL_PORT={actual}");
+    println!("{}={actual}", soundcraft_brand::CONTROL_PORT_ENV);
+    // The upstream spelling, for scripts written before the rename.
+    println!("{}={actual}", soundcraft_brand::LEGACY_CONTROL_PORT_ENV);
     let spawned = std::thread::Builder::new().name("soundcraft-control".into()).spawn(move || accept_loop(listener, tx, ctx));
     if let Err(e) = spawned {
         log::error!("control thread failed: {e}");

@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-web"
-description = "SoundCraft in the browser (eframe web runner, WebGPU with WebGL2 fallback, WebAudio playback)"
+description = "Pa Tools in the browser (eframe web runner, WebGPU with WebGL2 fallback, WebAudio playback)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ name = "soundcraft-web"
 path = "src/main.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+soundcraft-brand = { workspace = true }
 soundcraft-engine = { workspace = true }
 soundcraft-ui-egui = { workspace = true }
 soundcraft-playback = { workspace = true }

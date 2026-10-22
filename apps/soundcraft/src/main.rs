@@ -1,12 +1,12 @@
-//! SoundCraft desktop app.
+//! Pa Tools desktop app (the `pa-tools` executable; the package keeps its upstream name `soundcraft`).
 //!
-//! Usage: `soundcraft [--demo] [--control <port>] [--no-audio] [session.scraft | audio files…]`
+//! Usage: `pa-tools [--demo] [--control <port>] [--no-audio] [session.scraft | audio files…]`
 //!
-//! `--control <port>` (or `SOUNDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server
+//! `--control <port>` (or `PATOOLS_CONTROL_PORT`, or the upstream `SOUNDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server
 //! (`0` picks a free port and prints it): `{"id":1,"method":"ui.inspect","params":{}}` →
 //! `{"id":1,"ok":true,"result":…}`. See `soundcraft_ui_egui::control` for the methods.
 //!
-//! `log` records go to standard error and `<settings dir>/logs/soundcraft.log` (`RUST_LOG` sets the
+//! `log` records go to standard error and `<settings dir>/logs/patools.log` (`RUST_LOG` sets the
 //! levels); see [`logging`].
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -74,16 +74,8 @@ impl eframe::App for App {
         }
         // With the system menu bar there is no egui bar showing the window and dirty state, so the
         // title carries them; elsewhere the egui menu bar already does.
-        let title = if self.0.native_menu_bar {
-            format!(
-                "{}{} — SoundCraft — {}",
-                self.0.engine.session().name,
-                if self.0.engine.is_dirty() { " *" } else { "" },
-                if self.0.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" }
-            )
-        } else {
-            format!("{} — SoundCraft", self.0.engine.session().name)
-        };
+        let front = if self.0.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" };
+        let title = soundcraft_brand::window_title(&self.0.engine.session().name, self.0.engine.is_dirty(), front, self.0.native_menu_bar);
         set_title(ctx, title);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -164,7 +156,7 @@ fn services() -> Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
-                "session.open" => d.add_filter("SoundCraft Session", &["scraft"]),
+                "session.open" => d.add_filter(soundcraft_brand::SESSION_LABEL, &["scraft"]),
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(
                     "Audio",
@@ -177,7 +169,7 @@ fn services() -> Services {
             let path = std::path::Path::new(default);
             let mut d = match purpose {
                 "file.bounce_mix" => rfd::FileDialog::new().add_filter("Audio", &["wav", "aif", "aiff", "flac"]),
-                _ => rfd::FileDialog::new().add_filter("SoundCraft Session", &["scraft"]),
+                _ => rfd::FileDialog::new().add_filter(soundcraft_brand::SESSION_LABEL, &["scraft"]),
             };
             if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
                 d = d.set_directory(dir);
@@ -197,9 +189,9 @@ fn services() -> Services {
 /// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
 fn app_icon() -> Option<egui::IconData> {
     #[cfg(target_os = "macos")]
-    let png: &[u8] = include_bytes!("../../../assets/app-icon/soundcraft-macos-512.png");
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/patools-macos-512.png");
     #[cfg(not(target_os = "macos"))]
-    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.soundcraft.png");
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/com.imagescouture.patools.png");
     eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
 }
 
@@ -209,7 +201,7 @@ fn main() -> eframe::Result {
     let logger = logging::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("SoundCraft {}", env!("CARGO_PKG_VERSION"));
+        println!("{} {}", soundcraft_brand::APP_NAME, env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let demo = args.iter().any(|a| a == "--demo" || a == "--sample");
@@ -219,14 +211,14 @@ fn main() -> eframe::Result {
         .position(|a| a == "--control")
         .and_then(|i| args.get(i + 1))
         .and_then(|p| p.parse().ok())
-        .or_else(|| std::env::var("SOUNDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok()));
+        .or_else(|| soundcraft_brand::control_port_env().and_then(|p| p.trim().parse().ok()));
     let files: Vec<String> = args
         .iter()
         .enumerate()
         .filter(|(i, a)| !(a.starts_with("--") || (i > &0 && args.get(i - 1).is_some_and(|p| p == "--control"))))
         .map(|(_, a)| a.clone())
         .collect();
-    log::info!("SoundCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    log::info!("{} {} ({} {})", soundcraft_brand::APP_NAME, env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     // The log file lives in the settings directory; opened after the arguments, so `--version`
     // leaves no file behind. Records logged until now are written to it first. Runs without
     // preferences (agents' test runs) log to standard error only, so they don't rotate away the
@@ -249,12 +241,12 @@ fn main() -> eframe::Result {
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SoundCraft")
+            .with_title(soundcraft_brand::APP_NAME)
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_maximized(prefs.window_maximized)
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("ai.storyteller.soundcraft"),
+            .with_app_id(soundcraft_brand::APP_ID),
         ..Default::default()
     };
     if let Some(icon) = app_icon() {
@@ -264,7 +256,7 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "windows")]
     graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
     eframe::run_native(
-        "SoundCraft",
+        soundcraft_brand::APP_NAME,
         options,
         Box::new(move |cc| {
             let player =
@@ -321,8 +313,9 @@ mod tests {
             out.textures_delta.clear();
             out.viewport_output.values().flat_map(|v| &v.commands).filter(|c| matches!(c, egui::ViewportCommand::Title(_))).count()
         };
-        assert_eq!(titles("Song — SoundCraft"), 1);
-        assert_eq!(titles("Song — SoundCraft"), 0);
-        assert_eq!(titles("Song * — SoundCraft"), 1);
+        let song = soundcraft_brand::window_title("Song", false, "Edit", false);
+        assert_eq!(titles(&song), 1);
+        assert_eq!(titles(&song), 0);
+        assert_eq!(titles(&soundcraft_brand::window_title("Song *", false, "Edit", false)), 1);
     }
 }
