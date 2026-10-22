@@ -2200,8 +2200,8 @@ mod tests {
     #[test]
     fn strings_are_bounded() {
         let mut b = [0u16; 4];
-        write_c16("Pa Tools", &mut b);
-        assert_eq!(read_c16(&b), "Pa ");
+        write_c16("Hello", &mut b);
+        assert_eq!(read_c16(&b), "Hel");
         let full: Vec<u16> = "abcd".encode_utf16().collect();
         assert_eq!(read_c16(&full), "abcd");
         let c: Vec<c_char> = b"Fx|EQ\0junk".iter().map(|&x| x as c_char).collect();
