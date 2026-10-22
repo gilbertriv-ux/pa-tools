@@ -355,14 +355,14 @@ fn repair_take(path: &Path, folders: &[PathBuf], channels: usize, rate: u32) -> 
     }
     let folder = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
     if !folder.is_some_and(|d| folders.contains(&d)) {
-        return Err(refuse("not in a folder SoundCraft records into"));
+        return Err(refuse(&format!("not in a folder {} records into", soundcraft_brand::APP_NAME)));
     }
     let header = |frames| soundcraft_audio_io::wav_float_header(channels, rate, frames).map_err(std::io::Error::other);
     let expected = header(0)?;
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let mut head = vec![0u8; expected.len()];
     if std::io::Read::read_exact(&mut f, &mut head).is_err() || !is_take_header(&head, &expected) {
-        return Err(refuse("not a take SoundCraft recorded"));
+        return Err(refuse(&format!("not a take {} recorded", soundcraft_brand::APP_NAME)));
     }
     let audio = f.metadata()?.len().saturating_sub(expected.len() as u64);
     let frames = audio / (channels.max(1) as u64 * 4);

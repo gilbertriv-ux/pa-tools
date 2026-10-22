@@ -13,6 +13,10 @@ pub const MENUS: &str = include_str!("../catalog/menus.txt");
 /// Catalog path → command id, for entries whose label or menu differs from ours.
 pub const ALIASES: &[(&str, &str)] = &[
     ("File > Open > Session...", "session.open"),
+    // Commands whose label carries no third-party product name: the catalog still names the incumbent's item.
+    ("File > Export > Sibelius...", "file.export_sibelius"),
+    ("File > Send To... > Sibelius", "file.send_to_sibelius"),
+    ("View > Transport > Ableton Link", "view.transport_ableton_link"),
     ("Edit > Can't Undo", "edit.undo"),
     ("Edit > Can't Redo", "edit.redo"),
     ("Edit > Selection > Play Edit", "transport.play_selection"),

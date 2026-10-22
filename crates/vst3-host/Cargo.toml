@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+soundcraft-brand.workspace = true
 soundcraft-dsp.workspace = true
 serde.workspace = true
 thiserror.workspace = true

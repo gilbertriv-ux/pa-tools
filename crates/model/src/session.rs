@@ -15,9 +15,9 @@ pub const FEET_FRAMES_START: &str = "feet_frames.start";
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SessionError {
-    #[error("not a SoundCraft session: {0}")]
+    #[error("not a {app} session: {0}", app = soundcraft_brand::APP_NAME)]
     Format(String),
-    #[error("session file version {0} is newer than this SoundCraft supports")]
+    #[error("session file version {0} is newer than this {app} supports", app = soundcraft_brand::APP_NAME)]
     Version(u32),
     #[error("{0}")]
     Invalid(String),
