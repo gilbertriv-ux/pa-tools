@@ -46,3 +46,12 @@ The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is 
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft (upstream UI, before the Pa Tools rebrand; to be replaced with Pa Tools screenshots) rendered from the synthesised demo session | MIT OR Apache-2.0 |
 
 | `docs/images-patools/edit.jpg`, `mix.jpg`, `about.jpg` | Pa Tools screenshots captured on 2026-10-22 from the V2 Intel build (demo song synthesised by the app) | Pa Tools build | MIT OR Apache-2.0 |
+
+## Code (ported, clean-room donor)
+
+`crates/pa-speech` (speech-to-text) is ported from [FilmCraft](https://github.com/storytold/filmcraft)'s
+`crates/speech` (package `filmcraft-speech`) by the storytold / FilmCraft contributors, MIT OR
+Apache-2.0 — the same license as this repository. The donor's `filmcraft-time` and
+`filmcraft-project` types are inlined (as `f64` seconds) so the crate carries no external
+dependency. Whisper model weights (`openai/whisper-*`, MIT) are downloaded on first use and are
+never bundled or committed.

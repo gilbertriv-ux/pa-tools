@@ -3728,6 +3728,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-pa-speech"
+version = "0.11.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-playback"
 version = "0.11.0"
 dependencies = [

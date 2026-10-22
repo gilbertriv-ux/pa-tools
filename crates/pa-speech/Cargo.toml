@@ -1,0 +1,25 @@
+[package]
+name = "soundcraft-pa-speech"
+description = "Pa Tools speech-to-text: the Transcriber trait, a fixed transcriber, the Whisper model catalogue, and (flesh-out) pure-Rust Whisper inference. Standalone, no workspace deps. Ported from filmcraft-speech (MIT OR Apache-2.0)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Flesh-out: enable candle Whisper inference. The flesh-out pass adds the candle deps here and the
+# `whisper` module (port of filmcraft-speech `whisper/`, `vad.rs`, `diarize.rs`, `mel.rs`). Kept an
+# empty placeholder in the skeleton so `#[cfg(feature = "whisper")]` compiles both ways with no
+# candle dependency pulled into the default build.
+whisper = []
+# Flesh-out: enable the HTTPS model downloader (ureq + rustls + sha2 verification).
+download = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

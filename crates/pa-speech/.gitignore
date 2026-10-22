@@ -1,0 +1,5 @@
+# Whisper model weights are downloaded on first use, never committed.
+*.safetensors
+*.bin
+*.gguf
+models/
