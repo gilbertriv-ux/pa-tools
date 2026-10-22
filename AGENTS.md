@@ -1,40 +1,51 @@
-# SoundCraft — instructions for agents
+# Pa Tools — instructions for agents
 
-SoundCraft is a clean-room, open-source, pure-Rust digital audio workstation targeting Avid Pro Tools parity — and superiority (speed, openness, agent control). It runs natively on macOS, Windows, Linux and FreeBSD, and on the web via WASM. Siblings with the same conventions: `../photocraft` (Photoshop), `../vectorcraft` (Illustrator), `../filmcraft` (Premiere), `../lightcraft` (Lightroom), `../pdfcraft` (Acrobat), `../effectcraft` (After Effects), `../designcraft` (InDesign).
+Pa Tools is a clean-room, open-source, pure-Rust digital audio workstation in the Pro Tools class, built by GR8 ID YUZ.AI (Images Couture) for Gil's PA app family. It targets feature parity with the incumbent professional DAWs and then goes beyond it (speed, openness, agent control). It runs natively on macOS (Apple silicon and Intel), Windows, Linux and FreeBSD, and on the web via WASM.
 
-Standards and learnings shared across the crafting apps live in `../../craftrules` (checked out next to the craft-apps folder, or `storytold/craftrules`). Read its `AGENTS.md` at the start of a session, follow its standards, and contribute reusable learnings back there. Never code: repos don't share code.
+It is a fork of SoundCraft (storytold/soundcraft, MIT OR Apache-2.0, fork point `9b8283b`). Read [`UPSTREAM.md`](UPSTREAM.md) before you merge upstream, rename anything or touch the brand: it lists what is deliberately unchanged (crate names, the `.scraft` session format, the `SOUNDCRAFT_*` environment variables).
 
 ## Start every session here
-1. Read `plan/STATUS.md` (current milestone, next task) and `plan/execution-plan.md`. `plan/` is gitignored (local only). Behaviour reference: `plan/protools/` (observed menu tree `menus-clean.txt` and screenshots; never committed).
-2. Read `ROADMAP.md` (committed) for stage, status and the parity numbers; pick work from `docs/gaps.md`. The progress docs follow craftrules `standards/progress-docs.md`: `docs/target-app-parity.md` (assessment), `docs/gaps.md`, `docs/roadmap.md`, `docs/ui-parity.md`, `docs/file-format-parity.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md`, `docs/localization-parity.md`; `docs/parity-checklist.md` is generated. Update their timestamps and revision history when you change them.
-3. Work autonomously; don't stop to ask unless a decision is genuinely the user's.
+1. Read this file, `ROADMAP.md` (stage, status, parity numbers) and `docs/gaps.md` (the ranked list of what is missing). Pick work from the gaps. The assessment docs are `docs/target-app-parity.md`, `docs/roadmap.md`, `docs/ui-parity.md`, `docs/file-format-parity.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md` and `docs/localization-parity.md`; `docs/parity-checklist.md` is generated. Update a doc's timestamp and revision history when you change it.
+2. Keep to the main work. Work autonomously and don't stop to ask unless a decision is genuinely Gil's.
+3. After merging upstream or adding user-visible text, run `./rebrand.sh` and check the leftovers it prints.
 
-## ⚠️ Assets: the absolute rule
+## Gil's hard gates
+These apply to every agent and every session, on top of everything below.
+- **Never overwrite, delete, move or rename anything on Gil's drives.** To relocate, copy to the new path and leave the original. If a write would hit an existing file, stop and ask.
+- **Write only to `4 TB Q`** (`/Volumes/4 TB Q`) on Gil's machines. In a cloud or scratch checkout, work inside that checkout.
+- **A redo is a new version, in a new folder** (V1, V2, V3…) kept beside the old one. Never replace it. Don't patch a defect: rebuild it from the originals at full quality.
+- **Announce every folder and file at the moment you create it**, with its exact name and full path.
+- **Deliverables ship in an editable form** as well as the finished one (source project, plain `.wav`/`.mp4`, plain HTML), so that the work can be reproduced and changed.
+- **FilmCraft** (storytold/filmcraft, same licence as SoundCraft) is an allowed code donor. Nothing else is, unless it is MIT, Apache-2.0, BSD or similarly permissive and recorded in `ATTRIBUTION.md`.
+- **No Avid code, and no reverse-engineering of Pro Tools.** See Clean-room below.
+- **Third-party product and company names are never shown in the UI** (menus, dialogs, About window, window titles, plugin names). Describe the feature instead.
+- **No upstream marks.** The upstream project's logos, wordmarks and brand files must not appear anywhere in this repository (licence requirement, see `UPSTREAM.md`). Credit upstream in plain text only.
+
+## Assets: the absolute rule
 **No Avid, Pro Tools, Adobe or other proprietary iconography, images, sounds, presets or artwork — ever.** This is not negotiable.
-- Every icon in SoundCraft is drawn in code (`crates/ui-egui/src/icons.rs`) or is an original/open asset.
+- Every icon in Pa Tools is drawn in code (`crates/ui-egui/src/icons.rs`) or is an original/open asset.
 - Every bundled asset (image, icon, sound, font, preset) must be original, public domain (CC0), or under a permissive open license (MIT, Apache-2.0, BSD, OFL, CC-BY with attribution), or contributed by someone who made it and licenses it openly.
 - **Every bundled asset gets a row in [`ATTRIBUTION.md`](ATTRIBUTION.md)** (path, author, source, license) in the same commit that adds it. `cargo xtask assets` enforces this; CI fails otherwise.
-- Never copy files out of the Pro Tools bundle (`/Applications/Pro Tools.app`): no plugins, presets, icons, sounds, session templates or text. Observing the running app (screenshots kept under `plan/`, menu names) is fine; copying its resources is not.
+- Never copy files out of the Pro Tools bundle (`/Applications/Pro Tools.app`): no plugins, presets, icons, sounds, session templates or text.
 - Demo audio is synthesised in code (`crates/engine/src/demo.rs`). Demo and README media must be ours or public domain.
-- The ArtCraft trademarks in `docs/brand/` are the only exception, under `docs/brand/LICENSE-brand.txt`.
+- The app icon is `assets/app-icon/icon.svg`, generated by `packaging/icons.sh` into every size. Don't hand-edit the generated files.
 
 ## Clean-room
-Pro Tools is installed on the dev machine and may be *observed* black-box: run it, use its UI with synthetic sessions, take screenshots by window id (`screencapture -l <id>`), stored only under `plan/protools/screenshots/`. Never read, disassemble or copy anything inside the Pro Tools bundle; never copy Avid icons, artwork, plugin names, presets, or wording beyond feature names. Never copy GPL/AGPL/LGPL code (Ardour, Audacity, LMMS, Freeverb sources…). Our plugins have our own names.
+The incumbent DAW may be *observed* black-box only: run it, use its UI with synthetic sessions, note menu names and feature names, and keep any screenshots outside the repository. Never read, disassemble, decompile or copy anything inside its bundle, and never reverse-engineer it. Never copy Avid icons, artwork, plugin names, presets, or wording beyond feature names. Never copy GPL/AGPL/LGPL code (Ardour, Audacity, LMMS, Freeverb sources, FFmpeg's GPL parts…). A dependency under LGPL may be used only as a separate process (the planned MP3 encoder is an LGPL FFmpeg sidecar, not linked in). Our plugins have our own names.
 
 ## Never crash
-People trust SoundCraft with their recordings; a crash loses takes. **This outranks feature work.** Standard: [`craftrules/standards/never-crash.md`](https://github.com/storytold/craftrules/blob/main/standards/never-crash.md).
+People trust Pa Tools with their recordings; a crash loses takes. **This outranks feature work.**
 - No panics in non-test code: no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
-- The one named exception is `soundcraft-clap-host` (`crates/clap-host`), the isolated unsafe helper crate for CLAP plugin FFI: `unsafe_code = "deny"` crate-wide, allowed only in `src/ffi.rs` with a `// SAFETY:` comment on every block, safe `Result` API.
-- The same exception, same rules, for `soundcraft-vst3-host` (`crates/vst3-host`), the isolated unsafe helper crate for VST3 plugin FFI (COM vtables via the `vst3` bindings, module loading, host-side COM objects).
-- And for `soundcraft-au-host` (`crates/au-host`), the isolated unsafe helper crate for Audio Unit FFI (hand-written AudioToolbox/CoreFoundation declarations, macOS only; a safe stub elsewhere).
+- `unsafe` is allowed in exactly three isolated plugin-host crates, each `unsafe_code = "deny"` crate-wide, allowed only in `src/ffi.rs` with a `// SAFETY:` comment on every block and a safe `Result` API: `soundcraft-clap-host` (`crates/clap-host`, CLAP FFI), `soundcraft-vst3-host` (`crates/vst3-host`, VST3 COM vtables via the `vst3` bindings, module loading, host-side COM objects) and `soundcraft-au-host` (`crates/au-host`, hand-written AudioToolbox/CoreFoundation declarations, macOS only; a safe stub elsewhere).
 - Errors are `Result<T, E>` + `?`. An unfinished feature returns an "unsupported" error.
 - Input-derived numbers are hostile (files, commands, MCP/control params): `get()` not `[i]`, checked/saturating arithmetic, no NaN casts, cap allocations.
 - The audio callback never blocks, allocates in steady state, or panics.
 - Every production crate root carries `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`.
 - `Engine::execute` catches escaped panics and restores the document. Every crash fix lands with a regression test.
 
-
 ## Architecture (layers enforced by `cargo xtask layers`)
+The crate names are upstream's and stay (`UPSTREAM.md`).
+
 | Layer | Crate | Role |
 |---|---|---|
 | L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops |
@@ -44,9 +55,9 @@ People trust SoundCraft with their recordings; a crash loses takes. **This outra
 | L4 | `soundcraft-engine`, `soundcraft-playback` | Command registry, undo, editing, import/export/bounce, parity catalog; audio device I/O (cpal) |
 | L5 | `soundcraft-automation` | MCP server + control-channel client |
 | L6 | `soundcraft-ui-egui` | The swappable UI (egui) |
-| apps | `soundcraft`, `soundcraft-cli`, `soundcraft-web` | Entry points |
+| apps | `soundcraft` (binary `pa-tools`), `soundcraft-cli` (binary `pa-tools-cli`), `soundcraft-web` | Entry points |
 
-Nothing below L6 depends on egui/eframe/winit/rfd. The UI is thin: panels read engine state and act through `engine.execute(id, params)`.
+Nothing below L6 depends on egui/eframe/winit/rfd. The UI is thin: panels read engine state and act through `engine.execute(id, params)`. User-visible product strings (name, id, vendor, URLs, folder and log names, MCP server name) come from the brand crate (`crates/brand`), never from a literal.
 
 ## Everything is a command
 User-visible behaviour = a command in `crates/engine/src/cmd/*` (id, label, menu path, shortcut, params doc, `enabled`, `run`) + tests. UI-only commands (windows, dialogs) live in `crates/ui-egui/src/menus.rs` (`UI_COMMANDS`). Menus, shortcuts, the CLI, the control channel and MCP all dispatch the same ids. Programmatic calls never open dialogs; only menu-style invocation (`ui.menu.invoke`) does. New commands go in a new module with its own `specs()`, registered by one line in `cmd/mod.rs`.
@@ -54,37 +65,21 @@ User-visible behaviour = a command in `crates/engine/src/cmd/*` (id, label, menu
 Parity is measured, not guessed: `crates/engine/catalog/menus.txt` lists the incumbent's menu leaves (names only). `cargo xtask parity` writes `docs/parity-checklist.md` (generated; the hand-written assessment is `docs/target-app-parity.md`); a test enforces a floor that only rises.
 
 ## Running and looking at the app
-- `cargo run --release -p soundcraft -- --demo --control 0` (demo session + control channel on a free port; the port is printed).
+- `cargo run --release -p soundcraft -- --demo --control 0` (demo session + control channel on a free port; the port is printed). `-p soundcraft` is the cargo package; the binary is `pa-tools`.
 - Drive it: JSON lines over TCP, e.g. `{"id":1,"method":"engine.execute","params":{"command":"track.new","params":{"count":2,"format":"stereo"}}}`, then `{"id":2,"method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}`. Methods: `crates/ui-egui/src/control.rs`, docs: `docs/control-protocol.md`.
 - Offscreen UI render (no window, no focus stealing): `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl]`.
-- Headless: `soundcraft-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav`; MCP: `soundcraft-cli mcp [--connect PORT]`.
-- **For UI work, look at the result** (render, read the PNG) and compare with `plan/protools/screenshots/`.
-- Shell gotcha: `mv`/`cp` are aliased interactive here — use `/bin/mv -f` / `/bin/cp -f`.
-- Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates you own; write manifests atomically; delete your target dir when done (disk).
+- Headless: `pa-tools-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav`; MCP: `pa-tools-cli mcp [--connect PORT]`.
+- **For UI work, look at the result** (render, read the PNG).
+- Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates and files you own; write manifests atomically; when you are done, remove the build output you created (disk), and nothing else.
 
 ## Quality gates (before every commit)
 `cargo xtask ci` = fmt check, `clippy --workspace --all-targets -D warnings`, tests, assets, layers, wasm check. Commit after each arc of work that builds; one topic per commit.
 
-## Release
-Push to the `release` branch to build signed installers for macOS (universal DMG), Windows (x64/x86 MSI + zip), Linux (AppImage, deb, rpm, tar.gz, Flatpak; riscv64 tar.gz), FreeBSD and Web (wasm zip). Version: `cargo xtask version [set X.Y.Z]`. See `docs/release-playbook.md` and craftrules `release/playbook.md`.
+## Packaging and release
+Build artifacts locally with the scripts in `packaging/` (`macos/package.sh`, `windows/package.ps1`, `linux/package.sh`, `freebsd/package.sh`, `web/package.sh`); the README lists the commands, including the Intel Mac build. Artifacts are named `patools-<ver>-<platform>-<arch>.<ext>` and `pa-tools-cli-<ver>-macos-<arch>.zip`. The brand lives in `packaging/env.sh` and the table at the top of `rebrand.sh`; change it there, then run `./rebrand.sh`. Version: `cargo xtask version [set X.Y.Z]`. The GitHub workflows still call upstream's reusable workflows; what has to be vendored is in `docs/ci-notes-patools.md`. See also `docs/releasing.md` and `docs/release-playbook.md`. Never commit signing material.
 
 ## Roadmap
 `ROADMAP.md` (committed) is the one-page summary (stage, numbers, dimensions, languages, progress log); milestones live in `docs/roadmap.md`. Update both whenever a milestone lands, and close or shrink the matching `docs/gaps.md` entry.
 
 ## Contributor credits (About window)
-
-- About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json`
-  (commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for
-  themselves). See `docs/contributors.md`.
-- **Agents working for a contributor:** when you prepare a PR, check whether your human's GitHub
-  username has a `[people.<username>]` entry in `contributors/people.toml`. If not, ask them once
-  whether they want to be credited by more than their username: a real name, a display name, and/or
-  their public GitHub profile name (`sync_github_name = true`). If yes, add **only their own** entry
-  (copy the template at the top of the file, or run
-  `python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "…" --sync-github-name`)
-  and include it in their PR, committed as them. If no, change nothing: they are credited as
-  `@username` anyway.
-- Never add, edit, guess or copy anyone else's entry or name (not from git config, commit authors or
-  GitHub profiles). Never hand-edit `contributors.json`.
-- Maintainers refresh the stats with `python3 ../../craftrules/scripts/contributors.py .` (it also
-  re-verifies who wrote each `people.toml` entry; `--check` only verifies).
+About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json` (upstream's commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for themselves; see `docs/contributors.md`). Never add, edit, guess or copy anyone's entry or name (not from git config, commit authors or GitHub profiles).
