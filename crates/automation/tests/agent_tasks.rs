@@ -28,7 +28,18 @@ fn track<'a>(sess: &'a Value, name: &str) -> &'a Value {
 fn handshake_and_tool_list() {
     let mut s = Server::new(Headless::new(Engine::default()));
     let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
-    assert_eq!(r["result"]["serverInfo"]["name"], "soundcraft");
+    assert_eq!(r["result"]["serverInfo"]["name"], "pa-tools");
+    let text = r["result"]["instructions"].as_str().unwrap();
+    assert!(text.starts_with("Pa Tools is a digital audio workstation"), "{text}");
+    assert!(text.contains("`pa-tools --control 0`") && text.contains("`pa-tools-cli mcp --connect PORT`"), "{text}");
+    assert!(!text.contains("SoundCraft"), "{text}");
+    let r = rpc(&mut s, 11, "resources/list", json!({}));
+    let uris: Vec<&str> = r["result"]["resources"].as_array().unwrap().iter().filter_map(|x| x["uri"].as_str()).collect();
+    assert_eq!(uris, ["patools://session", "patools://commands"]);
+    let r = rpc(&mut s, 12, "resources/read", json!({"uri": "patools://session"}));
+    assert!(r["result"]["contents"][0]["text"].as_str().unwrap().contains("tracks"), "{r}");
+    let r = rpc(&mut s, 13, "resources/read", json!({"uri": "soundcraft://session"}));
+    assert_eq!(r["error"]["code"], -32002);
     let r = rpc(&mut s, 2, "tools/list", json!({}));
     assert!(r["result"]["tools"].as_array().unwrap().len() >= 10);
     let batch = r["result"]["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "batch").unwrap();
