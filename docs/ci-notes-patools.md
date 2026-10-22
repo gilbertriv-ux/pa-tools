@@ -21,7 +21,7 @@ the session. What follows about them comes from this tree: the callers, `docs/re
 | `release.yml` (Pa Tools Release) | push to `release`; manual run with an optional `version` | Builds every platform's installer, signs the macOS and Windows ones, drafts a GitHub Release `Pa Tools v<version>` with `SHA256SUMS.txt` | `craft-common-actions/.../release.yml@main`, inputs `app-name: patools`, `app-title: Pa Tools`, `version` | the 14 signing secrets below (all optional), a `release` environment |
 | `windows-arm64.yml` (Pa Tools Windows ARM64) | nightly 05:53 UTC; push to `release`; PRs touching `packaging/windows/**` | Cross-compiles the ARM64 MSI on an x64 runner (unsigned), installs it on a Windows 11 ARM64 runner, checks the installed binaries are ARM64, runs the CLI natively, uninstalls | `.../windows-arm64.yml@main`, inputs `app-name: patools`, `app-dir: Pa Tools` | none |
 | `freebsd.yml` (Pa Tools FreeBSD) | nightly 03:47 UTC; push to `release`; PRs touching `crates/playback`, `packaging/freebsd/**`, `packaging/env.sh` | Builds and tests the workspace inside a FreeBSD 14.3 VM on a Linux runner (GitHub has no FreeBSD runners) | `.../freebsd.yml@main` | none |
-| `nix.yml` (Pa Tools Nix) | push to `main` and PRs touching `flake.nix`, `flake.lock`, `nix/**`, `Cargo.lock` | Evaluates the Nix flake only (about a minute, no build) so a `Cargo.lock` change that `nix/package.nix` cannot vendor is noticed | `.../nix.yml@main` | none |
+| `nix.yml` (Pa Tools Nix) | push to `main` and PRs touching `flake.nix`, `flake.lock`, `nix/**`, `Cargo.lock` | Evaluates the Nix flake only (about a minute, no build) so a `Cargo.lock` change that `nix/package.nix` cannot vendor is noticed. **This tree has no `flake.nix` or `nix/` directory**, so the workflow never triggers and has nothing to evaluate; delete it or add the flake | `.../nix.yml@main` | none |
 | `packaging-lint.yml` (Pa Tools Packaging lint) | push to `main`/`release` and PRs touching workflows, `packaging/**`, `assets/app-icon/**` | actionlint, shellcheck, PowerShell parse, xmllint (WiX, plists, AppStream, MIME), `desktop-file-validate`, `appstreamcli validate`, and a check that the two Flatpak manifests agree | `.../packaging-lint.yml@main` | none |
 | `sonarcloud.yml` (Pa Tools SonarCloud) | push to `main`; PRs | Static analysis on SonarCloud | `.../sonarcloud.yml@main`, `secrets: inherit` | `SONAR_TOKEN` and a SonarCloud organisation (`sonar-project.properties`: `gilbertriv-ux_pa-tools`, org `gilbertriv-ux`) |
 | `dependabot.yml` | daily 06:00 America/New_York | Opens grouped PRs for Cargo and GitHub Actions updates | built into GitHub | enabling Dependabot on the repository |
@@ -70,7 +70,7 @@ Pin every third-party action by commit SHA.
 5. **macOS**: `packaging/macos/package.sh` on `macos-15` (add `--arch x86_64` for an Intel build, or build a universal
    binary). Needs Gil's own Developer ID certificate; until the secrets exist it signs ad-hoc (see "Needs Gil" below).
 6. **Web**: `packaging/web/package.sh` (Trunk) on `ubuntu-latest`.
-7. **FreeBSD VM**, **riscv64** (cross-compiled, QEMU smoke test), **Nix**, **SonarCloud**: last. None blocks a release of
+7. **FreeBSD VM**, **riscv64** (cross-compiled, QEMU smoke test), **SonarCloud**: last. (Nix: only if a flake is added.) None blocks a release of
    the desktop installers.
 8. **The draft-release job** that gathers the artifacts, writes `SHA256SUMS.txt` and creates the draft. Only this job gets
    `contents: write`, and only it and the signing jobs declare `environment: release`.
