@@ -14,13 +14,27 @@
 //!   SHA-256, size, licence) and where they live. Weights are **never** bundled or committed.
 //! - [`load`]: builds the Whisper transcriber (feature `whisper`).
 //!
-//! Flesh-out (tracked in `docs/g18-seam.md`): behind feature `whisper`, port the donor's `whisper/`
-//! module (candle inference + DTW word timestamps), `vad.rs`, `diarize.rs` and `mel.rs`; behind
-//! feature `download`, the verified HTTPS downloader. The skeleton below is the seam those build to.
+//! Feature `whisper` adds candle Whisper inference (`whisper/`), the log-mel front end (`mel`),
+//! energy-based bound tightening (`vad`) and speaker labelling (`diarize`), working internally in
+//! exact ticks ([`tick`]/[`ptranscript`]) and converting to the public `f64`-seconds API at the
+//! [`Transcriber`] boundary. Feature `download` adds the verified HTTPS model downloader.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod models;
+
+#[cfg(feature = "whisper")]
+mod diarize;
+#[cfg(feature = "whisper")]
+mod mel;
+#[cfg(feature = "whisper")]
+mod ptranscript;
+#[cfg(feature = "whisper")]
+mod tick;
+#[cfg(feature = "whisper")]
+mod vad;
+#[cfg(feature = "whisper")]
+pub mod whisper;
 
 use serde::{Deserialize, Serialize};
 
@@ -143,8 +157,8 @@ impl Transcriber for FixedTranscriber {
 
 /// Load the transcriber for catalogue model `id` from `models_dir` (feature `whisper`).
 ///
-/// In the skeleton this validates the catalogue and installation and then reports `Unavailable`
-/// without the `whisper` feature; the flesh-out returns a real candle-backed transcriber.
+/// Validates the catalogue and that the model is installed, then (feature `whisper`) returns a real
+/// candle-backed Whisper transcriber; without the feature it reports `Unavailable`.
 pub fn load(models_dir: &std::path::Path, id: &str) -> Result<std::sync::Arc<dyn Transcriber>, SpeechError> {
     let m = models::find(id).ok_or_else(|| SpeechError::UnknownModel(id.into()))?;
     if !models::installed(models_dir, m) {
@@ -152,8 +166,7 @@ pub fn load(models_dir: &std::path::Path, id: &str) -> Result<std::sync::Arc<dyn
     }
     #[cfg(feature = "whisper")]
     {
-        // Flesh-out: `Ok(std::sync::Arc::new(whisper::Whisper::load(&models::model_dir(models_dir, m), m.id)?))`
-        Err(SpeechError::Unavailable("whisper feature present but inference not yet ported".into()))
+        Ok(std::sync::Arc::new(whisper::Whisper::load(&models::model_dir(models_dir, m), m.id)?))
     }
     #[cfg(not(feature = "whisper"))]
     {
