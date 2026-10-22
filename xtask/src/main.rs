@@ -18,6 +18,7 @@ fn cargo(args: &[&str]) -> Result<(), String> {
 
 /// Layer table: crate name (minus `soundcraft-`) → layer. Apps and xtask are exempt.
 const LAYERS: &[(&str, u8)] = &[
+    ("brand", 0),
     ("time", 0),
     ("audio-io", 0),
     ("midi", 0),
@@ -34,7 +35,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("ui-egui", 6),
 ];
 /// Standalone format crates: no workspace dependencies at all (publishable on their own).
-const STANDALONE: &[&str] = &["time", "audio-io", "midi", "video", "dsp"];
+const STANDALONE: &[&str] = &["brand", "time", "audio-io", "midi", "video", "dsp"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "xtask"];
 
@@ -118,6 +119,7 @@ fn parity() -> Result<(), String> {
 
 /// Crates that must compile for the web.
 const WASM: &[&str] = &[
+    "soundcraft-brand",
     "soundcraft-time",
     "soundcraft-audio-io",
     "soundcraft-midi",
