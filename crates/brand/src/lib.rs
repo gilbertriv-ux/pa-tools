@@ -15,7 +15,7 @@ use std::ffi::CStr;
 /// The product name as shown in titles, menus, dialogs and the About window.
 pub const APP_NAME: &str = "Pa Tools";
 /// One-line description for the About window and package metadata.
-pub const DESCRIPTION: &str = "Gil's Pro Tools-class audio workstation, by GR8 ID YUZ.AI.";
+pub const DESCRIPTION: &str = "A professional multitrack audio workstation by GR8 ID YUZ.AI.";
 /// Reverse-DNS application id (Wayland/X11 app id, macOS bundle id, Flatpak id).
 pub const APP_ID: &str = "com.imagescouture.patools";
 /// The company that ships the product.
@@ -146,12 +146,10 @@ mod tests {
         ];
         for s in visible {
             let lower = s.to_lowercase();
-            for banned in ["soundcraft", "artcraft", "avid", "storyteller", "storytold"] {
+            for banned in ["soundcraft", "artcraft", "avid", "pro tools", "storyteller", "storytold"] {
                 assert!(!lower.contains(banned), "{s} contains {banned}");
             }
         }
-        // "Pro Tools-class" in the description is a factual comparison; no other brand mention may use the name.
-        assert!(!APP_NAME.contains("Pro Tools"));
     }
 
     #[test]

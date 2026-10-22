@@ -122,6 +122,7 @@ const THIRD_PARTY_MARKS: &[&str] = &[
     "Sibelius",
     "Ableton",
     "Soundbase",
+    "VENUE",
 ];
 
 /// Whether a menu label carries another company's product name or trademark (`ARA` counts as a whole word).
@@ -854,6 +855,7 @@ mod tests {
 
     /// Incumbent plug-in and product names that must not reach a Pa Tools menu.
     const INCUMBENT_NAMES: &[&str] = &[
+        "VENUE",
         "EQ3",
         "BF-76",
         "Dyn3",
@@ -948,6 +950,7 @@ mod tests {
             "Edit > Automation > Duplicate Dolby Atmos Plugin Automation to Pan Automation",
             "Edit > Automation > Duplicate Pan Automation to Dolby Atmos Plugin Automation",
             "File > Export > Selected Tracks as New Media Composer Compatible Session...",
+            "File > Import > VENUE Channel Names as Track Names",
             "File > Open > Sketch...",
             "Options > Activate HEAT",
             "Track > ARA Plugins > Melodyne",

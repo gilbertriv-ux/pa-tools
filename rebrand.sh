@@ -215,6 +215,7 @@ expect() { # file, fixed string, what
   grep -qF -- "$2" "$1" || note "$1 does not contain $3 ($2): update it by hand"
 }
 expect packaging/macos/Info.plist.in "<string>$APP_NAME</string>" "the app name"
+expect apps/soundcraft-web/index.html "Loading $APP_NAME&hellip;" "the web loading text"
 expect packaging/macos/Info.plist.in "<string>$APP_ID</string>" "the bundle id"
 expect packaging/macos/Info.plist.in "<string>$APP_ID.session</string>" "the session UTI"
 expect packaging/macos/Info.plist.in "<string>$MIME</string>" "the session MIME type"
