@@ -15,7 +15,7 @@
   timestamp server, ...). Optional overrides: WINDOWS_TIMESTAMP_URL, SIGNTOOL (path to signtool.exe).
 
 .EXAMPLE
-  pwsh packaging/windows/sign.ps1 dist/soundcraft.exe dist/soundcraft.msi
+  pwsh packaging/windows/sign.ps1 dist/pa-tools.exe dist/patools.msi
 #>
 param(
   [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
@@ -55,8 +55,9 @@ if (-not $haveCert -and -not $haveAzure) {
 }
 
 $script:SignTool = Find-SignTool
-$common = @('sign', '/v', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'SoundCraft', '/du', 'https://github.com/storytold/soundcraft')
-$tmp = Join-Path ([IO.Path]::GetTempPath()) "soundcraft-sign-$PID"
+# /d is the signature's display name, /du its information URL (PLACEHOLDER homepage: not final).
+$common = @('sign', '/v', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'Pa Tools', '/du', 'https://gr8idyuz.ai')
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "patools-sign-$PID"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 try {

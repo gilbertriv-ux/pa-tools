@@ -3,7 +3,7 @@
 # exports VERSION and NFPM_ARCH.
 #
 #   nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/release/
-name: soundcraft
+name: pa-tools
 arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
@@ -13,14 +13,16 @@ release: 1
 section: sound
 priority: optional
 maintainer: ${SOUNDCRAFT_MAINTAINER}
-vendor: Learning Machines LLC
-homepage: https://getartcraft.com/apps/soundcraft
+vendor: GR8 ID YUZ.AI
+# PLACEHOLDER homepage: not final.
+homepage: https://gr8idyuz.ai
 license: MIT OR Apache-2.0
 description: |-
   Open-source, native digital audio workstation. Record, edit and mix
   multitrack audio and MIDI in Edit and Mix windows; built-in EQ, dynamics,
   reverb, delay and instruments; imports WAV, AIFF, FLAC, MP3 and MIDI.
-  Includes soundcraft-cli, a headless editor, bounce tool and MCP server.
+  Includes pa-tools-cli, a headless editor, bounce tool and MCP server.
+  Based on SoundCraft.
 
 # The app links glibc, libgcc_s and ALSA (libasound, for audio I/O through cpal; PulseAudio and
 # PipeWire are reached through their ALSA plugins). Windowing (X11/Wayland, xkbcommon) and the GPU
@@ -60,11 +62,11 @@ overrides:
       - (pipewire-alsa or alsa-plugins-pulseaudio)
 
 contents:
-  - src: ${STAGE}/usr/bin/soundcraft
-    dst: /usr/bin/soundcraft
+  - src: ${STAGE}/usr/bin/pa-tools
+    dst: /usr/bin/pa-tools
     file_info: { mode: 0755 }
-  - src: ${STAGE}/usr/bin/soundcraft-cli
-    dst: /usr/bin/soundcraft-cli
+  - src: ${STAGE}/usr/bin/pa-tools-cli
+    dst: /usr/bin/pa-tools-cli
     file_info: { mode: 0755 }
   - src: ${STAGE}/usr/share/
     dst: /usr/share/

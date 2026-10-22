@@ -1,14 +1,14 @@
 [Desktop Entry]
 Type=Application
-Name=SoundCraft
+Name=Pa Tools
 GenericName=Digital Audio Workstation
 Comment=Record, edit and mix audio and MIDI
-Exec=soundcraft %F
-TryExec=soundcraft
-Icon=ai.storyteller.soundcraft
+Exec=pa-tools %F
+TryExec=pa-tools
+Icon=com.imagescouture.patools
 Terminal=false
 StartupNotify=true
-StartupWMClass=ai.storyteller.soundcraft
+StartupWMClass=com.imagescouture.patools
 Categories=AudioVideo;Audio;Midi;Mixer;Sequencer;Recorder;
-MimeType=application/x-soundcraft-session;audio/x-wav;audio/wav;audio/vnd.wave;audio/x-aiff;audio/aiff;audio/flac;audio/x-flac;audio/mpeg;audio/midi;audio/x-midi;
+MimeType=application/x-patools-session;audio/x-wav;audio/wav;audio/vnd.wave;audio/x-aiff;audio/aiff;audio/flac;audio/x-flac;audio/mpeg;audio/midi;audio/x-midi;
 Keywords=daw;audio;mixer;recording;multitrack;midi;editor;music;

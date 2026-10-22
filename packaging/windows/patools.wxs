@@ -1,90 +1,94 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  SoundCraft MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
+  Pa Tools MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
 
-    wix build soundcraft.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
+    wix build patools.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
 
   Per-machine install into Program Files, a Start Menu shortcut, `.scraft` sessions owned by
-  SoundCraft, and SoundCraft offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
+  Pa Tools, and Pa Tools offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
+
+  UpgradeCode and the component GUIDs are Pa Tools' own (not SoundCraft's): they must never change
+  once a release is out, or Windows treats the next MSI as a different product.
+  The ARP links point at the placeholder homepage (rebrand.sh HOMEPAGE).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="SoundCraft"
-      Manufacturer="Learning Machines LLC"
+      Name="Pa Tools"
+      Manufacturer="GR8 ID YUZ.AI"
       Version="$(var.Version)"
-      UpgradeCode="EE53D3E5-D0AE-40F9-808D-9417FDEBF61A"
+      UpgradeCode="1DEA60C7-CB3B-4232-ACD0-EA511738486C"
       Scope="perMachine"
       Compressed="yes"
       Language="1033">
-    <SummaryInformation Description="SoundCraft digital audio workstation" Manufacturer="Learning Machines LLC" />
+    <SummaryInformation Description="Pa Tools digital audio workstation" Manufacturer="GR8 ID YUZ.AI" />
     <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
          (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="A newer version of SoundCraft is already installed." />
+        DowngradeErrorMessage="A newer version of Pa Tools is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <Icon Id="SoundcraftIcon.ico" SourceFile="$(var.IconPath)" />
-    <Property Id="ARPPRODUCTICON" Value="SoundcraftIcon.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://getartcraft.com/apps/soundcraft" />
-    <Property Id="ARPURLUPDATEINFO" Value="https://getartcraft.com/apps/soundcraft" />
-    <Property Id="ARPHELPLINK" Value="https://discord.gg/artcraft" />
+    <Icon Id="PaToolsIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="PaToolsIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://gr8idyuz.ai" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://gr8idyuz.ai" />
+    <Property Id="ARPHELPLINK" Value="https://gr8idyuz.ai" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="SoundCraft" />
+      <Directory Id="INSTALLFOLDER" Name="Pa Tools" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
 
-    <Feature Id="Main" Title="SoundCraft" Level="1">
-      <ComponentGroupRef Id="SoundcraftFiles" />
+    <Feature Id="Main" Title="Pa Tools" Level="1">
+      <ComponentGroupRef Id="PaToolsFiles" />
     </Feature>
   </Package>
 
   <Fragment>
-    <ComponentGroup Id="SoundcraftFiles" Directory="INSTALLFOLDER">
-      <Component Id="SoundcraftApp" Guid="091136D7-205E-41A8-9D27-5E231F7CBBD4">
-        <File Id="SoundcraftExe" Source="$(var.BinDir)\soundcraft.exe" KeyPath="yes">
-          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="SoundCraft"
-              Description="SoundCraft digital audio workstation" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
-              Icon="SoundcraftIcon.ico" IconIndex="0" />
+    <ComponentGroup Id="PaToolsFiles" Directory="INSTALLFOLDER">
+      <Component Id="PaToolsApp" Guid="25BA2EB1-CD2E-4DB8-B520-00CED2E479BF">
+        <File Id="PaToolsExe" Source="$(var.BinDir)\pa-tools.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Pa Tools"
+              Description="Pa Tools digital audio workstation" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+              Icon="PaToolsIcon.ico" IconIndex="0" />
         </File>
 
-        <!-- .scraft: SoundCraft's own session format; SoundCraft is its default app. -->
-        <ProgId Id="SoundCraft.Session" Description="SoundCraft Session" Icon="SoundcraftExe" IconIndex="0">
-          <Extension Id="scraft" ContentType="application/x-soundcraft-session">
-            <Verb Id="open" Command="Open" TargetFile="SoundcraftExe" Argument="&quot;%1&quot;" />
+        <!-- .scraft: the session format (inherited from SoundCraft); Pa Tools is its default app. -->
+        <ProgId Id="PaTools.Session" Description="Pa Tools Session" Icon="PaToolsExe" IconIndex="0">
+          <Extension Id="scraft" ContentType="application/x-patools-session">
+            <Verb Id="open" Command="Open" TargetFile="PaToolsExe" Argument="&quot;%1&quot;" />
           </Extension>
         </ProgId>
         <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
              as the default. -->
-        <ProgId Id="SoundCraft.Audio" Description="Audio File" Icon="SoundcraftExe" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Audio\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <ProgId Id="SoundCraft.Midi" Description="MIDI File" Icon="SoundcraftExe" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Midi\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="SoundCraft.Midi" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="SoundCraft.Midi" Value="" Type="string" />
+        <ProgId Id="PaTools.Audio" Description="Audio File" Icon="PaToolsExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\PaTools.Audio\shell\open\command" Value="&quot;[#PaToolsExe]&quot; &quot;%1&quot;" Type="string" />
+        <ProgId Id="PaTools.Midi" Description="MIDI File" Icon="PaToolsExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\PaTools.Midi\shell\open\command" Value="&quot;[#PaToolsExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="PaTools.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="PaTools.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="PaTools.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="PaTools.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="PaTools.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="PaTools.Midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="PaTools.Midi" Value="" Type="string" />
 
-        <!-- "Open with" app list and the Run dialog (Win+R "soundcraft"). -->
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe" Name="FriendlyAppName" Value="SoundCraft" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".scraft" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".aiff" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".flac" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".mp3" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".mid" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe\SupportedTypes" Name=".midi" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\soundcraft.exe" Value="[#SoundcraftExe]" Type="string" />
+        <!-- "Open with" app list and the Run dialog (Win+R "pa-tools"). -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe" Name="FriendlyAppName" Value="Pa Tools" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\shell\open\command" Value="&quot;[#PaToolsExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".scraft" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".aiff" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".flac" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".mp3" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".mid" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pa-tools.exe\SupportedTypes" Name=".midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\pa-tools.exe" Value="[#PaToolsExe]" Type="string" />
       </Component>
 
-      <Component Id="SoundcraftCli" Guid="4552049A-C2F0-4AB0-BAE6-A62C3348F4B4">
-        <File Id="SoundcraftCliExe" Source="$(var.BinDir)\soundcraft-cli.exe" KeyPath="yes" />
+      <Component Id="PaToolsCli" Guid="2F54EF9E-F070-4066-BAEF-88D40768AD82">
+        <File Id="PaToolsCliExe" Source="$(var.BinDir)\pa-tools-cli.exe" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

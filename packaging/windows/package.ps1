@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  Build, sign and package SoundCraft for Windows.
+  Build, sign and package Pa Tools for Windows.
 
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
-    soundcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    soundcraft-<version>-windows-<arch>-portable.zip   soundcraft.exe + soundcraft-cli.exe
+    patools-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
+    patools-<version>-windows-<arch>-portable.zip   pa-tools.exe + pa-tools-cli.exe
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -25,6 +25,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+
+# The Pa Tools brand (rebrand.sh keeps this block in sync with packaging/env.sh). Cargo package names
+# (-p soundcraft, -p soundcraft-cli) are upstream's and stay; [[bin]] makes them build these exes.
+# >>> brand
+$PtName = 'Pa Tools'
+$PtBin = 'pa-tools'
+$PtCli = 'pa-tools-cli'
+$PtSlug = 'patools'
+# <<< brand
 
 function Invoke-Native([string] $What, [scriptblock] $Block) {
   Write-Output "==> $What"
@@ -53,7 +62,7 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if (-not $env:SOUNDCRAFT_BUILD_SHA) { $env:SOUNDCRAFT_BUILD_SHA = (git -C $Root rev-parse HEAD 2>$null) }
 if (-not $env:SOUNDCRAFT_BUILD_DATE) { $env:SOUNDCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') }
 
-Write-Output "SoundCraft $Version for Windows $Arch ($Target)"
+Write-Output "$PtName $Version for Windows $Arch ($Target)"
 
 if (-not $SkipBuild) {
   # Static CRT: no VC++ redistributable needed. Scoped to the target so host build scripts and
@@ -77,7 +86,7 @@ function Get-PeHeader([string] $Path) {
   return @{ Machine = [BitConverter]::ToUInt16($bytes, $pe + 4); Subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C) }
 }
 $Machine = switch ($Arch) { 'x64' { 0x8664 } 'x86' { 0x14C } 'arm64' { 0xAA64 } }
-foreach ($check in @(@('soundcraft.exe', 2), @('soundcraft-cli.exe', 3))) {
+foreach ($check in @(@("$PtBin.exe", 2), @("$PtCli.exe", 3))) {
   $h = Get-PeHeader (Join-Path $Bin $check[0])
   if ($h.Machine -ne $Machine) { throw "$($check[0]) is for machine 0x$('{0:X}' -f $h.Machine), expected 0x$('{0:X}' -f $Machine) ($Arch)" }
   if ($h.Subsystem -ne $check[1]) { throw "$($check[0]) has PE subsystem $($h.Subsystem), expected $($check[1])" }
@@ -86,15 +95,16 @@ foreach ($check in @(@('soundcraft.exe', 2), @('soundcraft-cli.exe', 3))) {
 $Stage = Join-Path $TargetDir "windows-package\$Arch"
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item (Join-Path $Bin 'soundcraft.exe'), (Join-Path $Bin 'soundcraft-cli.exe') $Stage
+Copy-Item (Join-Path $Bin "$PtBin.exe"), (Join-Path $Bin "$PtCli.exe") $Stage
 
-& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'soundcraft.exe') (Join-Path $Stage 'soundcraft-cli.exe')
+& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage "$PtBin.exe") (Join-Path $Stage "$PtCli.exe")
 
 # ---- MSI ---------------------------------------------------------------------------------------
-$Msi = Join-Path $Dist "soundcraft-$Version-windows-$Arch.msi"
+$IconPath = Join-Path $Root "assets\app-icon\$PtSlug.ico"
+$Msi = Join-Path $Dist "$PtSlug-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
-  wix build (Join-Path $PSScriptRoot 'soundcraft.wxs') -arch $Arch `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\soundcraft.ico')" `
+  wix build (Join-Path $PSScriptRoot 'patools.wxs') -arch $Arch `
+    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$IconPath" `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
@@ -102,7 +112,7 @@ Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Ms
 & (Join-Path $PSScriptRoot 'sign.ps1') $Msi
 
 # ---- portable zip ------------------------------------------------------------------------------
-$Portable = Join-Path $TargetDir "windows-package\soundcraft-$Version-windows-$Arch-portable"
+$Portable = Join-Path $TargetDir "windows-package\$PtSlug-$Version-windows-$Arch-portable"
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage '*.exe') $Portable
@@ -110,7 +120,7 @@ foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE'
   $p = Join-Path $Root $f
   if (Test-Path $p) { Copy-Item $p $Portable }
 }
-$Zip = Join-Path $Dist "soundcraft-$Version-windows-$Arch-portable.zip"
+$Zip = Join-Path $Dist "$PtSlug-$Version-windows-$Arch-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Portable -DestinationPath $Zip
 
@@ -118,8 +128,8 @@ Compress-Archive -Path $Portable -DestinationPath $Zip
 # here; .github/workflows/windows-arm64.yml installs and runs it on ARM64 instead.
 $HostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
 if ($Arch -ne 'arm64' -or $HostArch -eq 'arm64') {
-  Invoke-Native 'soundcraft-cli --version' { & (Join-Path $Stage 'soundcraft-cli.exe') --version }
+  Invoke-Native "$PtCli --version" { & (Join-Path $Stage "$PtCli.exe") --version }
 } else {
-  Write-Output "skipping soundcraft-cli --version: an $Arch build doesn't run on this $HostArch machine"
+  Write-Output "skipping $PtCli --version: an $Arch build doesn't run on this $HostArch machine"
 }
 Get-Item $Msi, $Zip | Format-Table Name, Length

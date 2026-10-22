@@ -1,13 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Hardened-runtime entitlements for SoundCraft. The app is pure Rust, loads no unsigned code,
-     needs no JIT, and is not sandboxed (it opens files by path, from the command line and
-     drag-and-drop). Add exceptions here only with a reason in a comment. -->
+<!-- Hardened-runtime entitlements for Pa Tools (the app and pa-tools-cli use the same file). The
+     app is pure Rust, needs no JIT, and is not sandboxed (it opens files by path, from the command
+     line and drag-and-drop). It does load third-party plug-in bundles: see library validation
+     below. Add exceptions here only with a reason in a comment. -->
 <plist version="1.0">
 <dict>
   <!-- Recording: the hardened runtime blocks audio input (CoreAudio via cpal) without this,
        even after the user grants microphone access (NSMicrophoneUsageDescription). -->
   <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <!-- Third-party plug-ins (gap G-05; upstream issues #153 and #149): the hardened runtime enforces
+       library validation, so dlopen() of a VST3, CLAP or Audio Unit bundle that is unsigned or
+       signed by another team is refused. This entitlement lets the host load them. Signing is
+       hardened-runtime even for the default ad-hoc identity (package.sh), so it is needed in
+       every build, and for pa-tools-cli too, which hosts the same plug-ins headless. Individual
+       plug-ins may additionally need allow-unsigned-executable-memory or allow-jit; add those
+       only for a plug-in that is proven to need them. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
 </dict>
 </plist>

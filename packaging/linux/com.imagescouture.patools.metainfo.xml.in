@@ -2,18 +2,19 @@
 <!-- AppStream metadata (software centres, Flathub). Template: package.sh and the Flatpak
      manifest substitute @VERSION@ and @DATE@ from Cargo.toml and the build date. -->
 <component type="desktop-application">
-  <id>ai.storyteller.soundcraft</id>
+  <id>com.imagescouture.patools</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>SoundCraft</name>
+  <name>Pa Tools</name>
   <summary>Record, edit and mix audio and MIDI</summary>
-  <developer id="ai.storyteller">
-    <name>Learning Machines LLC</name>
+  <developer id="com.imagescouture">
+    <name>GR8 ID YUZ.AI</name>
   </developer>
   <description>
     <p>
-      SoundCraft is an open-source, native digital audio workstation. Record, edit and mix
+      Pa Tools is an open-source, native digital audio workstation. Record, edit and mix
       multitrack audio and MIDI in Edit and Mix windows that work the way studio engineers expect.
+      Based on SoundCraft.
     </p>
     <ul>
       <li>Non-destructive clip editing with fades, playlists, grids and markers</li>
@@ -23,13 +24,13 @@
       <li>A headless command line and an MCP server for scripting and agents</li>
     </ul>
   </description>
-  <launchable type="desktop-id">ai.storyteller.soundcraft.desktop</launchable>
-  <icon type="stock">ai.storyteller.soundcraft</icon>
+  <launchable type="desktop-id">com.imagescouture.patools.desktop</launchable>
+  <icon type="stock">com.imagescouture.patools</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
-  <url type="homepage">https://getartcraft.com/apps/soundcraft</url>
-  <url type="bugtracker">https://github.com/storytold/soundcraft/issues</url>
-  <url type="help">https://github.com/storytold/soundcraft</url>
-  <url type="contact">https://discord.gg/artcraft</url>
+  <!-- PLACEHOLDER URLs: the homepage and the GitHub repository are not final. -->
+  <url type="homepage">https://gr8idyuz.ai</url>
+  <url type="bugtracker">https://github.com/gilbertriv-ux/pa-tools/issues</url>
+  <url type="help">https://github.com/gilbertriv-ux/pa-tools</url>
   <categories>
     <category>AudioVideo</category>
     <category>Audio</category>
@@ -44,12 +45,12 @@
   <screenshots>
     <screenshot type="default">
       <caption>Mixer with channel strips, sends, faders and an equalizer</caption>
-      <image type="source" width="2400" height="1500">https://raw.githubusercontent.com/storytold/soundcraft/main/docs/images/mix.png</image>
+      <image type="source" width="2400" height="1500">https://raw.githubusercontent.com/gilbertriv-ux/pa-tools/main/docs/images/mix.png</image>
     </screenshot>
   </screenshots>
   <branding>
-    <color type="primary" scheme_preference="light">#8fd9e6</color>
-    <color type="primary" scheme_preference="dark">#0b7385</color>
+    <color type="primary" scheme_preference="light">#e6d29a</color>
+    <color type="primary" scheme_preference="dark">#7a5f1e</color>
   </branding>
   <requires>
     <display_length compare="ge">760</display_length>
@@ -59,8 +60,8 @@
     <control>pointing</control>
   </supports>
   <provides>
-    <binary>soundcraft</binary>
-    <mediatype>application/x-soundcraft-session</mediatype>
+    <binary>pa-tools</binary>
+    <mediatype>application/x-patools-session</mediatype>
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
