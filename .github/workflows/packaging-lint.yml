@@ -1,6 +1,6 @@
 # Quick static checks for the release pipeline (seconds, no Rust build): workflow syntax,
 # packaging shell/PowerShell scripts, and the Linux desktop/AppStream/Flatpak metadata.
-name: Packaging lint
+name: Pa Tools Packaging lint
 
 on:
   push:

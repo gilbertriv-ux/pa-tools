@@ -1,6 +1,6 @@
 # Evaluates the Nix flake (no build, about a minute): `nix build` / `nix develop` stop at evaluation
 # when Cargo.lock gains something nix/package.nix can't vendor, and nothing else would notice.
-name: Nix
+name: Pa Tools Nix
 
 on:
   push:

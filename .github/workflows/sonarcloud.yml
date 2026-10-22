@@ -1,4 +1,4 @@
-name: SonarCloud
+name: Pa Tools SonarCloud
 
 on:
   push:

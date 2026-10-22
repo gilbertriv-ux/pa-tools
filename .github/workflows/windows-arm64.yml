@@ -2,7 +2,7 @@
 # runner, unsigned here), then install that MSI on a Windows 11 ARM64 runner, check the installed
 # binaries are ARM64, run the CLI natively, and uninstall. (A native ARM64 `cargo test` job is left
 # out for now: PdfCraft saw an intermittent access violation in egui UI tests there.)
-name: Windows ARM64
+name: Pa Tools Windows ARM64
 
 # Nightly on main and on pushes to `release` (dependency and runner-image drift shows up within a
 # day, and always before a release ships), and on PRs that change the Windows packaging itself.
@@ -29,5 +29,5 @@ jobs:
     # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
     uses: storytold/craft-common-actions/.github/workflows/windows-arm64.yml@main
     with:
-      app-name: soundcraft
-      app-dir: SoundCraft
+      app-name: patools
+      app-dir: Pa Tools
