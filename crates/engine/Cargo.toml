@@ -7,6 +7,13 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Speech-to-text back ends of `soundcraft-pa-speech`, forwarded so the apps can switch them on.
+# Both are off by default (and never forwarded into the wasm app).
+whisper = ["soundcraft-pa-speech/whisper"]
+download = ["soundcraft-pa-speech/download"]
+
 [dependencies]
 soundcraft-brand.workspace = true
 soundcraft-time.workspace = true

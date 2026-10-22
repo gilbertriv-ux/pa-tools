@@ -7,7 +7,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{Transcript, TrackKind, TranscriptWord};
+use soundcraft_model::{TrackKind, Transcript, TranscriptWord};
 use soundcraft_time::Range;
 use std::path::PathBuf;
 
@@ -72,7 +72,8 @@ fn transcribe(e: &mut Engine, p: &Value) -> Result<Value> {
         diarize: p.get("diarize").and_then(Value::as_bool).unwrap_or(true),
         max_speakers: 6,
     };
-    let produced = transcriber.transcribe(&audio, &opts, &mut |_fraction, _status| true).map_err(|err| bad(cmd, format!("transcription failed: {err}")))?;
+    let produced =
+        transcriber.transcribe(&audio, &opts, &mut |_fraction, _status| true).map_err(|err| bad(cmd, format!("transcription failed: {err}")))?;
 
     // Convert the recogniser's seconds to session samples and store.
     let words: Vec<TranscriptWord> = produced
