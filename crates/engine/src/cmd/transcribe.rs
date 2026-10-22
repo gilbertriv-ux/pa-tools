@@ -148,7 +148,7 @@ impl TranscribeJob {
         let text = produced.text();
         let (language, source) = (produced.language.clone(), produced.source.clone());
         let result = json!({"status": "ok", "track": track.0, "words": count, "language": language, "source": source, "text": text});
-        Ok(TranscribeOutcome { result, transcript: Some(Transcript { track, words, language, source }) })
+        Ok(TranscribeOutcome { result, transcript: Some(Transcript { track, words, language, source, speaker_names: Vec::new() }) })
     }
 }
 
@@ -201,7 +201,7 @@ fn set_transcript(e: &mut Engine, p: &Value) -> Result<Value> {
     let language: String = str_param(p, "language").unwrap_or("").chars().take(16).collect();
     let source: String = str_param(p, "source").unwrap_or("").chars().take(64).collect();
     let count = words.len();
-    e.session_mut().set_transcript(Transcript { track, words, language, source });
+    e.session_mut().set_transcript(Transcript { track, words, language, source, speaker_names: Vec::new() });
     Ok(json!({"track": track.0, "words": count}))
 }
 

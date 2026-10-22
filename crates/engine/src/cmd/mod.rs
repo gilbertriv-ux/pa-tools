@@ -32,6 +32,7 @@ mod tab;
 mod track;
 mod track_more;
 mod transcribe;
+mod transcript_edit;
 mod transport;
 mod video;
 mod view;
@@ -138,6 +139,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(sampler::specs());
         v.extend(video::specs());
         v.extend(transcribe::specs());
+        v.extend(transcript_edit::specs());
         v.extend(zoom_toggle::specs());
         v
     })
