@@ -121,3 +121,22 @@ two `xtask/src/main.rs` layer lines. The `transcribe` command + MCP tool, transc
   Both `track.transcribe` and `track.set_transcript` are undoable.
 - `Whisper::load` validates the folder's contents (configuration ranges, every token id against the
   vocabulary, alignment heads) before it reads the weights; a bad folder is an `Err`.
+
+## Addendum — after the final SPV (what differs again)
+- `SpeechError::ModelUnavailable` is now `{ model, searched }` (the model's catalogue id and the places
+  looked in). `SpeechError::summary()` is the one-line, folder-free form for a status line. Messages
+  name a model by its catalogue display name (`models::label`), never by its id ("Speech model, base
+  (multilingual) is not installed"); the id stays the folder name and the `model` / `source` field of
+  engine results.
+- A `model_unavailable` result carries `model` (id), `model_name`, `reason` (`not_found`,
+  `unsupported_build`, `unknown_model`, `invalid_model`), `why` (one line, no folders) and `error` (the
+  full text for agents and logs, with every place searched).
+- `track.transcribe` renders the track in 60 s ranges into one mono buffer at the session rate, then
+  resamples once; the buffer is capped at `MAX_MONO_SAMPLES` (2^29, about 3.1 h at 48 kHz) and a longer
+  track is refused before it is rendered. It never answers `ok` for less than the whole track. The
+  track's own end is used, not the session's.
+- The menu and the command palette run Transcribe Track as the Transcript window's background job;
+  only the control channel and MCP run the command synchronously.
+- `Whisper::load` also refuses a tokenizer whose timestamp tokens are not one run of 1501 ids after
+  every other token, weights with NaN or infinity (the tensor is named), and de-duplicates the
+  alignment heads; decoding stops with an error after 8 windows in a row that advance by under 0.5 s.

@@ -46,7 +46,7 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `ui.inspect` | `{}` | UI state (`window`, panels, dialogs), window size, playing/position, audio device, and `edit_layout` (timeline rect and every track row's rect, for clicking). |
 | `ui.set` | any `UiState` fields | e.g. `{"window": "Mix", "narrow_mix": true}`. |
 | `ui.menu.list` | `{}` | Every catalog menu path and the command that implements it (or null). |
-| `ui.menu.invoke` | `{path}` or `{id}` | Like clicking the menu item: may open its dialog (e.g. `"Track > New..."`). |
+| `ui.menu.invoke` | `{path}` or `{id}` | Like clicking the menu item: may open its dialog (e.g. `"Track > New..."`). `"Track > Transcribe Track"` opens the Transcript window and starts its background job, then returns at once; `engine.execute` of `track.transcribe` runs on the calling thread and answers when the transcript is stored. |
 | `ui.click` | `{x, y, button?, count?, cmd?, shift?, alt?, ctrl?}` | Synthetic click (window points). |
 | `ui.drag` | `{x, y, to_x, to_y, steps?}` | Synthetic drag with the primary button. |
 | `ui.scroll` | `{x, y, dx?, dy?, unit?: "point"\|"line", steps?, cmd?, shift?, alt?, ctrl?}` | A two-finger trackpad swipe over `(x, y)`: `dx`/`dy` points spread over `steps` frames (default 8). Positive values move the content right/down (natural scrolling). `unit: "line"` sends mouse-wheel notches instead. With `cmd` it zooms; with `shift` it scrolls sideways. |
