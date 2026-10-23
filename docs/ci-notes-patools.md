@@ -12,6 +12,7 @@ run; several of its beliefs turned out wrong and are corrected here.
 | 2026-10-22 | 1 | Written by the packaging worker at the fork point. The six workflows were thin callers to `storytold/craft-common-actions`, which was believed to be **private** and was not read. Included an untested sketch of a Windows MSI job that lacked the `wix extension add` step. |
 | 2026-10-23 | 2 | craft-common-actions read (public, **no licence**, trust and cost findings below). Gil decided to write Pa Tools' own workflows. Added `ci.yml` (PR gate on Linux, build and test on macOS and Windows) and `windows-msi.yml` (unsigned x64 and arm64 MSIs, built and run on GitHub). Replaced the MSI sketch with the real file. Added the failure-annotation scheme and the Dependabot ignore block. Corrected the "private" claim. |
 | 2026-10-23 | 2.1 | Review fixes on draft PR #4. **Provenance:** a smoke-test step in the first `windows-msi.yml` was derived from craft-common-actions (no licence); removed and rewritten (see "Provenance incident" below). Pinned the Rust toolchain. Recovery-test note corrected; `leftovers()` keeps a tie; one concurrency group per commit on `pa-tools`; cache saved only from `pa-tools`; Dependabot egui ignores narrowed; NOTICE and licences installed by the MSI. |
+| 2026-10-23 | 2.2 (branch `ci/release-macos`) | Added `release-macos.yml` (universal DMG + CLI zip via the repo's own `package.sh`/`import-cert.sh`; version asserted against Cargo; DMG smoke test; unsigned without secrets; draft Release on a `v*` tag). Marked item 4 done. Added on the `ci/release-macos` lane branch; may need a merge with the main session's own next revision of this file. |
 
 ## Where things stand
 
@@ -19,6 +20,7 @@ run; several of its beliefs turned out wrong and are corrected here.
 |---|---|---|
 | `ci.yml` (Pa Tools CI) | Pa Tools' own | Runs on every pull request, on pushes to `pa-tools` and `feat/**`, and by hand. |
 | `windows-msi.yml` (Pa Tools Windows MSI) | Pa Tools' own | Builds the unsigned x64 and arm64 MSIs; runs on pushes to `pa-tools`, by hand, and on PRs touching `packaging/windows/**`. |
+| `release-macos.yml` (Pa Tools macOS release) | Pa Tools' own | On branch `ci/release-macos`, not on `pa-tools` yet. Builds the universal DMG and the CLI zip (ad-hoc/unsigned without secrets); drafts a Release on a `v*` tag. |
 | `speech-real-model.yml` (Pa Tools Speech) | Pa Tools' own | On branch `feat/g18-speech` (PR #2), not on `pa-tools` yet. Self-contained. |
 | `release.yml`, `windows-arm64.yml`, `freebsd.yml`, `nix.yml`, `packaging-lint.yml`, `sonarcloud.yml` | thin callers to `craft-common-actions@main` | Unchanged. See "The thin callers" below. |
 | `dependabot.yml` | GitHub | Daily, grouped. Ignores the egui family and symphonia 0.6 (see below). |
@@ -160,6 +162,59 @@ turns red because the tool changed, not the code, teaches people to ignore it.
   `package.ps1` also makes are not uploaded.
 - Timing: about 6 to 7 minutes per architecture warm (cold: 6 for x64, 10 for arm64).
 
+### `release-macos.yml` (Pa Tools macOS release)
+
+The macOS half of item 4 and item 8 of "What still has to be written", on branch `ci/release-macos`.
+Written for Pa Tools from public documentation (GitHub Actions; Apple on `codesign`, `notarytool`,
+`stapler`, `spctl` and signing in CI with a temporary keychain) and from this repository's own
+`packaging/macos/package.sh`, `import-cert.sh` and `entitlements.plist`. **Nothing** is taken from
+`storytold/craft-common-actions` (no licence); that repository was not opened for this file.
+
+- **It calls the repository's own scripts; it does not re-implement them.** One `macos` job on
+  `macos-15` (Apple silicon, a free runner — never `-xlarge`):
+  1. installs the pinned Rust (`1.97.0`) with both `aarch64-apple-darwin` and `x86_64-apple-darwin`;
+  2. runs `packaging/macos/import-cert.sh` (imports the Developer ID certificate into a temporary
+     keychain and appends `MACOS_SIGN_IDENTITY`/`MACOS_KEYCHAIN` to `$GITHUB_ENV`; with no certificate
+     it warns and exits 0);
+  3. runs `packaging/macos/package.sh --arch universal` (builds both targets, `lipo`s them into one
+     universal `Pa Tools.app`, signs, notarises+staples when the three notarisation secrets are set,
+     and writes `dist/release/patools-<ver>-macos-universal.dmg` and the CLI zip).
+- **Version from Cargo only.** A step reads `[workspace.package] version` through `cargo metadata
+  --no-deps` (fails if the packages disagree, as `windows-msi.yml` does) and asserts the built
+  `Info.plist`'s `CFBundleShortVersionString` equals the short version and `PaToolsVersion` equals the
+  full version. The tag is never read for the version.
+- **Smoke test.** Mounts the finished DMG, runs `Pa Tools.app/Contents/MacOS/Pa Tools --version` and
+  requires it print "Pa Tools" and the Cargo version, then `codesign --verify --deep --strict` the
+  app; when a real Developer ID was used it also runs `spctl --assess --type execute` (skipped for the
+  ad-hoc/unsigned build, which Gatekeeper is expected to reject).
+- **Unsigned without secrets.** With no `APPLE_CERTIFICATE` secret the DMG is ad-hoc signed and not
+  notarised; it is a valid artifact that will not pass Gatekeeper on another Mac, and the job summary
+  says "unsigned". This is the path the first runs exercise.
+- **Artifacts (14 days):** `patools-macos-universal` holds the DMG and the CLI zip. The temporary
+  keychain is deleted in an `if: always()` step.
+- **Draft Release (tags only).** A second job, `draft-release`, runs only on a `v*` tag, is the only
+  job with `contents: write` (plus `actions: read`), downloads this run's artifacts with the
+  first-party `gh` CLI (so no extra third-party action is pinned) and runs `gh release create "$tag"
+  --draft`. This is the macOS slice of item 8; the unified draft-release job that also writes
+  `SHA256SUMS.txt` across platforms supersedes it once Linux/Windows/Web join.
+- **Triggers:** `workflow_dispatch` and `push: tags: ["v*"]`. Note that `workflow_dispatch` only
+  becomes available once the file is on the **default branch** (`pa-tools`); until this lane merges,
+  dispatch it by pushing a throwaway `v*` tag (the push-tag event runs the workflow from the tagged
+  ref). The version it builds still comes from `Cargo.toml`, not the tag.
+- **Pinned actions:** the same three SHAs as `ci.yml`/`windows-msi.yml` (`actions/checkout`,
+  `Swatinem/rust-cache`, `actions/upload-artifact`); no others.
+
+**Secrets for the signed path.** `release-macos.yml` reads the same six names the scripts and
+`release.yml` already use (see "Secrets and settings to create" below): `APPLE_CERTIFICATE`,
+`APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`. (The
+localisation lane's prompt named these with Apple's generic documentation spellings —
+`APPLE_CERTIFICATE_P12_BASE64` and `APPLE_APP_PASSWORD` — which map to `APPLE_CERTIFICATE` and
+`APPLE_PASSWORD` here; the repository keeps one set of names across `import-cert.sh`, `package.sh`,
+`release.yml` and this file.) The job reads them at job level, so put them in as **repository**
+secrets; to reuse the `release` *environment* instead, add `environment: release` to the `macos` job
+and allow the `v*` tags in that environment's deployment tag rules (its default branch restriction is
+written for `release.yml`, which runs on the `release` branch, not on tags).
+
 ### Provenance incident (review of draft PR #4, fixed in the same pull request)
 
 An independent review found that about 14 lines of the first `windows-msi.yml`, in its smoke-test step,
@@ -267,8 +322,9 @@ In priority order; everything is Pa Tools' own code, pinned by commit SHA.
 3. **Linux**: x86_64 on `ubuntu-22.04`, aarch64 on `ubuntu-22.04-arm`; `packaging/linux/package.sh` makes
    the AppImage, `.deb`, `.rpm` (nfpm) and tarball; `flatpak-bundle.sh` repackages the tarball
    (`ubuntu-24.04` and `ubuntu-24.04-arm`).
-4. **macOS**: `packaging/macos/package.sh` on `macos-15` (a free runner, not xlarge). Needs Gil's own
-   Developer ID certificate; until the secrets exist it signs ad hoc.
+4. ~~**macOS**~~: done (`release-macos.yml`, branch `ci/release-macos`). `packaging/macos/package.sh`
+   on `macos-15` (a free runner, not xlarge). Needs Gil's own Developer ID certificate; until the
+   secrets exist it signs ad hoc. See "`release-macos.yml`" above.
 5. **Web**: `packaging/web/package.sh` (Trunk) on `ubuntu-24.04`.
 6. **Packaging lint**: `actionlint`, `shellcheck`, `pwsh` parse, `xmllint`, `desktop-file-validate`,
    `appstreamcli validate`. No secrets, cheap. (`actionlint` and `shellcheck` already pass locally on

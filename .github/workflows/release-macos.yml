@@ -1,0 +1,241 @@
+# Pa Tools macOS release: builds, signs, notarises and packages the universal macOS artifacts with
+# the repository's own packaging/macos/package.sh and import-cert.sh, and (on a version tag) drafts
+# a GitHub Release with them.
+#
+# Provenance: written for Pa Tools from public documentation (GitHub Actions, and Apple's developer
+# documentation on codesign, notarytool, stapler, spctl and signing in CI with a temporary
+# keychain) and from this repository's own packaging/macos/package.sh, import-cert.sh and
+# entitlements.plist. Nothing here is taken from storytold/craft-common-actions, which declares no
+# licence (docs/ci-notes-patools.md); that repository was not opened.
+#
+# * One macos job builds aarch64-apple-darwin and x86_64-apple-darwin and runs package.sh, which
+#   lipos them into one universal "Pa Tools.app", signs it (Developer ID when the secrets below are
+#   present, ad-hoc otherwise), notarises and staples it when the notarisation secrets are present,
+#   and produces the DMG and the CLI zip.
+# * No secrets: the build still succeeds. import-cert.sh prints a warning and leaves signing ad-hoc,
+#   package.sh skips notarisation, and the job summary says "unsigned". An unsigned DMG is still a
+#   valid artifact; it will not pass Gatekeeper on another Mac.
+# * Version: the single source of truth is [workspace.package] version in Cargo.toml. The job asserts
+#   the built app's Info.plist CFBundleShortVersionString (and PaToolsVersion) match it; it is never
+#   taken from the tag.
+# * Standard free GitHub-hosted runners only (macos-15, Apple silicon; never an -xlarge runner).
+#   Every third-party action is pinned to a commit SHA (the same pins as ci.yml and windows-msi.yml).
+#
+# Secrets (all optional; each missing one only leaves that step unsigned/un-notarised). These are the
+# names the repository's own scripts already read (import-cert.sh, package.sh) and that release.yml
+# passes; see docs/ci-notes-patools.md, "macOS release":
+#   APPLE_CERTIFICATE            base64 .p12 of the "Developer ID Application" certificate
+#   APPLE_CERTIFICATE_PASSWORD   its export password
+#   KEYCHAIN_PASSWORD            password for the temporary keychain (optional; random if unset)
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID   notarytool credentials (APPLE_PASSWORD is the
+#                               app-specific password)
+name: Pa Tools macOS release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+# Read-only by default; only the draft-release job asks for contents: write.
+permissions:
+  contents: read
+
+# One release per ref, never cancelled: notarisation can take minutes and must not be interrupted.
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The Rust release to build with: the same pin as ci.yml and windows-msi.yml (see the note in
+  # ci.yml before changing it).
+  RUST_TOOLCHAIN: "1.97.0"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  macos:
+    name: Universal DMG (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Recorded in the app's Info.plist (PaToolsBuildCommit) and used by env.sh.
+      SOUNDCRAFT_BUILD_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (pinned, both macOS targets)
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-macos
+          cache-on-failure: true
+          # Only the integration branch writes the cache (dispatch/tag runs read it); matches ci.yml.
+          save-if: ${{ github.ref == 'refs/heads/pa-tools' }}
+
+      # Imports the Developer ID certificate into a temporary keychain when APPLE_CERTIFICATE is set,
+      # and appends MACOS_SIGN_IDENTITY and MACOS_KEYCHAIN to $GITHUB_ENV for the steps below. With no
+      # certificate it warns and exits 0, so the build falls back to ad-hoc signing.
+      - name: Import signing certificate (optional)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: bash packaging/macos/import-cert.sh
+
+      # Builds both targets, lipos them universal, assembles/signs "Pa Tools.app", notarises and
+      # staples when the three notarisation secrets are present, and writes the DMG and the CLI zip
+      # to dist/release. MACOS_SIGN_IDENTITY / MACOS_KEYCHAIN come from the step above via $GITHUB_ENV.
+      - name: Build, sign, notarise and package (universal)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash packaging/macos/package.sh --arch universal
+
+      # The version lives in exactly one place. Assert the built bundle agrees with Cargo, so a DMG
+      # can never ship a version string that drifted from [workspace.package] version.
+      - name: Assert the app version matches Cargo.toml
+        run: |
+          set -euo pipefail
+          versions="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].version' | sort -u)"
+          if [ "$(printf '%s\n' "$versions" | grep -c .)" -ne 1 ]; then
+            echo "::error::workspace packages disagree on the version: $(printf '%s ' $versions)"
+            exit 1
+          fi
+          cargo_version="$versions"
+          short_version="${cargo_version%%-*}"
+          plist="target/macos-package/Pa Tools.app/Contents/Info.plist"
+          short_in_plist="$(plutil -extract CFBundleShortVersionString raw -o - "$plist")"
+          full_in_plist="$(plutil -extract PaToolsVersion raw -o - "$plist")"
+          echo "Cargo version: $cargo_version (short $short_version)"
+          echo "Info.plist   : CFBundleShortVersionString=$short_in_plist PaToolsVersion=$full_in_plist"
+          if [ "$short_in_plist" != "$short_version" ]; then
+            echo "::error::CFBundleShortVersionString ($short_in_plist) != Cargo short version ($short_version)"
+            exit 1
+          fi
+          if [ "$full_in_plist" != "$cargo_version" ]; then
+            echo "::error::PaToolsVersion ($full_in_plist) != Cargo version ($cargo_version)"
+            exit 1
+          fi
+          # Export for the smoke and summary steps.
+          {
+            echo "PT_CARGO_VERSION=$cargo_version"
+            echo "PT_DMG=dist/release/patools-$cargo_version-macos-universal.dmg"
+            echo "PT_CLI_ZIP=dist/release/pa-tools-cli-$cargo_version-macos-universal.zip"
+          } >>"$GITHUB_ENV"
+
+      # Mount the finished DMG and run the app the way a user gets it: the app binary must print the
+      # product name and the Cargo version, the signature must verify strictly, and (only when a real
+      # Developer ID was used) Gatekeeper must accept it.
+      - name: Smoke test the DMG
+        run: |
+          set -euo pipefail
+          test -f "$PT_DMG" || { echo "::error::DMG not found: $PT_DMG"; exit 1; }
+          mount="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$mount"
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mount" "$PT_DMG" >/dev/null
+          cleanup() { hdiutil detach "$mount" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          app="$mount/Pa Tools.app"
+          bin="$app/Contents/MacOS/Pa Tools"
+          out="$("$bin" --version)"
+          echo "pa-tools --version -> $out"
+          echo "$out" | grep -qF "Pa Tools" || { echo "::error::--version did not print the product name"; exit 1; }
+          echo "$out" | grep -qF "$PT_CARGO_VERSION" || { echo "::error::--version did not print $PT_CARGO_VERSION"; exit 1; }
+          # Signature must verify strictly whether ad-hoc or Developer ID.
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ "${MACOS_SIGN_IDENTITY:-}" != "-" ]; then
+            echo "Developer ID signature: asserting Gatekeeper acceptance"
+            spctl --assess --type execute -vv "$app"
+          else
+            echo "ad-hoc signature (unsigned build): skipping spctl Gatekeeper assessment"
+          fi
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ "${MACOS_SIGN_IDENTITY:-}" != "-" ]; then
+            signed="signed (Developer ID)"
+            [ -n "${APPLE_ID_PRESENT:-}" ] && signed="$signed and notarised"
+          else
+            signed="**unsigned** (ad-hoc; no APPLE_CERTIFICATE secret)"
+          fi
+          {
+            echo "## Pa Tools macOS release"
+            echo ""
+            echo "- Version: \`${PT_CARGO_VERSION:-unknown}\` (from Cargo.toml)"
+            echo "- Signing: $signed"
+            echo ""
+            echo "| Artifact | Size |"
+            echo "|---|---|"
+            for f in "$PT_DMG" "$PT_CLI_ZIP"; do
+              if [ -f "$f" ]; then
+                echo "| \`$(basename "$f")\` | $(ls -lh "$f" | awk '{print $5}') |"
+              fi
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+        env:
+          APPLE_ID_PRESENT: ${{ secrets.APPLE_ID }}
+
+      - name: Upload the DMG and CLI zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patools-macos-universal
+          path: |
+            dist/release/*.dmg
+            dist/release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      # The temporary signing keychain must not outlive the job. import-cert.sh only sets
+      # MACOS_KEYCHAIN when a certificate was imported, so this is a no-op for the unsigned path.
+      - name: Delete the temporary keychain
+        if: always()
+        run: |
+          if [ -n "${MACOS_KEYCHAIN:-}" ]; then
+            security delete-keychain "$MACOS_KEYCHAIN" || true
+            echo "deleted temporary keychain"
+          fi
+
+  # Only on a version tag, and the only job granted contents: write. Downloads this run's artifacts
+  # with the first-party gh CLI (so no extra third-party action is pinned) and drafts a Release.
+  draft-release:
+    name: Draft GitHub Release
+    needs: macos
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download this run's artifacts
+        run: gh run download "${{ github.run_id }}" --dir artifacts
+
+      - name: Draft the Release
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          files=()
+          while IFS= read -r f; do files+=("$f"); done < <(find artifacts -type f \( -name '*.dmg' -o -name '*.zip' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no artifacts to attach"; exit 1
+          fi
+          printf 'attaching: %s\n' "${files[@]}"
+          gh release create "$tag" --draft --title "Pa Tools $tag" \
+            --notes "Draft release for $tag. macOS artifacts built by release-macos.yml. Review, add the other platforms' artifacts, and publish." \
+            "${files[@]}"
