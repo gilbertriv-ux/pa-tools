@@ -133,7 +133,8 @@ fn closing_the_session_or_quitting_drops_its_autosave() {
         let mut next = launch(&root);
         let left = next.leftovers[0].clone();
         next.recover(&left);
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "{end}");
+        // recover() hands the recovered session to the background writer, which makes its folder.
+        assert!(eventually(|| std::fs::read_dir(&root).is_ok_and(|d| d.count() == 1)), "{end}");
         next.run(end, json!({})).unwrap();
         next.close_autosave();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "{end}");
