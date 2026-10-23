@@ -4844,6 +4844,7 @@ dependencies = [
  "soundcraft-midi",
  "soundcraft-mix",
  "soundcraft-model",
+ "soundcraft-pa-speech",
  "soundcraft-playback",
  "soundcraft-time",
  "soundcraft-video",

@@ -36,6 +36,8 @@ image.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+# The fixed recogniser that tests of the menu, palette and Transcript window inject.
+soundcraft-pa-speech.workspace = true
 
 [lints]
 workspace = true

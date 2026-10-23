@@ -12,6 +12,10 @@
 //! open this window on the track and return at once. Only calls that come in over the control
 //! channel or MCP run `track.transcribe` synchronously, on the calling thread.
 //!
+//! A stopped transcription leaves its worker thread running until the next time the recogniser
+//! checks in; the window keeps the thread's handle and starts no other job until it has finished
+//! (see [`TranscriptState::is_stopping`]), so two recognisers never hold the model in memory at once.
+//!
 //! Nothing here names the speech model's maker or its id: people read the catalogue's display name
 //! ("Speech model, base (multilingual)"), and the folders searched go to the log, not the status line.
 //!
@@ -22,7 +26,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold, mono, regular};
 use egui::{Align, Color32, Key, Label, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 use serde_json::{Map, Value, json};
-use soundcraft_engine::cmd::{TranscribeOutcome, track_param, transcribe_job};
+use soundcraft_engine::cmd::{SharedTranscriber, TranscribeOutcome, track_param, transcribe_job, transcribe_job_with_transcriber};
 use soundcraft_model::{Session, TrackId, TrackKind, Transcript, TranscriptWord};
 use soundcraft_time::{SampleRate, Samples};
 use std::sync::Arc;
@@ -197,6 +201,12 @@ pub struct TranscriptState {
     /// What the window last had to say (progress, results, why nothing happened).
     pub status: String,
     job: Option<Running>,
+    /// The worker thread of a transcription that was stopped and has not finished yet. No other
+    /// job starts while it is alive.
+    stopping: Option<std::thread::JoinHandle<()>>,
+    /// A recogniser to use instead of looking for the speech model (see
+    /// [`TranscriptState::inject_transcriber`]); `None` in the program.
+    transcriber: Option<SharedTranscriber>,
     /// A transcription asked for before there was a frame to start it in (see [`invoke`]).
     pending: Option<TrackId>,
     view: Option<View>,
@@ -218,6 +228,8 @@ impl Default for TranscriptState {
             track: None,
             status: String::new(),
             job: None,
+            stopping: None,
+            transcriber: None,
             pending: None,
             view: None,
             shown: None,
@@ -233,6 +245,25 @@ impl TranscriptState {
     pub fn is_running(&self) -> bool {
         self.job.is_some()
     }
+
+    /// Whether a transcription that was stopped is still winding down on its worker thread. A new
+    /// one does not start until it has finished.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.as_ref().is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Use `transcriber` for every transcription this window starts, instead of looking for the
+    /// speech model on disk. This is the seam for tests of the menu, the command palette and this
+    /// window, which prove that a background job ends in a stored transcript without the model being
+    /// installed; the app itself never calls it, so in the program every job looks for the model.
+    pub fn inject_transcriber(&mut self, transcriber: SharedTranscriber) {
+        self.transcriber = Some(transcriber);
+    }
+
+    /// Whether jobs use an injected recogniser ([`TranscriptState::inject_transcriber`]).
+    pub fn has_injected_transcriber(&self) -> bool {
+        self.transcriber.is_some()
+    }
 }
 
 /// A transcription on its worker thread.
@@ -245,6 +276,8 @@ struct Running {
     stage: String,
     cancel: Arc<AtomicBool>,
     rx: Receiver<Msg>,
+    /// The worker thread, kept so that a stop can wait for it (see [`TranscriptState::stopping`]).
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 enum Msg {
@@ -374,17 +407,31 @@ fn job_params(track: TrackId, models_dir: &str, language: Option<String>) -> Val
     Value::Object(params)
 }
 
+/// What the window says while a stopped transcription is still winding down.
+const STOPPING: &str = "Stopping the previous transcription…";
+
 /// Starts transcribing `track` on a worker thread.
 fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
     if app.transcript.job.is_some() {
         return set_status(app, "A transcription is already running");
+    }
+    // A stopped job's thread may still be working on the model; wait for it, so that two recognisers
+    // never run at once (the button is greyed out for the same reason).
+    if app.transcript.is_stopping() {
+        return set_status(app, STOPPING);
     }
     let Some(track_name) = app.engine.session().track(track).map(|t| t.name.clone()) else {
         set_status(app, "That track no longer exists");
         return;
     };
     let params = job_params(track, &app.transcript.models_dir, language_flag(app.engine.session()));
-    let job = match transcribe_job(&app.engine, &params) {
+    // The ordinary job looks for the speech model when it runs; only a recogniser injected on the
+    // state (tests) replaces that.
+    let job = match &app.transcript.transcriber {
+        Some(transcriber) => transcribe_job_with_transcriber(&app.engine, &params, Arc::clone(transcriber)),
+        None => transcribe_job(&app.engine, &params),
+    };
+    let job = match job {
         Ok(job) => job,
         Err(e) => {
             set_status(app, e.to_string());
@@ -407,29 +454,61 @@ fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
         let _ = tx.send(Msg::Done(result));
         repaint.request_repaint();
     });
-    if let Err(e) = spawned {
-        set_status(app, format!("Transcription needs a background thread, and this build cannot start one ({e})"));
-        return;
-    }
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(e) => {
+            set_status(app, format!("Transcription needs a background thread, and this build cannot start one ({e})"));
+            return;
+        }
+    };
     let started = ctx.input(|i| i.time);
-    app.transcript.job = Some(Running { track, track_name: track_name.clone(), started, fraction: 0.0, stage: String::new(), cancel, rx });
+    app.transcript.job =
+        Some(Running { track, track_name: track_name.clone(), started, fraction: 0.0, stage: String::new(), cancel, rx, thread: Some(thread) });
     app.transcript.status = format!("Transcribing {track_name}...");
     ctx.request_repaint();
 }
 
-/// Stops a running transcription. True when there was one.
+/// Stops a running transcription. True when there was one. The worker is told to stop at once; it
+/// finishes what it is doing and ends a moment later, and until it has, no other transcription
+/// starts ([`TranscriptState::is_stopping`]).
 pub(crate) fn cancel(app: &mut SoundApp) -> bool {
     // A request that has not started yet belongs to the session being replaced too.
     app.transcript.pending = None;
-    let Some(job) = app.transcript.job.take() else { return false };
+    let Some(mut job) = app.transcript.job.take() else { return false };
     job.cancel.store(true, Ordering::Relaxed);
-    set_status(app, "Transcription stopped");
+    app.transcript.stopping = job.thread.take().filter(|thread| !thread.is_finished());
+    if app.transcript.stopping.is_some() {
+        set_status(app, STOPPING);
+    } else {
+        set_status(app, "Transcription stopped");
+    }
     true
+}
+
+/// Notices that a stopped transcription's thread has ended: joins it and says so, once.
+fn reap_stopped(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some(thread) = &app.transcript.stopping else { return };
+    if !thread.is_finished() {
+        // Nothing wakes the window when the thread ends, so look again shortly.
+        ctx.request_repaint_after_secs(0.1);
+        return;
+    }
+    if let Some(thread) = app.transcript.stopping.take()
+        && thread.join().is_err()
+    {
+        log::warn!("transcription: the stopped worker thread panicked");
+    }
+    // Only replace the message it belongs to: something else may have been said since.
+    if app.transcript.status == STOPPING {
+        set_status(app, "Transcription stopped");
+    }
+    ctx.request_repaint();
 }
 
 /// Collects the worker's progress and result. Called every frame from `logic`, so a result lands
 /// even while the window is hidden.
 pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
+    reap_stopped(app, ctx);
     if let Some(track) = app.transcript.pending.take() {
         // Collect its answer from the next frame on, not in the frame that starts it.
         return start(app, ctx, track);
@@ -646,7 +725,9 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
     let t = Tokens::current();
     let choices = candidates(f.s);
     let shown = resolve(st.track, &choices, f.s);
-    let busy = st.job.is_some();
+    let running = st.job.is_some();
+    // A stopped job that is still winding down keeps the button off, too.
+    let busy = running || st.is_stopping();
 
     if let Some(shown) = shown {
         let shown_name = choices.iter().find(|(id, _)| *id == shown).map(|(_, n)| n.clone()).unwrap_or_default();
@@ -666,7 +747,7 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
             {
                 out.push(Action::Transcribe(shown));
             }
-            if busy && ui.button("Cancel").clicked() {
+            if running && ui.button("Cancel").clicked() {
                 out.push(Action::Cancel);
             }
         });
@@ -1223,7 +1304,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let track_name = app.engine.session().track(track).unwrap().name.clone();
         let stop = Arc::clone(&cancel);
-        app.transcript.job = Some(Running { track, track_name, started: 0.0, fraction: 0.0, stage: String::new(), cancel, rx });
+        app.transcript.job = Some(Running { track, track_name, started: 0.0, fraction: 0.0, stage: String::new(), cancel, rx, thread: None });
         (tx, stop)
     }
 
@@ -1350,6 +1431,153 @@ mod tests {
         assert!(app.transcript.job.is_none());
         assert_eq!(app.transcript.status, "Transcription stopped");
         assert_eq!(app.ui.status, "Transcription stopped");
+    }
+
+    /// A worker thread that stays alive until the returned sender is used (or dropped), standing in
+    /// for a recogniser that takes a while to notice it was told to stop.
+    fn slow_worker() -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, wait) = mpsc::channel::<()>();
+        (
+            release,
+            std::thread::spawn(move || {
+                let _ = wait.recv();
+            }),
+        )
+    }
+
+    /// Steps the window until `done`, up to ten seconds.
+    fn step_until(app: &mut SoundApp, ctx: &egui::Context, done: impl Fn(&SoundApp) -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(app) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            step(app, ctx);
+        }
+        assert!(done(app), "timed out; status is `{}`", app.transcript.status);
+    }
+
+    /// After Cancel the worker thread may still be running the model. A new job must not start
+    /// until it has ended: the window says so, keeps the handle, and starts again once it is done.
+    #[test]
+    fn after_cancel_no_new_job_starts_until_the_old_thread_has_finished() {
+        let (mut app, ctx) = (app(), egui::Context::default());
+        let track = first_audio(&app);
+        let (_tx, stop) = fake_job(&mut app, track);
+        let (release, thread) = slow_worker();
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+
+        assert!(cancel(&mut app));
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(app.transcript.job.is_none() && !app.transcript.is_running());
+        assert!(app.transcript.is_stopping(), "the old thread is still alive");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        assert_eq!(app.ui.status, "Stopping the previous transcription…");
+
+        // Every way of asking for a job is refused, with the same message, while it winds down.
+        start(&mut app, &ctx, track);
+        assert!(app.transcript.job.is_none(), "start() refused");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        app.transcript.status.clear();
+        crate::menus::invoke_menu(&mut app, "track.transcribe", "Track > Transcribe Track");
+        step(&mut app, &ctx);
+        assert!(app.transcript.job.is_none() && !app.transcript.is_running(), "the menu entry started nothing");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        step(&mut app, &ctx);
+        assert!(app.transcript.is_stopping(), "stepping does not forget a thread that is alive");
+
+        // The old thread ends; the window notices, says so, and a new job can start.
+        drop(release);
+        step_until(&mut app, &ctx, |app| !app.transcript.is_stopping());
+        step(&mut app, &ctx);
+        assert!(app.transcript.stopping.is_none(), "the finished thread was joined and let go");
+        assert_eq!(app.transcript.status, "Transcription stopped");
+        app.transcript.models_dir =
+            std::env::temp_dir().join(format!("pa-tools-no-model-stop-{}", std::process::id())).to_string_lossy().into_owned();
+        start(&mut app, &ctx, track);
+        assert!(app.transcript.job.is_some(), "Transcribe works again");
+        step_until(&mut app, &ctx, |app| app.transcript.job.is_none());
+    }
+
+    /// A stopped job whose thread has already ended is not "stopping" at all.
+    #[test]
+    fn cancel_does_not_wait_for_a_thread_that_has_already_ended() {
+        let (mut app, ctx) = (app(), egui::Context::default());
+        let track = first_audio(&app);
+        let (_tx, _) = fake_job(&mut app, track);
+        let thread = std::thread::spawn(|| ());
+        while !thread.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+        assert!(cancel(&mut app));
+        assert!(!app.transcript.is_stopping());
+        assert_eq!(app.transcript.status, "Transcription stopped");
+        step(&mut app, &ctx);
+        assert_eq!(app.transcript.status, "Transcription stopped");
+    }
+
+    /// The Transcribe button is greyed out while the old thread winds down, and Cancel is not shown.
+    #[test]
+    fn the_transcribe_button_is_off_while_the_stopped_thread_is_alive() {
+        let mut app = app();
+        let track = first_audio(&app);
+        app.run("window.transcript", json!({"value": true})).unwrap();
+        let (_tx, _) = fake_job(&mut app, track);
+        let (release, thread) = slow_worker();
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+        assert!(cancel(&mut app));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut SoundApp| -> Vec<egui::epaint::ClippedShape> {
+            let raw =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            });
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // How the text is painted: a greyed-out label differs in colour or opacity from a live one.
+        let colour_of = |shapes: &[egui::epaint::ClippedShape], text: &str| {
+            shapes.iter().find_map(|c| match &c.shape {
+                Shape::Text(t) if t.galley.text() == text => Some((t.fallback_color, t.override_text_color, t.opacity_factor.to_bits())),
+                _ => None,
+            })
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = frame(&mut app);
+        }
+        let waiting = colour_of(&shapes, "Transcribe Track").expect("the button is drawn");
+        assert!(colour_of(&shapes, "Cancel").is_none(), "there is nothing to cancel");
+        assert!(
+            shapes.iter().any(|c| matches!(&c.shape, Shape::Text(t) if t.galley.text() == "Stopping the previous transcription…")),
+            "the window says why"
+        );
+
+        drop(release);
+        step_until(&mut app, &ctx, |app| !app.transcript.is_stopping());
+        for _ in 0..4 {
+            shapes = frame(&mut app);
+        }
+        let ready = colour_of(&shapes, "Transcribe Track").expect("the button is drawn");
+        assert_ne!(waiting, ready, "the button is enabled again (drawn in the normal text colour)");
+    }
+
+    #[test]
+    fn the_program_looks_for_the_model_unless_a_recogniser_is_injected() {
+        let mut app = app();
+        assert!(!app.transcript.has_injected_transcriber(), "a fresh window uses the model on disk");
+        app.transcript.inject_transcriber(std::sync::Arc::new(soundcraft_pa_speech::FixedTranscriber {
+            transcript: soundcraft_pa_speech::Transcript::default(),
+            id: "fixed".into(),
+        }));
+        assert!(app.transcript.has_injected_transcriber());
     }
 
     #[test]
