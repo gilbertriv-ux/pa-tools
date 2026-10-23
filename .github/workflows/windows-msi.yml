@@ -70,6 +70,7 @@ jobs:
         with:
           key: windows-msi-${{ matrix.arch }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/pa-tools' }}
 
       # WiX v5 is distributed as a .NET tool (https://www.nuget.org/packages/wix/5.0.2). patools.wxs
       # uses core WiX elements only (no UI, Util or other extension namespace), so the tool alone

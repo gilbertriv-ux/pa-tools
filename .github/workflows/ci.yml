@@ -83,10 +83,13 @@ jobs:
           rustc --version
           cargo --version
 
-      # A failing run still saves the cache: it holds compiled dependencies, not test results.
+      # A failing run still saves the cache: it holds compiled dependencies, not test results. Only
+      # pushes to `pa-tools` save it: pull-request and feature-branch runs read the cache of the
+      # default branch but do not each write a cache of their own, which would push it out.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/pa-tools' }}
 
       - name: Quality gate (cargo xtask ci)
         run: |
@@ -143,6 +146,7 @@ jobs:
         with:
           key: build-test-${{ matrix.os }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/pa-tools' }}
 
       - name: Build (cargo build --workspace)
         run: |
