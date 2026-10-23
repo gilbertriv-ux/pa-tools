@@ -47,7 +47,6 @@ mod adapt_hevc;
 pub mod av1;
 pub mod bitstream;
 pub mod convert;
-pub mod vc3;
 mod gop;
 pub mod h264;
 #[cfg(feature = "hevc-decode")]
@@ -56,6 +55,7 @@ pub mod isobmff;
 mod movie;
 pub mod prores;
 pub mod synth;
+pub mod vc3;
 
 pub use isobmff::ByteSource;
 pub use movie::{Frame, Movie, MovieInfo, SharedSource, fit_size};

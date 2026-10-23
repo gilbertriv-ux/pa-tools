@@ -11,7 +11,6 @@
 //!
 //! See the crate README for accuracy, performance and limitations.
 
-
 mod bits;
 mod dct;
 mod decode;
