@@ -1,15 +1,40 @@
-//! Clean-room Avid DNxHD / DNxHR codec (VC-3, implemented from SMPTE ST 2019-1:2016 and its
-//! Amendment 1:2023).
+//! Clean-room VC-3 picture codec (SMPTE ST 2019-1:2016 and its Amendment 1:2023), the intra-frame
+//! broadcast and post-production format also known by the names of its two profile families:
+//! the fixed-raster HD profile (compression IDs 1235-1260) and the resolution-independent
+//! profiles (1270-1274). Copied from FilmCraft's `filmcraft-dnx` (`storytold/filmcraft`, MIT OR
+//! Apache-2.0, commit `f47a1f6`), which was written from the public standard; its constant tables
+//! (Annex D weights, Annex E codewords) were extracted from the standard's text by the donor's
+//! script. The deltas here are hardening (see the list below) and the neutral names; the on-screen
+//! label of a stream is [`label`], e.g. "VC-3 (HQX, 10-bit)".
 //!
-//! - **Decoder** ([`decode_frame`]): every compression ID of the standard — the DNxHD (HD
-//!   profile) IDs 1235–1260 including interlaced field and macroblock-adaptive coding, thin
-//!   rasters and 4:4:4 RGB, and the resolution-independent DNxHR IDs 1270–1274 (LB, SQ, HQ, HQX,
-//!   444) at 8, 10 and 12 bits in 4:2:0, 4:2:2 and 4:4:4, with DCT or lossless alpha. Macroblock
-//!   scan lines decode in parallel with the `threads` feature (rayon).
-//! - **Encoder** ([`Encoder`]): DNxHR SQ / HQ (8-bit 4:2:2) and HQX (10- or 12-bit 4:2:2), CBR
-//!   at the standard's frame sizes, progressive.
+//! - **Decoder** ([`decode_frame`]): every compression ID of the standard, including interlaced
+//!   field and macroblock-adaptive coding, thin rasters and 4:4:4 RGB, and the LB, SQ, HQ, HQX
+//!   and 444 profiles at 8, 10 and 12 bits in 4:2:0, 4:2:2 and 4:4:4, with DCT or lossless alpha.
+//!   Macroblock scan lines decode in parallel with the `threads` feature (rayon).
+//! - **Encoder** ([`Encoder`]): LB, SQ and HQ (8-bit 4:2:2), HQX (10- or 12-bit 4:2:2) and 444
+//!   (10- or 12-bit), CBR at the standard's frame sizes, progressive. Used here to make test
+//!   streams; the app does not write VC-3.
 //!
-//! See the crate README for accuracy, performance and limitations.
+//! ## Accuracy
+//!
+//! The donor measured the decoder against ffmpeg's: every sample within 2 levels, at most about 50
+//! per million beyond 1, 87 to 99 % bit-identical (ffmpeg uses an integer inverse DCT, this
+//! decoder the exact one of equation 8.3). `oracle.rs` repeats that comparison (ignored, needs
+//! ffmpeg), and `fixture_tests.rs` checks a committed ffmpeg-made sample without it. In three
+//! places the decoder follows ffmpeg's measured behaviour instead of the standard's text
+//! ([`DecodeOptions::spec_dequant`] selects the text for the first): the reconstruction offset of
+//! a quantised amplitude (3/4 of a step, not 1/2), the weights of compression ID 1271 (the ones
+//! of 1241), and the 4:4:4 signalling (every 4:4:4 stream is R'G'B' except macroblocks flagged
+//! `ACF`; planes are G, B, R).
+//!
+//! ## Hardening against hostile files
+//!
+//! Headers are untrusted: sizes are capped at 8192 on a side and at the crate's picture limit
+//! (both fields of a field-coded frame counted) before any plane exists, every scan line must be
+//! long enough for its macroblocks before planes are allocated, decoding fits a 1 GiB budget,
+//! the HD profile refuses the 4:2:0 layout it has no macroblock structure for (the donor
+//! panicked on it), and offsets, indices and plane copies use `get()`. Pixel loops index fixed
+//! blocks bounded by that validated geometry. Tests: `tests.rs` (sweeps, fuzzing, absurd headers).
 
 mod bits;
 mod dct;
