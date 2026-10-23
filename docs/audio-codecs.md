@@ -165,12 +165,16 @@ Gil decides when to enable it.
   project and render crates and is not imported; its design was re-implemented in `crates/aac/src/export/`,
   with an edit list that also trims the tail. The Ogg writer and the 48 kHz converter in `soundcraft-opus`
   are new, written from RFC 3533, RFC 7845 and RFC 6716 for Pa Tools.
-- **Huffman tables: needs Gil's confirmation.** The AAC Huffman codebooks (`crates/aac/src/huffman_tables.rs`)
-  are the normative values of ISO/IEC 14496-3 Annex 4.A. The donor authors recovered them by probing the
-  behaviour of an ffmpeg binary as a black-box oracle (`crates/aac/tools/probe.py`, `derive.py`, `gen.py`
-  are kept for provenance); no ffmpeg source was read or copied. The tables are standard-mandated data and are
-  checked to be complete prefix codes, but the method touches a GPL-built binary, so this is flagged for the
-  owner rather than assumed fine.
+- **Huffman table provenance (accepted by Gil, 2026-10-23).** The spectral and scalefactor codebooks in
+  `crates/aac/src/huffman_tables.rs` are the functional constants that ISO/IEC 14496-3 (MPEG-4 AAC; the same
+  codebooks as ISO/IEC 13818-7) requires every AAC implementation to contain. The independent review of this
+  branch checked all 12: sizes 121, 81×6, 64×2, 169×2 and 289, each a complete prefix code, with sampled
+  codewords matching the standard. They are byte-identical to the FilmCraft donor `d3801e2`. The donor derived
+  them by black-box probing a decoder (an ffmpeg binary, used as an oracle; the tools are kept in
+  `crates/aac/tools/`); no decoder source was read or copied. The file's arrangement is the standard's codebook
+  order, and its formatting comes from the donor's own `gen.py`, not from any other implementation's layout. As
+  standard-required interoperability constants they are treated as uncopyrightable facts (17 U.S.C. § 102(b)).
+  This is not legal advice. Gil accepted them on 2026-10-23.
 - **No third-party code in the Pa Tools additions.** ffmpeg and ffprobe are test tools only (`#[ignore]`d
   tests, run by hand), never a dependency.
 
