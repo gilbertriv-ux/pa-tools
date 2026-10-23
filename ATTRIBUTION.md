@@ -60,6 +60,17 @@ Small test samples for the video decoders, in `crates/video/tests/fixtures/`. Th
 | `crates/video/tests/fixtures/av1/av1-8bit-64x64-4f.ivf`, `av1-8bit-64x64-4f.mp4`, `av1-10bit-64x64-4f.ivf`, `av1-10bit-64x64-4f.mp4` | AV1 regression samples generated with libaom v3.8.2 (BSD-2-Clause, with the Alliance for Open Media Patent License 1.0) from synthetic test patterns; the samples are encoder output, not derivative works of the encoder, and no GPL code is included in this repository. |
 | `crates/video/tests/fixtures/av1/regress-grain-points.frames`, `regress-scaled-reference.frames` | libaom-encoded synthetic test pictures with a few header bits altered, so they work as fuzz regression inputs. Same licence note as the AV1 regression samples above. |
 
+## Third-party code and workflow provenance
+
+Dependencies and adapted files that are not assets (so `cargo xtask assets` does not check them),
+recorded here for their licence and provenance.
+
+| Path | Author | Source | License |
+|---|---|---|---|
+| `symphonia` 0.5.5 and its `symphonia-*` crates (16 packages in `Cargo.lock`; decode MP3, FLAC, Ogg Vorbis, WAV, AIFF, ALAC, AAC, MP4, CAF and MKV for `crates/audio-io`) | The Project Symphonia Developers (Philip Deljanov and contributors) | https://github.com/pdeljanov/Symphonia, used **unmodified** as released on crates.io (no `[patch]`, no vendored copy); the notice is in `NOTICE` | MPL-2.0, file-level copyleft (https://mozilla.org/MPL/2.0/). Unmodified MPL-2.0 dependencies are allowed (decision 2026-10-23); modifying MPL-2.0 files needs a new decision. |
+| `.github/workflows/ci.yml` | Pa Tools (GR8 ID YUZ.AI), adapted from the CI workflows of FilmCraft and PhotoCraft (ArtCraft Team and the FilmCraft / PhotoCraft contributors) | https://github.com/storytold/filmcraft (`.github/workflows/ci.yml`, the quality-gate job) and https://github.com/storytold/photocraft (`.github/workflows/ci.yml`, the OS matrix) | MIT OR Apache-2.0 |
+| `.github/workflows/windows-msi.yml`, `.github/scripts/ci-digest.sh` | Pa Tools (GR8 ID YUZ.AI) | original; the workflow only calls the repository's own `packaging/windows/` scripts. Nothing is taken from storytold/craft-common-actions, which has no licence file | MIT OR Apache-2.0 |
+
 ## Files
 
 | Path | Author | Source | License |
