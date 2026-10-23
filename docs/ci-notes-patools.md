@@ -146,8 +146,11 @@ ever run on a Mac:
   1. *Test:* an autosave counts as unsaved work only if it is newer than the session file it came
      from; Linux file systems stamp files from a clock that ticks every few milliseconds, so a save and
      the autosave right after it could carry the same time. The test now pauses 50 ms between them.
-  2. *Test:* `SoundApp::recover()` hands the recovered session to the background autosave writer, but a
-     test counted the autosave folders at once. It now waits with the file's own `eventually()`.
+  2. *Test (defensive, not a cause):* a test counted the autosave folders right after
+     `SoundApp::recover()`. That call is synchronous (`crates/ui-egui/src/lib.rs`: `recover()` calls
+     `write_autosave()`, which flushes the background writer before it returns), so the folder is
+     already there. The test now waits for it with the file's own `eventually()` anyway, so it does not
+     depend on that.
   3. *Product bug (data loss):* an autosave folder was named `<name> <epoch ms>-<pid>` and made with
      `create_dir_all`, so when one session closed (its folder kept for the next launch, holding unsaved
      work) and the next opened within the same millisecond, the new autosave reused the kept folder and

@@ -134,7 +134,9 @@ fn closing_the_session_or_quitting_drops_its_autosave() {
         let mut next = launch(&root);
         let left = next.leftovers[0].clone();
         next.recover(&left);
-        // recover() hands the recovered session to the background writer, which makes its folder.
+        // recover() writes the recovered session's autosave folder before it returns (it flushes the
+        // background writer), so the folder is already there. The wait is defensive: it keeps this
+        // test from depending on that.
         assert!(eventually(|| std::fs::read_dir(&root).is_ok_and(|d| d.count() == 1)), "{end}");
         next.run(end, json!({})).unwrap();
         next.close_autosave();
