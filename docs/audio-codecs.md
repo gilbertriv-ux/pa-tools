@@ -5,7 +5,7 @@
 What `crates/opus` (package `soundcraft-opus`) and `crates/aac` (package `soundcraft-aac`) can write, which
 of them ship, and why AAC is compiled out of shipped builds. For the format table see
 [`file-format-parity.md`](file-format-parity.md); for what is still missing see G-21 in [`gaps.md`](gaps.md).
-The video counterpart is [`video-codecs.md`](video-codecs.md).
+For the video side, see `docs/video-codecs.md` (added with the video decoders, G-17).
 
 **Status.** These are crates, tested on their own. Bounce, the CLI and the control channel do not call them
 yet: that wiring is a later lane (see "Wiring" below). Nothing in `crates/engine`, `crates/mix`,
@@ -125,6 +125,11 @@ and both writers answer `Error::NotBuilt` ("AAC export is not included in this b
 `cfg`; it shows the message and offers another format. `cargo xtask ci` lints and tests `soundcraft-aac`
 with `aac-encode` on as well as off, so the encoder does not rot while it is switched off.
 
+The Cargo feature `rayon` of `soundcraft-aac` quantises channels in parallel inside the encoder. It is only
+used together with `aac-encode` and does **not** switch it on: AAC encoding stays off unless `aac-encode` is
+named explicitly (`cargo tree -p soundcraft-aac -e features --features rayon` shows no `aac-encode`, and no
+`soundcraft-bitstream` or `soundcraft-isobmff`, among the normal dependencies).
+
 ## Patent posture
 
 Gil's decision of 2026-10-23 (the record is kept with the G-21 plan, not in this repository). This is not
@@ -181,6 +186,12 @@ Against hostile input and the never-crash rule (`AGENTS.md`):
   silence, when it would not leave room for the CELT part.
 - Bit counts are clamped to 32, transform sizes are rounded to a power of two instead of asserted, and every
   allocation the export API makes is bounded by a chunk size, not by the input.
+- The donor's one remaining debug assertion in the Opus encoder (a finished frame must fit its byte budget) is
+  kept as a count, not dropped: `Stats::frame_overflows` is the number of frames whose range coder ran past the
+  budget. It is 0 for every input the tests try (ordinary signals at five rates and channel layouts, the stress
+  signals in every mode, the random-signal test and the proptest), and the tests assert it.
+- `RangeDecoder::uint` returns 0 for `ft < 2` in debug and release alike (an empty range also sets the decoder's
+  error flag), instead of asserting.
 
 ## Wiring (what the engine lane does later)
 
@@ -195,8 +206,20 @@ Against hostile input and the never-crash rule (`AGENTS.md`):
 - Coordinate the format table with Phase 5 (`pa-formats`).
 - Fix the importer's edit-list and 88.2/96 kHz `.m4a` limits above before promising bounce-and-reimport.
 
+## Later: dedupe
+
+`crates/isobmff` (package `soundcraft-isobmff`, imported here from FilmCraft for the `.m4a` muxer) duplicates
+`crates/video/src/isobmff`: two copies of one ISO/IEC 14496-12 demuxer and muxer, about 4 500 and 4 300 lines,
+that have already started to diverge (this one has `Brand::M4a`, `Mp4Writer::set_edits` for edit lists and the
+memory notes above; the video copy has none of them). Keeping both is deliberate for now: the video decoders
+(G-17) are a separate lane, and merging the two is a refactor of that lane's code. When both are on the main
+line, make one the single implementation (the audio crate is the natural base, as it is the one with its own
+package, tests and README), point `soundcraft-video` at it, port the video copy's fixes across, and delete the
+other copy. Until then a fix to an MP4 box has to be made twice.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-23 | major | Created: Ogg Opus (ships) and AAC `.m4a` / ADTS (feature `aac-encode`, off in shipped builds) export crates for G-21, with limits, timing, measurements, patent posture and provenance |
+| 2026-10-23 | minor | Review follow-ups: dead `video-codecs.md` link made plain text, `.m4a` writer memory stated accurately, "Later: dedupe" note for the two ISOBMFF copies, `rayon` does not imply `aac-encode`, Opus frame-overflow count |
