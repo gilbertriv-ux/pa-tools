@@ -14,6 +14,22 @@ updates:
           - "*"
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # craft-ui (storytold/craft-libs, pinned in the root Cargo.toml) is built against egui 0.36, so
+      # the whole egui family has to move together, and only after craft-libs does. A bump to egui
+      # 0.37 on its own is not expected to build against craft-ui. Lift this block when the
+      # craft-libs pin moves to egui 0.37.
+      - dependency-name: "egui"
+      - dependency-name: "eframe"
+      - dependency-name: "egui_kittest"
+      - dependency-name: "egui_*"
+      - dependency-name: "epaint"
+      - dependency-name: "emath"
+      - dependency-name: "ecolor"
+      # symphonia 0.6 changes the API that crates/audio-io decodes through. Patch releases of 0.5
+      # (bug fixes) still come through; a move to 0.6 is a code change, so it is done by hand.
+      - dependency-name: "symphonia*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # Maintain GitHub Actions workflows
   - package-ecosystem: "github-actions"

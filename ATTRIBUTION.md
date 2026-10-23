@@ -31,6 +31,17 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is text from Inter
 (SIL OFL 1.1) converted to outlines; no font file is shipped.
 
+## Third-party code and workflow provenance
+
+Dependencies and adapted files that are not assets (so `cargo xtask assets` does not check them),
+recorded here for their licence and provenance.
+
+| Path | Author | Source | License |
+|---|---|---|---|
+| `symphonia` 0.5.5 and its `symphonia-*` crates (16 packages in `Cargo.lock`; decode MP3, FLAC, Ogg Vorbis, WAV, AIFF, ALAC, AAC, MP4, CAF and MKV for `crates/audio-io`) | The Project Symphonia Developers (Philip Deljanov and contributors) | https://github.com/pdeljanov/Symphonia, used **unmodified** as released on crates.io (no `[patch]`, no vendored copy); the notice is in `NOTICE` | MPL-2.0, file-level copyleft (https://mozilla.org/MPL/2.0/). Unmodified MPL-2.0 dependencies are allowed (decision 2026-10-23); modifying MPL-2.0 files needs a new decision. |
+| `.github/workflows/ci.yml` | Pa Tools (GR8 ID YUZ.AI), adapted from the CI workflows of FilmCraft and PhotoCraft (ArtCraft Team and the FilmCraft / PhotoCraft contributors) | https://github.com/storytold/filmcraft (`.github/workflows/ci.yml`, the quality-gate job) and https://github.com/storytold/photocraft (`.github/workflows/ci.yml`, the OS matrix) | MIT OR Apache-2.0 |
+| `.github/workflows/windows-msi.yml`, `.github/scripts/ci-digest.sh` | Pa Tools (GR8 ID YUZ.AI) | original; the workflow only calls the repository's own `packaging/windows/` scripts. Nothing is taken from storytold/craft-common-actions, which has no licence file | MIT OR Apache-2.0 |
+
 ## Files
 
 | Path | Author | Source | License |
@@ -55,3 +66,4 @@ Apache-2.0 — the same license as this repository. The donor's `filmcraft-time`
 `filmcraft-project` types are inlined (as `f64` seconds) so the crate carries no external
 dependency. Whisper model weights (`openai/whisper-*`, MIT) are downloaded on first use and are
 never bundled or committed.
+
