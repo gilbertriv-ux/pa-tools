@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (G-21 shrunk: Ogg Opus and AAC export crates landed, not yet wired to Bounce; previously trivial: G-04 mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -35,7 +35,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 | G-18 | Speech-to-text transcription | AI | this file | 30–50 |
 | G-19 | UI feel: generic plugin windows, shortcut collisions, pro-grade meters and scaling | UI/UX | [ui-parity.md](ui-parity.md) | 60–100 |
 | G-20 | MIDI/instrument depth: MIDI learn, sampler, notation editing | Features | [target-app-parity.md](target-app-parity.md) | 40–60 |
-| G-21 | Compressed export (MP3, AAC/M4A, Ogg/Opus) | File formats | [file-format-parity.md](file-format-parity.md) | 10–20 |
+| G-21 | Compressed export: MP3, and wiring the Ogg Opus and AAC/M4A encoders into Bounce | File formats | [file-format-parity.md](file-format-parity.md) | 10–20 |
 | G-22 | Avid cloud services (collaboration, Sketch, Splice, sign-in) | Ecosystem | — | not estimated (owner decision) |
 
 ## Details
@@ -203,7 +203,18 @@ articulations, parts). ≈ 40–60 h.
 ### G-21. Compressed export
 
 Bounce writes WAV/BWF/RF64, AIFF and FLAC; Pro Tools also writes MP3 and AAC/M4A in Bounce Mix.
-≈ 10–20 h (pure-Rust encoders).
+
+- **Done (2026-10-23):** native encoders, as crates with their own tests, not yet reachable from Bounce, the CLI
+  or the control channel. Ogg Opus (`soundcraft-opus`, ships enabled) and AAC-LC in `.m4a` with an exact
+  priming and tail edit list, or in ADTS (`soundcraft-aac`, behind the Cargo feature `aac-encode`, off in
+  shipped builds because of AAC patent licensing; Gil decides when to enable it). One-shot and streaming APIs
+  over interleaved f32, validated input, round trips within 0.21 LU and exact lengths. Details, limits, patent
+  posture and provenance: [audio-codecs.md](audio-codecs.md).
+- **Missing:** an MP3 encoder; the bounce commands, UI and CLI flags for Ogg Opus, M4A and ADTS (progress and
+  cancel through the streaming writers, the product name as vendor string, a limiter or clipping policy, the
+  channel layout above stereo, the "not in this build" message for AAC); the importer ignores `.m4a` edit
+  lists and cannot read 88.2 / 96 kHz AAC in MP4 (symphonia), which bounce-and-reimport needs fixed.
+  Hours not re-measured.
 
 ### G-22. Avid cloud services
 
@@ -214,6 +225,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | G-21 shrunk: Ogg Opus (ships) and AAC `.m4a` / ADTS (feature `aac-encode`, off in shipped builds) encoder crates landed, tested, not yet wired to Bounce. Left: MP3, the wiring, importer edit lists. Hours not re-measured |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |

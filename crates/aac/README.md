@@ -1,5 +1,11 @@
 # soundcraft-aac
 
+> **In Pa Tools** (`docs/audio-codecs.md`): everything below is behind the Cargo feature `aac-encode`, which is
+> off by default and off in shipped builds (patent posture). With it on, the crate also has the validated export
+> API: `encode_m4a` / `encode_adts` (one-shot) and `M4aWriter` / `AdtsWriter` (streaming) over interleaved f32,
+> with an exact priming and tail edit list in the `.m4a`. Without it the same API answers `Error::NotBuilt`.
+> `cargo test -p soundcraft-aac --features aac-encode` is the real test run.
+
 A clean-room AAC-LC encoder and decoder (ISO/IEC 14496-3, MPEG-4 Audio, Low Complexity profile),
 written from the standard and the public psychoacoustics literature. Layer L0: it depends only on
 `soundcraft-bitstream` and `thiserror` (plus optional `rayon`), has no `unsafe`, and builds for

@@ -1,5 +1,10 @@
 # soundcraft-opus
 
+> **In Pa Tools** (`docs/audio-codecs.md`): the crate also has the validated export API, `encode_opus_ogg` /
+> `OpusOggWriter` (interleaved f32, 1 or 2 channels, 8 to 192 kHz input converted to 48 kHz, Ogg pages with an
+> `OpusHead` pre-skip, `OpusTags` and an exact end granule), and every constructor returns a `Result`. Opus is
+> royalty-free and ships enabled.
+
 Clean-room, pure-Rust Opus encoder for EffectCraft's WebM export audio (layer L0, `std` only,
 no `unsafe`, builds for `wasm32-unknown-unknown`).
 
