@@ -78,45 +78,46 @@ impl Picture {
     }
 }
 
-/// Whether a temporal unit starts a random access point: its first frame is a shown key frame
-/// (used for keyframe detection: containers may flag samples as sync that are not).
-pub fn is_key_frame_unit(data: &[u8]) -> bool {
-    let mut pos = 0;
-    let mut seq_seen = false;
+/// The first byte of the first frame header (or frame) OBU of a temporal unit, if the OBUs before it
+/// are well formed.
+fn first_frame_byte(data: &[u8]) -> Option<u8> {
+    let mut pos = 0usize;
     while pos < data.len() {
-        let h = data[pos];
+        let h = *data.get(pos)?;
         let obu_type = (h >> 3) & 0xf;
         let ext = h & 4 != 0;
         let has_size = h & 2 != 0;
-        let mut p = pos + 1 + ext as usize;
+        let mut p = pos.checked_add(1)?.checked_add(usize::from(ext))?;
         let size = if has_size {
-            match bits::leb128(data.get(p..).unwrap_or(&[])) {
-                Ok((v, n)) => {
-                    p += n;
-                    v as usize
-                }
-                Err(_) => return false,
-            }
+            let (v, n) = bits::leb128(data.get(p..)?).ok()?;
+            p = p.checked_add(n)?;
+            usize::try_from(v).ok()?
         } else {
             data.len().saturating_sub(p)
         };
-        if p > data.len() {
-            return false;
+        let end = p.checked_add(size).filter(|&e| e <= data.len())?;
+        if matches!(obu_type, 3 | 6) {
+            return data.get(p).copied();
         }
-        match obu_type {
-            1 => seq_seen = true,
-            3 | 6 => {
-                let b = data.get(p).copied().unwrap_or(0);
-                // show_existing_frame = 0, frame_type = KEY_FRAME (0), show_frame = 1
-                let show_existing = b >> 7;
-                let frame_type = (b >> 5) & 3;
-                let show_frame = (b >> 4) & 1;
-                let _ = seq_seen;
-                return show_existing == 0 && frame_type == 0 && show_frame == 1;
-            }
-            _ => {}
-        }
-        pos = p.saturating_add(size);
+        pos = end;
     }
-    false
+    None
+}
+
+/// Whether a temporal unit starts a random access point: its first frame is a shown key frame
+/// (used for keyframe detection: containers may flag samples as sync that are not). Reads only the
+/// first bits of the first frame header, so it is wrong for a stream with a reduced still-picture
+/// sequence header, whose frame headers have no frame-type bits (see [`has_frame_unit`]).
+pub fn is_key_frame_unit(data: &[u8]) -> bool {
+    first_frame_byte(data).is_some_and(|b| {
+        // show_existing_frame = 0, frame_type = KEY_FRAME (0), show_frame = 1
+        let (show_existing, frame_type, show_frame) = (b >> 7, (b >> 5) & 3, (b >> 4) & 1);
+        show_existing == 0 && frame_type == 0 && show_frame == 1
+    })
+}
+
+/// Whether a temporal unit holds a frame header or frame OBU (every frame of a reduced still-picture
+/// sequence is a key frame).
+pub fn has_frame_unit(data: &[u8]) -> bool {
+    first_frame_byte(data).is_some()
 }
