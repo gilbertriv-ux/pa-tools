@@ -212,6 +212,9 @@ pub struct OpusEncoder {
     block: Vec<f32>,
     freq: Vec<f32>,
     silk: Option<SilkPath>,
+    /// Frames whose range coder had written past the frame's byte budget when the frame was finalised. The donor
+    /// asserted on this in debug builds; here it is counted and reported, never a panic (see [`Self::frame_overflows`]).
+    frame_overflows: u64,
 }
 
 impl OpusEncoder {
@@ -307,6 +310,7 @@ impl OpusEncoder {
             block: vec![0.0; N + OVERLAP],
             freq: vec![0.0; c * N],
             silk,
+            frame_overflows: 0,
         })
     }
 
@@ -328,6 +332,16 @@ impl OpusEncoder {
     /// Coded audio bandwidth of every packet of the stream.
     pub fn bandwidth(&self) -> Bandwidth {
         self.bandwidth
+    }
+
+    /// How many frames so far were finalised with the range coder past the frame's byte budget (the
+    /// CELT and hybrid budget is the packet size, the SILK-only budget is 1275 bytes). Zero is the
+    /// expected value for any input: rate control and `SilkPath::encode_within` keep every frame inside
+    /// its budget, and the tests assert it on normal and stress signals. A non-zero count means the
+    /// bitstream of that frame was cut short, so it is the signal a regression leaves where the donor
+    /// had a debug assertion; it is reported as [`Stats::frame_overflows`] and never panics.
+    pub fn frame_overflows(&self) -> u64 {
+        self.frame_overflows
     }
 
     /// Bitrate in bits per second: the constant packet size × 50 packets per second in CELT
@@ -406,6 +420,9 @@ impl OpusEncoder {
                     let target = sp.target_bits + 0.25 * sp.reservoir;
                     let mut enc = RangeEncoder::new();
                     sp.encode_within(&x, target.max(24.0), (MAX_FRAME_BYTES * 8) as i32, &mut enc);
+                    if enc.tell() > (MAX_FRAME_BYTES * 8) as i32 {
+                        self.frame_overflows += 1;
+                    }
                     let bytes = (enc.tell() as usize).div_ceil(8).max(2);
                     let lim = 4.0 * sp.target_bits;
                     sp.reservoir = (sp.reservoir + sp.target_bits - (bytes * 8) as f64).clamp(-lim, lim);
@@ -593,8 +610,12 @@ impl OpusEncoder {
         );
         let bits_left = total_bits_raw - enc.tell();
         quant_energy_finalise(start, end, log_e, &mut self.old_band_e, &alloc.fine_quant, &alloc.fine_priority, bits_left, &mut enc, c);
-        // The frame fits its byte budget: the SILK part is capped by `SilkPath::encode_within` and the CELT
+        // The frame should fit its byte budget: the SILK part is capped by `SilkPath::encode_within` and the CELT
         // part checks every optional field against the remaining bits (random-signal test in tests/export.rs).
+        // The donor asserted this in debug builds; a miss is counted here and shows up in `Stats::frame_overflows`.
+        if enc.tell() > total_bits_raw {
+            self.frame_overflows += 1;
+        }
         if c == 1 {
             let (a, b) = self.old_band_e.split_at_mut(NB_EBANDS);
             b.copy_from_slice(a);

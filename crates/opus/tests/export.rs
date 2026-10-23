@@ -424,6 +424,33 @@ fn non_finite_and_huge_samples_are_sanitised() {
     assert!(dec.iter().flatten().all(|v| v.abs() < 2.0));
 }
 
+/// The frame-overflow counter (the donor's debug assertion, kept as a count) stays 0 on ordinary music-like
+/// input at every rate, channel count and application, through both the one-shot and the streaming API.
+#[test]
+fn the_frame_overflow_counter_stays_zero_on_normal_input() {
+    for (rate, ch) in [(48_000u32, 2usize), (48_000, 1), (44_100, 2), (16_000, 1), (96_000, 2)] {
+        let x = interleave(&test_signal(rate, rate as usize, ch));
+        for bitrate in [12_000u32 * ch as u32, 64_000, 128_000, 320_000] {
+            for app in [Application::Audio, Application::Voip] {
+                let mut o = OpusOptions::new(bitrate);
+                o.application = app;
+                let (file, stats) = encode_opus_ogg_with(&x, ch as u16, rate, &o).unwrap();
+                assert!(stats.packets > 0);
+                assert_eq!(stats.frame_overflows, 0, "{rate} Hz {ch} ch {bitrate} b/s {app:?}: {stats:?}");
+                check_structure(&file, ch, rate, rate as usize);
+
+                let mut w = OpusOggWriter::new(Vec::new(), ch as u16, rate, &o).unwrap();
+                for chunk in x.chunks(977 * ch) {
+                    w.write_interleaved(chunk).unwrap();
+                    assert_eq!(w.stats().frame_overflows, 0);
+                }
+                let (_, streamed) = w.finish().unwrap();
+                assert_eq!(streamed.frame_overflows, 0, "{rate} Hz {ch} ch {bitrate} b/s {app:?} streamed");
+            }
+        }
+    }
+}
+
 /// Signals that stress the quantisers: every mode and bitrate must produce a decodable file. The
 /// test profile has overflow checks and debug assertions, so a bad shift or index shows up as a panic.
 #[test]
@@ -464,7 +491,8 @@ fn stress_signals_encode_and_decode_in_every_mode() {
                 eprintln!("stress: {name}, {ch} ch, {bitrate} b/s, {app:?}");
                 let mut o = OpusOptions::new(bitrate);
                 o.application = app;
-                let (file, _) = encode_opus_ogg_with(&input, ch, 48_000, &o).unwrap_or_else(|e| panic!("{name} {ch} ch {bitrate}: {e}"));
+                let (file, stats) = encode_opus_ogg_with(&input, ch, 48_000, &o).unwrap_or_else(|e| panic!("{name} {ch} ch {bitrate}: {e}"));
+                assert_eq!(stats.frame_overflows, 0, "{name} {ch} ch {bitrate} b/s {app:?}: {stats:?}");
                 let dec = decode(&file);
                 assert_eq!(dec.len(), usize::from(ch), "{name}");
                 assert_eq!(dec[0].len(), frames, "{name} {ch} ch {bitrate} b/s {app:?}");
@@ -520,7 +548,8 @@ fn random_signals_at_random_bitrates_decode() {
             .collect();
         let mut o = OpusOptions::new(bitrate);
         o.application = if pick(2) == 0 { Application::Audio } else { Application::Voip };
-        let (file, _) = encode_opus_ogg_with(&x, ch, rate, &o).unwrap_or_else(|e| panic!("case {case}: {e}"));
+        let (file, stats) = encode_opus_ogg_with(&x, ch, rate, &o).unwrap_or_else(|e| panic!("case {case}: {e}"));
+        assert_eq!(stats.frame_overflows, 0, "case {case}: {ch} ch {rate} Hz {bitrate} b/s kind {kind} level {level}: {stats:?}");
         check_structure(&file, usize::from(ch), rate, frames);
         let dec = decode(&file);
         assert_eq!(dec[0].len(), expected_frames(frames, rate), "case {case}: {ch} ch {rate} Hz {bitrate} b/s kind {kind} level {level}");
@@ -559,7 +588,8 @@ mod fuzz {
         ) {
             let bitrate = 6_000 * u32::from(ch) + extra_bitrate;
             let input: Vec<f32> = (0..frames * usize::from(ch)).map(|i| samples[i % samples.len()]).collect();
-            let file = encode_opus_ogg(&input, ch, rate, bitrate).unwrap();
+            let (file, stats) = encode_opus_ogg_with(&input, ch, rate, &OpusOptions::new(bitrate)).unwrap();
+            prop_assert_eq!(stats.frame_overflows, 0);
             check_structure(&file, usize::from(ch), rate, frames);
             let dec = decode(&file);
             prop_assert_eq!(dec[0].len(), expected_frames(frames, rate));
