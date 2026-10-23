@@ -140,3 +140,27 @@ two `xtask/src/main.rs` layer lines. The `transcribe` command + MCP tool, transc
 - `Whisper::load` also refuses a tokenizer whose timestamp tokens are not one run of 1501 ids after
   every other token, weights with NaN or infinity (the tensor is named), and de-duplicates the
   alignment heads; decoding stops with an error after 8 windows in a row that advance by under 0.5 s.
+
+## Addendum — after the third fix round (what differs again)
+- `transcribe_job` (the menu, the palette, the Transcript window) does only the render on the calling
+  thread: the track's clips, downmixed to mono, at the session rate. `TranscribeJob::run` does the
+  sample-rate conversion to 16 kHz (about 40 s for an hour of audio) and the recognition, on the worker.
+  `track.transcribe` (synchronous) is unchanged for its callers. A missing model is reported before any
+  conversion.
+- `soundcraft_mix::render_clips_settled` renders a range after a run-in (`clip_fx_preroll_secs`: 0 with
+  no clip effect, else at least 3 s, nine times the longest compressor release when more, up to 30 s)
+  that is thrown away, so clip EQ, compressor and lookahead are in the same state as in one render of
+  the whole track. The transcription's 60 s ranges use it; a range boundary no longer costs up to 10 ms
+  of audio or steps the gain.
+- `Whisper` checks the encoder's output and the decoder's logits for NaN and infinity while it runs and
+  stops with `SpeechError::Model("the speech model produced invalid numbers in its …")`. Weights that
+  are finite but overflow (a first layer of 3e38) used to come back as `ok` with a transcript of `!!!!`.
+- A tokenizer in which two special tokens share an id (the start token on the end token's id) is
+  refused when the model loads; the message names both tokens.
+- Test seam: `transcribe_job_with_transcriber(engine, params, Arc<dyn Transcriber>)` builds a job that
+  runs the given recogniser and never searches for the model; `TranscriptState::inject_transcriber` sets
+  it on the Transcript window, whose menu, palette and button then store a real transcript with
+  `track.set_transcript` without the model installed. A window that was not given one (the program)
+  always searches.
+- Cancel keeps the worker's `JoinHandle`. Until that thread has ended the window says "Stopping the
+  previous transcription…", the Transcribe button is off, and no new job starts.
