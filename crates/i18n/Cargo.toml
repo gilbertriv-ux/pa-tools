@@ -1,0 +1,24 @@
+[package]
+name = "soundcraft-i18n"
+description = "Localisation runtime for Pa Tools: catalog lookup with fallback, plurals, language names, the system locale and a pseudo locale. Layer 0, standalone."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Standalone layer-0 crate: no workspace (soundcraft-*) dependencies, so it builds on its own and the
+# later UI-string migration can depend on it without pulling anything else in. These three are the
+# same crates the donor runtime uses; intl_pluralrules is pinned exactly, because the plural-category
+# counts the runtime computes depend on its bundled CLDR data (the donor pins it for the same reason).
+[dependencies]
+intl_pluralrules = "=7.0.2"
+unic-langid = "0.9"
+sys-locale = "0.3"
+
+# On the web, sys-locale reads the browser's languages through wasm-bindgen.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+sys-locale = { version = "0.3", features = ["js"] }
+
+[lints]
+workspace = true

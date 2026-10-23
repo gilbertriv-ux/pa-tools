@@ -48,7 +48,7 @@ The crate names are upstream's and stay (`UPSTREAM.md`).
 
 | Layer | Crate | Role |
 |---|---|---|
-| L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops |
+| L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi`, `soundcraft-i18n` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops; localisation runtime (catalog lookup, plurals, pseudo locale) |
 | L1 | `soundcraft-dsp` | Plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utility, instruments), offline processing, meters, FFT |
 | L2 | `soundcraft-model` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups) |
 | L3 | `soundcraft-mix` | Mix engine shared by realtime playback and offline bounce |

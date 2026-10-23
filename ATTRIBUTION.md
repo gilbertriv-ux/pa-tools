@@ -31,6 +31,14 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is text from Inter
 (SIL OFL 1.1) converted to outlines; no font file is shipped.
 
+## Localisation (G-09)
+
+The localisation runtime and its translations are donor-sourced, both MIT OR Apache-2.0:
+
+| Path | Author | Source | License |
+|---|---|---|---|
+| `crates/i18n/src/lib.rs`, `crates/i18n/src/catalog.rs` | ArtCraft Team and the craft-libs contributors | the `i18n` crate of [storytold/craft-libs](https://github.com/storytold/craft-libs) at commit `49190884278f16c9a9f5823d7698a8ffb5deb062`, imported verbatim then adapted (a `tr!`/global layer, an accented pseudo locale, Pa Tools' embedded catalog); see `docs/i18n.md` | MIT OR Apache-2.0 |
+
 ## Files
 
 | Path | Author | Source | License |

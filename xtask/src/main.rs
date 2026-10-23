@@ -23,6 +23,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("audio-io", 0),
     ("midi", 0),
     ("video", 0),
+    ("i18n", 0),
     ("dsp", 1),
     ("clap-host", 1),
     ("vst3-host", 1),
@@ -35,7 +36,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("ui-egui", 6),
 ];
 /// Standalone format crates: no workspace dependencies at all (publishable on their own).
-const STANDALONE: &[&str] = &["brand", "time", "audio-io", "midi", "video", "dsp"];
+const STANDALONE: &[&str] = &["brand", "time", "audio-io", "midi", "video", "i18n", "dsp"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "xtask"];
 
@@ -124,6 +125,7 @@ const WASM: &[&str] = &[
     "soundcraft-audio-io",
     "soundcraft-midi",
     "soundcraft-video",
+    "soundcraft-i18n",
     "soundcraft-dsp",
     "soundcraft-model",
     "soundcraft-mix",
