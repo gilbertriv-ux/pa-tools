@@ -48,6 +48,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.config_update", "Update Active Configuration", "Window > Configurations > Update Active Configuration", None),
     ("window.config_auto_update", "Auto-Update Active Configuration", "Window > Configurations > Auto-Update Active Configuration", None),
     ("window.renderer", "Renderer", "Window > Renderer", None),
+    ("window.transcript", "Transcript", "Window > Transcript", None),
     ("window.ui_customization", "UI Customization", "Window > UI Customization", None),
     ("window.arrange_tile", "Tile", "Window > Arrange > Tile", None),
     ("window.arrange_tile_h", "Tile Horizontal", "Window > Arrange > Tile Horizontal", None),
@@ -496,6 +497,7 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
         Some("window.renderer") => app.extra.show_renderer,
+        Some("window.transcript") => app.transcript.open,
         Some("window.ui_customization") => app.extra.show_ui_customization,
         Some("window.config_auto_update") => app.extra.auto_update_config,
         Some("view.mix_section") => path.rsplit(" > ").next().map(mix_section_id).is_some_and(|s| app.ui.mix_views.iter().any(|v| v == s)),
@@ -641,6 +643,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     if let Some(v) = crate::extra_windows::run(app, id, p) {
         return Some(Ok(v));
     }
+    if let Some(r) = crate::transcript_window::run(app, id, p) {
+        return Some(r);
+    }
     if id == "ui.audio_device" {
         return Some(crate::windows::audio_device_command(app, p));
     }
@@ -759,6 +764,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             app.ui.show_automation = false;
             app.ui.plugin_windows.clear();
             app.ui.audiosuite = None;
+            app.transcript.open = false;
             json!({})
         }
         "view.mix_section" => {
