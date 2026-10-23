@@ -13,6 +13,8 @@ pub enum Brand {
     Mp4,
     /// QuickTime MOV: `qt  ` major brand.
     Mov,
+    /// Audio-only MPEG-4 file (`.m4a`): `M4A ` major brand, compatible `M4A  mp42 isom iso2`.
+    M4a,
 }
 
 /// Movie-level writer options.
@@ -165,6 +167,13 @@ fn write_ftyp(b: &mut BoxBuf, brand: Brand) {
             b.bytes(b"qt  ");
             b.u32(0x200);
             b.bytes(b"qt  ");
+        }
+        Brand::M4a => {
+            b.bytes(b"M4A ");
+            b.u32(0);
+            for c in [b"M4A ", b"mp42", b"isom", b"iso2"] {
+                b.bytes(c);
+            }
         }
     }
     b.end(m);
@@ -541,6 +550,15 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Ok(self.tracks.len() - 1)
     }
 
+    /// Replace a track's edit list before the file is finished (the `moov` is written last), for edits
+    /// whose length is only known at the end, like trimming an encoder's tail padding. Takes
+    /// precedence over `media_start`.
+    pub fn set_edits(&mut self, track: usize, edits: Vec<Edit>) -> Result<()> {
+        let t = self.tracks.get_mut(track).ok_or(Error::NoSuchTrack(track))?;
+        t.cfg.edits = edits;
+        Ok(())
+    }
+
     /// Replace a track's sample entry before the file is finished (the `moov` is written last), for
     /// codecs whose configuration is only complete at the end, like the FLAC STREAMINFO in `dfLa`.
     pub fn set_sample_entry(&mut self, track: usize, entry: SampleEntry) -> Result<()> {
@@ -906,6 +924,22 @@ mod tests {
         assert_eq!(pack_language("und"), 0x55C4);
         assert_eq!(pack_language("eng"), 0x15C7);
         assert_eq!(pack_language("EN"), 0x55C4);
+    }
+
+    #[test]
+    fn m4a_brand_and_late_edit_list() {
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions { movie_timescale: 44_100, ..WriterOptions::new(Brand::M4a) }).unwrap();
+        let t = w.add_track(TrackConfig::new(SampleEntry::aac(vec![0x12, 0x10], 2, 44_100), 44_100)).unwrap();
+        for i in 0..4u8 {
+            w.write_sample(t, WriteSample { data: &[i; 50], duration: 1024, composition_offset: 0, is_sync: true }).unwrap();
+        }
+        w.set_edits(t, vec![Edit { segment_duration: 3000, media_time: 1024, media_rate: 0x10000 }]).unwrap();
+        assert!(w.set_edits(7, Vec::new()).is_err());
+        let out = w.finish().unwrap().into_inner();
+        assert_eq!(&out[4..16], b"ftypM4A     ");
+        let f = crate::open(out.as_slice()).unwrap();
+        assert_eq!(f.tracks[0].samples.len(), 4);
+        assert_eq!(f.tracks[0].edits, vec![Edit { segment_duration: 3000, media_time: 1024, media_rate: 0x10000 }]);
     }
 
     #[test]
