@@ -6,6 +6,8 @@
 //! - [`annexb_nals`] / [`length_prefixed_nals`]: split Annex-B byte streams and AVCC/HVCC samples into NAL units.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+// Index loops mirror the specifications' pseudo-code and keep the DSP loops readable.
+#![allow(clippy::needless_range_loop)]
 
 use std::fmt;
 

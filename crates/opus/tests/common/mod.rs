@@ -1,6 +1,6 @@
 //! Shared helpers for the SILK/hybrid round-trip tests: synthetic signals, encoding, decoding
 //! with FilmCraft's spec-derived decoder, delay-searched SNR and an Ogg Opus writer for ffmpeg.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::needless_range_loop)]
 
 use soundcraft_opus::OpusEncoder;
 

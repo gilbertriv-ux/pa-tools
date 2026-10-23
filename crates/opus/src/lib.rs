@@ -24,6 +24,8 @@
 //! ```
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+// Index loops mirror the specifications' pseudo-code and keep the DSP loops readable.
+#![allow(clippy::needless_range_loop)]
 // The bit-allocation code mirrors the normative integer arithmetic; keep C-like shift expressions.
 #![allow(clippy::precedence, clippy::int_plus_one)]
 

@@ -9,6 +9,8 @@
 //! See the crate README for supported boxes and limitations.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+// Index loops mirror the specifications' pseudo-code and keep the DSP loops readable.
+#![allow(clippy::needless_range_loop)]
 
 mod bytes;
 mod codec;

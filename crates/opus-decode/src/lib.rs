@@ -3,6 +3,8 @@
 //! Layer L0: no dependencies beyond `std`; no `unsafe`; builds for `wasm32-unknown-unknown`.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+// Index loops mirror the specifications' pseudo-code and keep the DSP loops readable.
+#![allow(clippy::needless_range_loop)]
 // The fixed-point parts mirror the normative integer arithmetic; keep C-like shift expressions.
 #![allow(clippy::precedence, clippy::int_plus_one)]
 

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::needless_range_loop)]
 
 use std::path::Path;
 use std::process::Command;
