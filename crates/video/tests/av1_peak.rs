@@ -6,16 +6,21 @@
 //! Linux only: the peak comes from `/proc/self/status` (`VmHWM`) after resetting it through
 //! `/proc/self/clear_refs`, because this workspace forbids the `unsafe` a counting allocator needs.
 //! Resident memory counts touched pages only, so it reads a little below what was allocated; the
-//! figures in `docs/video-codecs.md` ("Limits") come from a counting allocator in a scratch harness.
-//! The stream builders are those of `av1_dims.rs` (from FilmCraft's `hostile_dims` test, MIT OR
-//! Apache-2.0), extended with the full sequence header, intra-only frames and film grain.
+//! figures in `docs/video-codecs.md` ("Limits") come from a counting allocator in a scratch harness,
+//! and these numbers are a lower bound on them.
+//!
+//! **One measurement per process.** The peak is the whole process's, and memory a decoder freed stays
+//! resident in the allocator for the next one to reuse, so a measurement made after another one in the
+//! same process reads low (the second format's growth over a baseline that already holds the first's
+//! pages). Each measurement therefore runs in a fresh process: the test binary is re-invoked on
+//! `peak_child` with the case in an environment variable, and prints one `PEAK <bytes>` line. Run
+//! on its own, `peak_child` does nothing. The stream builders are those of `av1_dims.rs` (from
+//! FilmCraft's `hostile_dims` test, MIT OR Apache-2.0), extended with the full sequence header,
+//! intra-only frames and film grain.
 #![cfg(all(feature = "av1-decode", target_os = "linux"))]
 
 use soundcraft_video::av1::{DEFAULT_MEMORY_BUDGET, Decoder, SequenceHeader, memory_needed, picture_fits_budget};
-use std::sync::Mutex;
-
-/// The peak is the whole process's, so measurements must not overlap.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+use std::process::Command;
 
 #[derive(Default)]
 struct Bits {
@@ -246,7 +251,6 @@ fn peak_of_eight_references(fm: Fmt, w: u32, h: u32) -> Option<u64> {
     for i in 1..8u8 {
         units.push(full_frame(w, h, fm, Some(1 << i), 64));
     }
-    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !reset_peak() {
         return None;
     }
@@ -265,6 +269,39 @@ fn peak_of_eight_references(fm: Fmt, w: u32, h: u32) -> Option<u64> {
     Some(peak_rss()?.saturating_sub(before))
 }
 
+/// The environment variable that carries a case to `peak_child`: `profile depth mono grain width height`.
+const CASE: &str = "AV1_PEAK_CASE";
+
+/// The child half of a measurement: decodes the case named in `AV1_PEAK_CASE` and prints `PEAK <bytes>`
+/// (`PEAK none` when the kernel does not offer the numbers). Without the variable it does nothing, so
+/// an ordinary run of this file passes over it.
+#[test]
+fn peak_child() {
+    let Ok(case) = std::env::var(CASE) else { return };
+    let n: Vec<u32> = case.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    let [profile, depth, mono, grain, w, h] = n[..] else { panic!("bad {CASE}: {case:?}") };
+    let fm = Fmt { profile, depth, mono: mono == 1, grain: grain == 1 };
+    match peak_of_eight_references(fm, w, h) {
+        Some(peak) => println!("PEAK {peak}"),
+        None => println!("PEAK none"),
+    }
+}
+
+/// Peak resident growth of eight references of `w` x `h` in format `fm`, measured in a fresh process
+/// (see the header). None when the kernel or the sandbox does not offer the numbers.
+fn peak_in_fresh_process(fm: Fmt, w: u32, h: u32) -> Option<u64> {
+    let exe = std::env::current_exe().ok()?;
+    let case = format!("{} {} {} {} {w} {h}", fm.profile, fm.depth, u8::from(fm.mono), u8::from(fm.grain));
+    let out = Command::new(exe).args(["--exact", "peak_child", "--nocapture", "--test-threads=1"]).env(CASE, case).output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{w}x{h} {fm:?}: the measuring process failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    // the harness starts the line with "test peak_child ... ", so the marker is looked for anywhere in it
+    let Some((_, value)) = stdout.lines().find_map(|l| l.split_once("PEAK ")) else {
+        panic!("{w}x{h} {fm:?}: the measuring process printed no PEAK line:\n{stdout}");
+    };
+    value.trim().parse().ok()
+}
+
 const FORMATS: [Fmt; 5] = [
     Fmt { profile: 0, depth: 8, mono: false, grain: false },
     Fmt { profile: 0, depth: 10, mono: false, grain: true },
@@ -278,7 +315,7 @@ fn check(w: u32, h: u32) {
         let seq = seq_for(fm);
         assert!(picture_fits_budget(&seq, w, h, DEFAULT_MEMORY_BUDGET), "{w}x{h} {fm:?} must fit the default budget");
         let estimate = memory_needed(&seq, w, h);
-        let Some(peak) = peak_of_eight_references(fm, w, h) else {
+        let Some(peak) = peak_in_fresh_process(fm, w, h) else {
             eprintln!("peak resident memory is not available here; skipping {w}x{h} {fm:?}");
             continue;
         };
@@ -293,15 +330,39 @@ fn eight_references_at_720p_stay_under_the_estimate() {
     check(1280, 720);
 }
 
-/// The largest 16:9 picture (width in steps of 64) the 1.5 GiB budget admits in 4:2:0, which is
-/// 7424 x 4176: eight references of it stay under the budget itself. About 1 GB and some seconds, so
-/// it runs on request: `cargo test -p soundcraft-video --features av1-decode --test av1_peak -- --ignored`.
+/// The largest 16:9 pictures the 1.6 GiB budget admits (width in steps of 16; `docs/video-codecs.md`),
+/// per layout: eight references of each stay under the estimate, and under the budget itself. About 1 to
+/// 1.5 GB at a time and some seconds each, one process each, so it runs on request:
+/// `cargo test -p soundcraft-video --features av1-decode --test av1_peak -- --ignored --nocapture`.
+/// The printed peaks are what the "Peak measured" column of the Limits table quotes.
 #[test]
-#[ignore = "allocates about 1 GB"]
-fn eight_references_at_the_largest_admitted_picture_stay_under_the_budget() {
-    let fm = FORMATS[0];
-    let peak = peak_of_eight_references(fm, 7424, 4176);
-    if let Some(peak) = peak {
-        assert!(peak <= DEFAULT_MEMORY_BUDGET, "peak {peak} bytes is over the 1.5 GiB budget");
+#[ignore = "allocates 1 to 1.5 GB per layout"]
+fn eight_references_at_the_largest_admitted_pictures_stay_under_the_budget() {
+    let cases = [
+        (Fmt { profile: 0, depth: 8, mono: false, grain: false }, 7680, 4320, "4:2:0 8-bit"),
+        (Fmt { profile: 0, depth: 10, mono: false, grain: false }, 7680, 4320, "4:2:0 10-bit"),
+        (Fmt { profile: 0, depth: 10, mono: false, grain: true }, 6816, 3834, "4:2:0 10-bit with film grain"),
+        (Fmt { profile: 2, depth: 10, mono: false, grain: false }, 6784, 3816, "4:2:2 10-bit"),
+        (Fmt { profile: 1, depth: 8, mono: false, grain: false }, 5632, 3168, "4:4:4 8-bit"),
+        (Fmt { profile: 2, depth: 12, mono: false, grain: true }, 5232, 2943, "4:4:4 12-bit with film grain"),
+        (Fmt { profile: 0, depth: 10, mono: true, grain: false }, 7952, 4473, "monochrome 10-bit"),
+    ];
+    for (fm, w, h, name) in cases {
+        let seq = seq_for(fm);
+        assert!(picture_fits_budget(&seq, w, h, DEFAULT_MEMORY_BUDGET), "{w}x{h} {name} is admitted");
+        let Some(peak) = peak_in_fresh_process(fm, w, h) else {
+            eprintln!("peak resident memory is not available here; skipping {w}x{h} {name}");
+            continue;
+        };
+        let estimate = memory_needed(&seq, w, h);
+        eprintln!(
+            "{w}x{h} {name}: peak {:.2} GiB ({} MB), estimate {:.2} GiB, budget {:.2} GiB",
+            peak as f64 / f64::from(1u32 << 30),
+            peak / 1_000_000,
+            estimate as f64 / f64::from(1u32 << 30),
+            DEFAULT_MEMORY_BUDGET as f64 / f64::from(1u32 << 30)
+        );
+        assert!(peak <= estimate, "{w}x{h} {name}: peak {peak} bytes is over the estimate {estimate}");
+        assert!(peak <= DEFAULT_MEMORY_BUDGET, "{w}x{h} {name}: peak {peak} bytes is over the 1.6 GiB budget");
     }
 }

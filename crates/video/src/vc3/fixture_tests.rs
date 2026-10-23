@@ -77,8 +77,9 @@ fn opens_as_a_movie_and_shows_the_picture() {
     let f = m.frame(0).unwrap();
     assert_eq!((f.width, f.height, f.rgba.len()), (256, 144, 256 * 144 * 4));
     // a colour-bar test pattern: far from one flat colour, and opaque
-    let distinct: std::collections::HashSet<[u8; 3]> = f.rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
-    assert!(distinct.len() > 100 && f.rgba.chunks_exact(4).all(|p| p[3] == 255));
+    let (pixels, _) = f.rgba.as_chunks::<4>();
+    let distinct: std::collections::HashSet<[u8; 3]> = pixels.iter().map(|p| [p[0], p[1], p[2]]).collect();
+    assert!(distinct.len() > 100 && pixels.iter().all(|p| p[3] == 255));
     assert!(m.frame(1).unwrap().rgba != f.rgba);
     assert!(matches!(m.frame(2), Err(VideoError::OutOfRange)));
 }

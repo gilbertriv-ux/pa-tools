@@ -158,7 +158,8 @@ fn field_coded_frames_are_woven() {
                 if row % 2 == 0 { top } else { bottom }[1],
                 if row % 2 == 0 { top } else { bottom }[2],
             );
-            for px in line.chunks_exact(4).step_by(7) {
+            let (pixels, _) = line.as_chunks::<4>();
+            for px in pixels.iter().step_by(7) {
                 for c in 0..3 {
                     assert!((i32::from(px[c]) - i32::from(expect[c])).abs() <= 2, "vbr {vbr} row {row}: {px:?} vs {expect:?}");
                 }

@@ -11,7 +11,7 @@ use crate::theme::regular;
 use egui::{Color32, Painter, Rect, pos2};
 use soundcraft_model::{ClipContent, Session, SourceId, Track};
 use soundcraft_time::Samples;
-use soundcraft_video::{Frame, Movie, MovieInfo};
+use soundcraft_video::{Frame, FrameCache, Movie, MovieInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,19 +47,33 @@ enum Done {
     Thumb(ThumbKey, Result<Arc<Frame>, String>),
 }
 
+/// Most movies the worker keeps open; opening one more closes them all.
+const MAX_OPEN_MOVIES: usize = 8;
+
 /// Owns the open movies; runs jobs (on the worker thread, or inline on wasm).
-#[derive(Default)]
+///
+/// There is ONE decoded-frame cache for the whole app (Gil, V4 decision 6, 2026-10-23): the worker
+/// holds its handle and gives a clone to every movie it opens, so the movies share a single 1 GiB
+/// budget, counted in bytes, with the least recently used frame going first whichever movie it belongs
+/// to. Each movie's decoder still has its own working-memory budget. Closing a movie (the pool is
+/// cleared when a ninth is opened, or the worker is rebuilt) frees its frames' bytes.
 struct Worker {
     movies: HashMap<MovieKey, Result<Movie, String>>,
+    cache: FrameCache,
 }
 
 impl Worker {
+    /// A worker whose movies store their frames in `cache`.
+    fn new(cache: FrameCache) -> Worker {
+        Worker { movies: HashMap::new(), cache }
+    }
+
     fn open(&mut self, key: MovieKey, path: &str, out: &mut Vec<Done>) -> Option<&mut Movie> {
         if !self.movies.contains_key(&key) {
-            let m = open_movie(path);
+            let m = open_movie(path, &self.cache);
             out.push(Done::Info(key, m.as_ref().map(|m| m.info().clone()).map_err(Clone::clone)));
-            // Keep a handful of movies open.
-            if self.movies.len() >= 8 {
+            // Keep a handful of movies open. Clearing drops them, which gives their frames back to the cache.
+            if self.movies.len() >= MAX_OPEN_MOVIES {
                 self.movies.clear();
             }
             self.movies.insert(key, m);
@@ -89,22 +103,24 @@ impl Worker {
     }
 }
 
-fn open_movie(path: &str) -> Result<Movie, String> {
+/// Open the movie at `path`, storing its decoded frames in the app's shared `cache`.
+fn open_movie(path: &str, cache: &FrameCache) -> Result<Movie, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-        Movie::open_source(Arc::new(f)).map_err(|e| e.to_string())
+        Movie::open_source_with_cache(Arc::new(f), cache.clone()).map_err(|e| e.to_string())
     }
     #[cfg(target_arch = "wasm32")]
     {
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        Movie::open(bytes).map_err(|e| e.to_string())
+        Movie::open_with_cache(bytes, cache.clone()).map_err(|e| e.to_string())
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{Done, Job, Worker};
+    use soundcraft_video::FrameCache;
     use std::collections::VecDeque;
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Condvar, Mutex};
@@ -174,7 +190,10 @@ mod backend {
     }
 
     fn run(shared: &(Mutex<Queue>, Condvar), tx: &Sender<Done>, ctx: &egui::Context) {
-        let mut worker = Worker::default();
+        // One frame cache for the app, kept across a rebuilt worker (below): its movies are dropped with
+        // the old worker, which gives their frames back.
+        let cache = FrameCache::default();
+        let mut worker = Worker::new(cache.clone());
         loop {
             let job = {
                 let (lock, cv) = shared;
@@ -207,7 +226,7 @@ mod backend {
                         }
                     }
                 }
-                Err(_) => worker = Worker::default(),
+                Err(_) => worker = Worker::new(cache.clone()),
             }
             ctx.request_repaint();
         }
@@ -217,6 +236,7 @@ mod backend {
 #[cfg(target_arch = "wasm32")]
 mod backend {
     use super::{Done, Job, Worker};
+    use soundcraft_video::FrameCache;
     use std::collections::VecDeque;
 
     /// Inline decoding with a per-frame budget (no threads on the web).
@@ -229,7 +249,7 @@ mod backend {
 
     impl Backend {
         pub fn new(ctx: egui::Context) -> Option<Backend> {
-            Some(Backend { worker: Worker::default(), frame: None, thumbs: VecDeque::new(), ctx })
+            Some(Backend { worker: Worker::new(FrameCache::default()), frame: None, thumbs: VecDeque::new(), ctx })
         }
         pub fn submit(&mut self, job: Job) {
             match job {
@@ -489,5 +509,80 @@ pub fn draw_lane(app: &mut SoundApp, painter: &Painter, s: &Session, track: &Tra
             p.line_segment([pos2(tx, body.min.y), pos2(tx, body.max.y)], egui::Stroke::new(1.0, Color32::from_black_alpha(160)));
             k += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soundcraft_video::synth::test_pattern_mp4;
+    use std::path::PathBuf;
+
+    /// Bytes of one decoded frame of the test pattern (320 x 192 RGBA).
+    const FRAME: usize = 320 * 192 * 4;
+
+    /// `n` copies of a one-second test movie in a fresh temp directory (each its own file, so each is
+    /// its own movie to the worker), as (key, path).
+    fn movies(tag: &str, n: usize) -> (PathBuf, Vec<(MovieKey, String)>) {
+        let dir = std::env::temp_dir().join(format!("soundcraft-video-track-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let bytes = test_pattern_mp4(1).expect("test movie");
+        let list = (0..n)
+            .map(|i| {
+                let path = dir.join(format!("movie-{i}.mp4"));
+                std::fs::write(&path, &bytes).expect("write movie");
+                let path = path.to_string_lossy().into_owned();
+                (MovieKey::new(SourceId(i as u64 + 1), &path), path)
+            })
+            .collect();
+        (dir, list)
+    }
+
+    /// Ask the worker for the picture at frame `k` of a movie and check it decoded.
+    fn frame(w: &mut Worker, (key, path): &(MovieKey, String), k: usize) {
+        let done = w.run(Job::Frame { key: *key, path: path.clone(), secs: k as f64 / 24.0 + 0.001 });
+        assert!(done.iter().any(|d| matches!(d, Done::Frame(_, _, Ok(f)) if f.rgba.len() == FRAME)), "frame {k} of {path} did not decode");
+    }
+
+    #[test]
+    fn every_movie_the_worker_opens_shares_the_one_frame_cache() {
+        let (dir, list) = movies("share", 4);
+        // room for 6 frames in all, though 4 movies each play 12
+        let budget = 6 * FRAME;
+        let cache = FrameCache::new(budget, 4096);
+        let mut w = Worker::new(cache.clone());
+        for k in 0..12 {
+            for m in &list {
+                frame(&mut w, m, k);
+                assert!(cache.cached_bytes() <= budget, "{} bytes after frame {k}", cache.cached_bytes());
+            }
+        }
+        assert_eq!(cache.cached_bytes(), budget, "full, and no fuller");
+        let held: usize = w.movies.values().filter_map(|m| m.as_ref().ok()).map(Movie::cached_bytes).sum();
+        assert_eq!(held, budget, "the movies' own counts add up to the cache's");
+        assert!(w.movies.values().filter_map(|m| m.as_ref().ok()).all(|m| m.frame_cache().cached_bytes() == budget), "one cache for all");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_the_pool_and_dropping_the_worker_free_the_frames() {
+        let (dir, list) = movies("clear", MAX_OPEN_MOVIES + 1);
+        let cache = FrameCache::new(1 << 30, 4096);
+        let mut w = Worker::new(cache.clone());
+        for m in &list[..MAX_OPEN_MOVIES] {
+            frame(&mut w, m, 0);
+            frame(&mut w, m, 1);
+        }
+        assert_eq!((w.movies.len(), cache.cached_bytes()), (MAX_OPEN_MOVIES, MAX_OPEN_MOVIES * 2 * FRAME));
+        // the ninth movie closes the other eight, and their frames with them
+        frame(&mut w, &list[MAX_OPEN_MOVIES], 0);
+        assert_eq!((w.movies.len(), cache.cached_bytes()), (1, FRAME));
+        // a rebuilt worker (after a decoder panic) starts empty and keeps the same cache
+        drop(w);
+        assert_eq!(cache.cached_bytes(), 0);
+        let mut w = Worker::new(cache.clone());
+        frame(&mut w, &list[0], 3);
+        assert_eq!(cache.cached_bytes(), FRAME);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
