@@ -5,7 +5,7 @@
 //! feature) that publishes finished CTB rows into the picture's shared [`Frame`]; jobs of later pictures
 //! block per row on the reference data they read, so several pictures decode concurrently.
 
-use crate::bitstream::{annexb_nals, unescape_rbsp};
+use crate::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
 use crate::hevc::dpb::{Dpb, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
 use crate::hevc::error::{Error, Result, ensure, invalid};
 use crate::hevc::params::{Layout, Pps, Sps, Vps};
@@ -184,7 +184,7 @@ impl Decoder {
     /// not split into NAL units.
     pub fn is_random_access(&self, au: &[u8]) -> bool {
         let nals = match self.nal_length_size {
-            Some(n) => split_length_prefixed(au, n),
+            Some(n) => length_prefixed_nals(au, n),
             None => Ok(annexb_nals(au)),
         };
         let Ok(nals) = nals else { return false };
@@ -210,7 +210,7 @@ impl Decoder {
     /// access unit through reordering.
     pub fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
         let nals = match self.nal_length_size {
-            Some(n) => split_length_prefixed(data, n)?,
+            Some(n) => length_prefixed_nals(data, n)?,
             None => annexb_nals(data),
         };
         let mut result = Ok(());
@@ -559,24 +559,6 @@ impl Decoder {
         }
         run_job(frame, sps, pps, layout, scaling, slices, draft, &shared);
     }
-}
-
-/// Split a length-prefixed access unit (`length_size` bytes of big-endian length before each NAL unit,
-/// 1 to 4) into NAL units; a length that runs past the data is an error. (Checked arithmetic: on a
-/// 32-bit target `index + length` could wrap.)
-fn split_length_prefixed(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
-    let mut out = Vec::new();
-    let mut rest = data;
-    while !rest.is_empty() {
-        let Some((len_bytes, tail)) = rest.split_at_checked(length_size) else { return invalid("truncated NAL unit length") };
-        let len = len_bytes.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
-        let Some((nal, tail)) = usize::try_from(len).ok().and_then(|n| tail.split_at_checked(n)) else {
-            return invalid("NAL unit runs past the end of the sample");
-        };
-        out.push(nal);
-        rest = tail;
-    }
-    Ok(out)
 }
 
 /// Decode all slices of one picture and publish its rows, in the picture's sample type.

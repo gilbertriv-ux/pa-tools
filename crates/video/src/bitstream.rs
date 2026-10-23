@@ -13,6 +13,8 @@ pub enum BitError {
     Eof,
     /// An Exp-Golomb code longer than 32 leading zeros.
     InvalidExpGolomb,
+    /// A NAL length prefix size outside 1 to 4 bytes (AVCC/HVCC allow nothing else).
+    BadLengthSize,
 }
 
 impl fmt::Display for BitError {
@@ -20,6 +22,7 @@ impl fmt::Display for BitError {
         match self {
             BitError::Eof => f.write_str("unexpected end of bitstream"),
             BitError::InvalidExpGolomb => f.write_str("invalid Exp-Golomb code"),
+            BitError::BadLengthSize => f.write_str("NAL length prefix size outside 1 to 4 bytes"),
         }
     }
 }
@@ -312,24 +315,24 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1/2/4 bytes) into NAL units.
+/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1 to 4 bytes of big-endian length before each
+/// NAL unit) into NAL units. A length that runs past the data, a truncated prefix or a `length_size`
+/// outside 1 to 4 is an error. The data is consumed with `split_at_checked` rather than by index
+/// arithmetic: a four-byte length is up to `u32::MAX`, and `index + length` wraps on a 32-bit target
+/// (wasm32), which would have let a hostile length pass the bounds check and then slice out of range.
 pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    if !(1..=4).contains(&length_size) {
+        return Err(BitError::BadLengthSize);
+    }
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        if i + length_size > data.len() {
-            return Err(BitError::Eof);
-        }
-        let mut len = 0usize;
-        for k in 0..length_size {
-            len = (len << 8) | data[i + k] as usize;
-        }
-        i += length_size;
-        if i + len > data.len() {
-            return Err(BitError::Eof);
-        }
-        out.push(&data[i..i + len]);
-        i += len;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (prefix, tail) = rest.split_at_checked(length_size).ok_or(BitError::Eof)?;
+        // At most four bytes, so this fits a u32 exactly.
+        let len = prefix.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
+        let (nal, tail) = usize::try_from(len).ok().and_then(|n| tail.split_at_checked(n)).ok_or(BitError::Eof)?;
+        out.push(nal);
+        rest = tail;
     }
     Ok(out)
 }
@@ -435,6 +438,48 @@ mod tests {
         assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
         let l = [0, 0, 0, 2, 0x67, 1, 0, 0, 0, 1, 0x68];
         assert_eq!(length_prefixed_nals(&l, 4).unwrap(), vec![&[0x67, 1][..], &[0x68][..]]);
+    }
+
+    #[test]
+    fn length_prefixed_split_every_prefix_size() {
+        // 1, 2, 3 and 4-byte prefixes; a zero-length NAL unit and an exactly-fitting last one.
+        for size in 1..=4usize {
+            let mut sample = Vec::new();
+            for nal in [&[0x40u8, 1, 2][..], &[][..], &[0x42, 9][..]] {
+                sample.extend(std::iter::repeat_n(0u8, size - 1));
+                sample.push(nal.len() as u8);
+                sample.extend_from_slice(nal);
+            }
+            assert_eq!(length_prefixed_nals(&sample, size).unwrap(), vec![&[0x40, 1, 2][..], &[][..], &[0x42, 9][..]], "size {size}");
+        }
+        assert_eq!(length_prefixed_nals(&[], 4).unwrap(), Vec::<&[u8]>::new());
+    }
+
+    #[test]
+    fn length_prefixed_split_rejects_hostile_lengths_without_panicking() {
+        // A length that cannot fit, at every prefix size. Values chosen so that `index + length` is exactly
+        // 2^32 or just past it: on a 32-bit target (wasm32) the old index arithmetic wrapped to a small number,
+        // passed the bounds check and then sliced out of range. (A 64-bit test host cannot show the wrap itself;
+        // the checked split makes the question moot on every target.)
+        for (size, len) in [(1usize, 0xFFu32), (2, 0xFFFF), (3, 0xFF_FFFF), (4, u32::MAX), (4, u32::MAX - 3), (4, 0x8000_0000), (4, 6)] {
+            let mut sample = len.to_be_bytes()[4 - size..].to_vec();
+            sample.extend_from_slice(&[0x40, 1]);
+            assert_eq!(length_prefixed_nals(&sample, size), Err(BitError::Eof), "size {size} len {len:#x}");
+        }
+        // A second NAL unit whose length overruns, after a good first one.
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40, 0xFF, 0xFF, 0xFF, 0xFC, 7], 4), Err(BitError::Eof));
+        // A truncated prefix.
+        assert_eq!(length_prefixed_nals(&[0, 0, 0], 4), Err(BitError::Eof));
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40, 0, 0], 4), Err(BitError::Eof));
+    }
+
+    #[test]
+    fn length_prefixed_split_rejects_unusable_prefix_sizes() {
+        // Size 0 would never advance (an unbounded loop of empty NAL units); more than 4 cannot be a valid prefix.
+        for size in [0usize, 5, 8, 9, usize::MAX] {
+            assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40], size), Err(BitError::BadLengthSize), "size {size}");
+            assert_eq!(length_prefixed_nals(&[], size), Err(BitError::BadLengthSize), "size {size}");
+        }
     }
 
     #[test]
