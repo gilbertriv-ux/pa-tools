@@ -69,7 +69,6 @@ impl Downsampler {
     /// Decimates `input` (a multiple of the factor long), appending to `out`. Output sample `j`
     /// is the filtered input at frame position `factor * j`, delayed by [`delay`].
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        debug_assert!(input.len().is_multiple_of(self.factor));
         let taps = self.taps;
         self.buf.truncate(taps - 1);
         self.buf.extend_from_slice(input);

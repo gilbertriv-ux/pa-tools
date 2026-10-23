@@ -42,6 +42,7 @@ fn ffmpeg_decode(exe: &str, codec: &str, file: &[u8], channels: usize, tag: &str
 }
 
 #[test]
+#[ignore = "needs ffmpeg installed (a test tool, never a dependency); run with --ignored"]
 fn ffmpeg_decodes_every_mode() {
     let Some(exe) = ffmpeg() else {
         eprintln!("ffmpeg not installed; skipping the oracle test");
@@ -63,7 +64,7 @@ fn ffmpeg_decodes_every_mode() {
     ];
     for (c, mode, bw, rate, fc, min_snr) in cases {
         let planar: Vec<Vec<f32>> = if c == 1 { vec![left.clone()] } else { vec![left.clone(), right.clone()] };
-        let (enc, packets) = encode(OpusEncoder::with_mode(c as u8, rate, mode, bw), &planar);
+        let (enc, packets) = encode(OpusEncoder::with_mode(c as u8, rate, mode, bw).unwrap(), &planar);
         let file = ogg_opus(&enc, &packets, len);
         for codec in ["opus", "libopus"] {
             let Some(dec) = ffmpeg_decode(exe, codec, &file, c, &format!("{mode:?}{bw:?}{c}{codec}")) else {

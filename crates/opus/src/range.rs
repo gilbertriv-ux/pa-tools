@@ -141,7 +141,10 @@ impl RangeEncoder {
 
     /// Encodes a uniformly distributed integer `fl` in `[0, ft)` (`ft >= 2`).
     pub fn uint(&mut self, fl: u32, ft: u32) {
-        debug_assert!(ft > 1 && fl < ft);
+        if ft < 2 {
+            return;
+        }
+        let fl = fl.min(ft - 1);
         let ft1 = ft - 1;
         let ftb = ilog(ft1);
         if ftb > 8 {

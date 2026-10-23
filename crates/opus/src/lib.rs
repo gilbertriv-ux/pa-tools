@@ -12,15 +12,33 @@
 //!
 //! Layer L0: no dependencies beyond `std`; no `unsafe`; builds for `wasm32-unknown-unknown`.
 //!
+//! ## Files
+//!
+//! [`encode_opus_ogg`] turns interleaved `f32` audio into an Ogg Opus (`.opus`) file; [`OpusOggWriter`]
+//! does the same as a stream. Input may be 8 kHz to 192 kHz, mono or stereo; anything but 48 kHz is
+//! converted first. Opus is royalty-free, so this is always built (no Cargo feature).
+//!
+//! ```
+//! let tone: Vec<f32> = (0..44_100).map(|n| (n as f32 * 0.14).sin() * 0.5).collect();
+//! let file = soundcraft_opus::encode_opus_ogg(&tone, 1, 44_100, 64_000)?;
+//! assert_eq!(&file[..4], b"OggS");
+//! # Ok::<(), soundcraft_opus::Error>(())
+//! ```
+//!
+//! ## Packets
+//!
+//! [`OpusEncoder`] is the packet-level encoder underneath:
+//!
 //! ```
 //! use soundcraft_opus::{Application, Mode, OpusEncoder};
-//! let mut enc = OpusEncoder::new(2, 128_000);
+//! let mut enc = OpusEncoder::new(2, 128_000)?;
 //! let pcm = vec![0.0f32; OpusEncoder::FRAME_SIZE * 2];
-//! let packet = enc.encode_float(&pcm);
+//! let packet = enc.encode_float(&pcm)?;
 //! assert_eq!(packet[0] >> 3, 31); // CELT-only, fullband, 20 ms
 //! assert_eq!(enc.opus_head().len(), 19);
-//! let voip = OpusEncoder::with_application(1, 16_000, Application::Voip);
+//! let voip = OpusEncoder::with_application(1, 16_000, Application::Voip)?;
 //! assert_eq!(voip.mode(), Mode::Silk);
+//! # Ok::<(), soundcraft_opus::Error>(())
 //! ```
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -31,14 +49,24 @@
 
 mod bands;
 mod energy;
+mod error;
 mod mdct;
+pub mod ogg;
 mod range;
 mod rate;
+mod rate_convert;
 mod resample;
 mod silk;
+mod stream;
 mod tables;
 
 use std::sync::OnceLock;
+
+pub use error::Error;
+pub use stream::{
+    MAX_BITRATE, MAX_SAMPLE_RATE, MAX_SECONDS, MIN_BITRATE_PER_CHANNEL, MIN_SAMPLE_RATE, OPUS_RATE, OpusOggWriter, OpusOptions, Stats,
+    encode_opus_ogg, encode_opus_ogg_with,
+};
 
 use bands::{SPREAD_NORMAL, quant_all_bands};
 use energy::{quant_coarse_energy, quant_energy_finalise, quant_fine_energy};
@@ -130,6 +158,39 @@ struct SilkPath {
     reservoir: f64,
 }
 
+impl SilkPath {
+    /// Codes one SILK frame into `enc` so that it takes at most `max_bits`.
+    ///
+    /// The rate control normally gets there. Full-scale noise at the lowest bitrates can leave it
+    /// above the limit even at the coarsest gain; a hybrid frame would then have no room for its CELT
+    /// part and the packet would be cut short, which the decoder reads as garbage. So the frame is
+    /// coded again from the saved state with the input 12 dB quieter each time (a ducked frame beats a
+    /// corrupt one), and as silence if even that does not fit.
+    fn encode_within(&mut self, x: &[Vec<f32>], target_bits: f64, max_bits: i32, enc: &mut RangeEncoder) {
+        let saved_silk = self.enc.clone();
+        let saved_range = enc.clone();
+        self.enc.encode(x, target_bits, max_bits, enc);
+        if enc.tell() <= max_bits {
+            return;
+        }
+        let mut gain = 1.0f32;
+        for _ in 0..6 {
+            gain *= 0.25;
+            self.enc = saved_silk.clone();
+            *enc = saved_range.clone();
+            let ducked: Vec<Vec<f32>> = x.iter().map(|ch| ch.iter().map(|v| v * gain).collect()).collect();
+            self.enc.encode(&ducked, target_bits, max_bits, enc);
+            if enc.tell() <= max_bits {
+                return;
+            }
+        }
+        self.enc = saved_silk;
+        *enc = saved_range;
+        let silent: Vec<Vec<f32>> = x.iter().map(|ch| vec![0.0; ch.len()]).collect();
+        self.enc.encode(&silent, target_bits, max_bits, enc);
+    }
+}
+
 /// Opus encoder for one mono or stereo stream at 48 kHz.
 pub struct OpusEncoder {
     channels: usize,
@@ -159,15 +220,24 @@ impl OpusEncoder {
 
     /// Creates a general-audio encoder ([`Application::Audio`]) for `channels` (1 or 2)
     /// channels of 48 kHz audio at `bitrate_bps` (total for all channels).
-    pub fn new(channels: u8, bitrate_bps: u32) -> Self {
+    ///
+    /// # Errors
+    /// [`Error::InvalidChannels`] unless `channels` is 1 or 2.
+    pub fn new(channels: u8, bitrate_bps: u32) -> Result<Self, Error> {
         Self::with_application(channels, bitrate_bps, Application::Audio)
     }
 
     /// Creates an encoder for `channels` (1 or 2) channels of 48 kHz audio at `bitrate_bps`
     /// (total for all channels; clamped to 6 kb/s per channel – 510 kb/s), choosing the mode
     /// and bandwidth for `application`.
-    pub fn with_application(channels: u8, bitrate_bps: u32, application: Application) -> Self {
-        let c = channels.max(1) as u32;
+    ///
+    /// # Errors
+    /// [`Error::InvalidChannels`] unless `channels` is 1 or 2.
+    pub fn with_application(channels: u8, bitrate_bps: u32, application: Application) -> Result<Self, Error> {
+        if !(1..=2).contains(&channels) {
+            return Err(Error::InvalidChannels(channels.into()));
+        }
+        let c = u32::from(channels);
         let (mode, bandwidth) = choose_mode(application, bitrate_bps.clamp(6_000 * c, 510_000) / c);
         Self::build(channels, bitrate_bps, application, mode, bandwidth)
     }
@@ -176,20 +246,25 @@ impl OpusEncoder {
     /// table. Valid combinations: SILK with narrowband, mediumband or wideband; hybrid with
     /// super-wideband or fullband; CELT with fullband.
     ///
-    /// # Panics
-    /// On any other combination, or when `channels` is not 1 or 2.
-    pub fn with_mode(channels: u8, bitrate_bps: u32, mode: Mode, bandwidth: Bandwidth) -> Self {
+    /// # Errors
+    /// [`Error::InvalidMode`] on any other combination, [`Error::InvalidChannels`] unless `channels`
+    /// is 1 or 2.
+    pub fn with_mode(channels: u8, bitrate_bps: u32, mode: Mode, bandwidth: Bandwidth) -> Result<Self, Error> {
         let ok = match mode {
             Mode::Silk => bandwidth <= Bandwidth::Wideband,
             Mode::Hybrid => bandwidth >= Bandwidth::SuperWideband,
             Mode::Celt => bandwidth == Bandwidth::Fullband,
         };
-        assert!(ok, "unsupported mode/bandwidth combination {mode:?}/{bandwidth:?}");
+        if !ok {
+            return Err(Error::InvalidMode);
+        }
         Self::build(channels, bitrate_bps, Application::Audio, mode, bandwidth)
     }
 
-    fn build(channels: u8, bitrate_bps: u32, application: Application, mode: Mode, bandwidth: Bandwidth) -> Self {
-        assert!(channels == 1 || channels == 2, "Opus family-0 streams have 1 or 2 channels");
+    fn build(channels: u8, bitrate_bps: u32, application: Application, mode: Mode, bandwidth: Bandwidth) -> Result<Self, Error> {
+        if !(1..=2).contains(&channels) {
+            return Err(Error::InvalidChannels(channels.into()));
+        }
         let c = channels as usize;
         let bitrate_bps = bitrate_bps.clamp(6_000 * c as u32, 510_000);
         let packet_bytes = (bitrate_bps as usize).div_ceil(400);
@@ -218,21 +293,21 @@ impl OpusEncoder {
                 })
             }
         };
-        OpusEncoder {
+        Ok(OpusEncoder {
             channels: c,
             application,
             mode,
             bandwidth,
             bitrate_bps,
             frame_bytes,
-            mdct: Mdct::new(N),
+            mdct: Mdct::new(N).ok_or(Error::Internal("MDCT size"))?,
             preemph_mem: [0.0; 2],
             hist: vec![0.0; c * OVERLAP],
             old_band_e: [0.0; 2 * NB_EBANDS],
             block: vec![0.0; N + OVERLAP],
             freq: vec![0.0; c * N],
             silk,
-        }
+        })
     }
 
     /// Number of channels.
@@ -307,10 +382,16 @@ impl OpusEncoder {
     }
 
     /// Encodes one 20 ms frame of interleaved f32 samples in [-1, 1] (exactly
-    /// `FRAME_SIZE * channels` values) and returns one Opus packet.
-    pub fn encode_float(&mut self, pcm: &[f32]) -> Vec<u8> {
+    /// `FRAME_SIZE * channels` values) and returns one Opus packet. Non-finite samples are coded as
+    /// silence and out-of-range ones are clamped.
+    ///
+    /// # Errors
+    /// [`Error::FrameSize`] when `pcm` is not exactly one frame.
+    pub fn encode_float(&mut self, pcm: &[f32]) -> Result<Vec<u8>, Error> {
         let c = self.channels;
-        assert_eq!(pcm.len(), N * c, "encode_float takes exactly FRAME_SIZE samples per channel");
+        if pcm.len() != N * c {
+            return Err(Error::FrameSize { expected: N * c, got: pcm.len() });
+        }
         let mut packet = vec![self.toc()];
         match self.mode {
             Mode::Celt => {
@@ -324,7 +405,7 @@ impl OpusEncoder {
                 if let Some(sp) = self.silk.as_mut() {
                     let target = sp.target_bits + 0.25 * sp.reservoir;
                     let mut enc = RangeEncoder::new();
-                    sp.enc.encode(&x, target.max(24.0), (MAX_FRAME_BYTES * 8) as i32, &mut enc);
+                    sp.encode_within(&x, target.max(24.0), (MAX_FRAME_BYTES * 8) as i32, &mut enc);
                     let bytes = (enc.tell() as usize).div_ceil(8).max(2);
                     let lim = 4.0 * sp.target_bits;
                     sp.reservoir = (sp.reservoir + sp.target_bits - (bytes * 8) as f64).clamp(-lim, lim);
@@ -338,7 +419,8 @@ impl OpusEncoder {
                 let celt_min = (total / 5).max(80);
                 let mut enc = RangeEncoder::new();
                 if let Some(sp) = self.silk.as_mut() {
-                    sp.enc.encode(&x, sp.target_bits, total - celt_min, &mut enc);
+                    let target = sp.target_bits;
+                    sp.encode_within(&x, target, total - celt_min, &mut enc);
                 }
                 // No redundancy (RFC 6716 §4.5.1); the flag is present when there is room.
                 if enc.tell() + 17 + 20 <= total {
@@ -349,7 +431,7 @@ impl OpusEncoder {
                 packet.extend_from_slice(&self.encode_celt(enc, len, HYBRID_START_BAND, end, &log_e, false));
             }
         }
-        packet
+        Ok(packet)
     }
 
     /// Decimates the input to the SILK internal rate (16-bit scale), one vector per channel.
@@ -511,7 +593,8 @@ impl OpusEncoder {
         );
         let bits_left = total_bits_raw - enc.tell();
         quant_energy_finalise(start, end, log_e, &mut self.old_band_e, &alloc.fine_quant, &alloc.fine_priority, bits_left, &mut enc, c);
-        debug_assert!(enc.tell() <= total_bits_raw, "frame overflow: {} > {}", enc.tell(), total_bits_raw);
+        // The frame fits its byte budget: the SILK part is capped by `SilkPath::encode_within` and the CELT
+        // part checks every optional field against the remaining bits (random-signal test in tests/export.rs).
         if c == 1 {
             let (a, b) = self.old_band_e.split_at_mut(NB_EBANDS);
             b.copy_from_slice(a);
@@ -532,7 +615,7 @@ mod tests {
 
     #[test]
     fn opus_head_layout() {
-        let e = OpusEncoder::new(2, 96_000);
+        let e = OpusEncoder::new(2, 96_000).unwrap();
         let h = e.opus_head();
         assert_eq!(&h[..8], b"OpusHead");
         assert_eq!(h[8], 1);
@@ -545,9 +628,9 @@ mod tests {
     #[test]
     fn packet_sizes_follow_bitrate() {
         for (ch, rate) in [(1u8, 64_000u32), (2, 128_000), (2, 256_000)] {
-            let mut e = OpusEncoder::new(ch, rate);
+            let mut e = OpusEncoder::new(ch, rate).unwrap();
             let pcm: Vec<f32> = (0..N * ch as usize).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
-            let p = e.encode_float(&pcm);
+            let p = e.encode_float(&pcm).unwrap();
             assert_eq!(p.len(), rate as usize / 400);
             assert_eq!(p[0], 0xF8 | if ch == 2 { 4 } else { 0 });
             assert_eq!(e.bitrate(), rate);
@@ -556,8 +639,8 @@ mod tests {
 
     #[test]
     fn silence_is_a_tiny_packet() {
-        let mut e = OpusEncoder::new(1, 64_000);
-        let p = e.encode_float(&vec![0.0; N]);
+        let mut e = OpusEncoder::new(1, 64_000).unwrap();
+        let p = e.encode_float(&vec![0.0; N]).unwrap();
         assert_eq!(p.len(), 3);
     }
 }

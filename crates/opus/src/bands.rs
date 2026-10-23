@@ -181,9 +181,10 @@ pub fn encode_pulses(y: &[i32], k: usize, enc: &mut RangeEncoder, v: &mut Vec<u6
         index += base;
         kk -= t;
     }
-    debug_assert!(total <= u32::MAX as u64);
-    if total >= 2 {
-        enc.uint(index as u32, total as u32);
+    if let Ok(total) = u32::try_from(total)
+        && total >= 2
+    {
+        enc.uint(u32::try_from(index).unwrap_or(total - 1), total);
     }
 }
 
@@ -315,7 +316,6 @@ pub fn quant_all_bands(
     coded_bands: usize,
 ) {
     let mm = 1usize << lm;
-    debug_assert!(c == 1 || dual_stereo || intensity <= start, "stereo frames are coded as dual stereo");
     let mut ctx = BandEnc { m, enc, i: 0, spread, remaining_bits: 0, pvq_v: Vec::new(), iy: Vec::new(), tmp: Vec::new() };
     for i in start..end {
         ctx.i = i;

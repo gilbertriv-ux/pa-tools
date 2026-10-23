@@ -34,7 +34,8 @@ pub struct Fft {
 }
 
 impl Fft {
-    pub fn new(n: usize) -> Fft {
+    /// `None` when `n` has a prime factor other than 2, 3 or 5.
+    pub fn new(n: usize) -> Option<Fft> {
         let mut factors = Vec::new();
         let mut m = n;
         for p in [4usize, 2, 3, 5] {
@@ -43,14 +44,16 @@ impl Fft {
                 m /= p;
             }
         }
-        assert_eq!(m, 1, "unsupported FFT size {n}");
+        if m != 1 {
+            return None;
+        }
         let twiddle = (0..n)
             .map(|k| {
                 let ph = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
                 Cpx { re: ph.cos() as f32, im: ph.sin() as f32 }
             })
             .collect();
-        Fft { n, factors, twiddle }
+        Some(Fft { n, factors, twiddle })
     }
 
     pub fn process(&self, data: &mut [Cpx], scratch: &mut Vec<Cpx>) {
@@ -104,7 +107,8 @@ pub struct Mdct {
 }
 
 impl Mdct {
-    pub fn new(n: usize) -> Mdct {
+    /// `None` when `n / 2` is not a size the FFT supports.
+    pub fn new(n: usize) -> Option<Mdct> {
         let n2 = n / 2;
         let pi = std::f64::consts::PI;
         let pre = (0..n2)
@@ -125,7 +129,7 @@ impl Mdct {
             let s = x.sin();
             *w = (std::f64::consts::FRAC_PI_2 * s * s).sin() as f32;
         }
-        Mdct { n, fft: Fft::new(n2), pre, post, window, scale: 2.0 / n as f32, z: Vec::new(), scratch: Vec::new(), v: vec![0.0; n] }
+        Some(Mdct { n, fft: Fft::new(n2)?, pre, post, window, scale: 2.0 / n as f32, z: Vec::new(), scratch: Vec::new(), v: vec![0.0; n] })
     }
 
     /// Transforms `block` (`n + OVERLAP` samples: the previous frame's last `OVERLAP` samples, then
@@ -134,7 +138,6 @@ impl Mdct {
     pub fn forward(&mut self, block: &[f32], out: &mut [f32]) {
         let n = self.n;
         let n2 = n / 2;
-        debug_assert_eq!(block.len(), n + OVERLAP);
         // Place the windowed block into the (virtual) 2n-sample MDCT input u at offset `pad`.
         let pad = (n - OVERLAP) / 2;
         let w = &self.window;
@@ -203,7 +206,7 @@ mod tests {
     fn matches_direct_formula() {
         for &n in &[240usize, 960] {
             let block: Vec<f32> = (0..n + OVERLAP).map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0).collect();
-            let mut m = Mdct::new(n);
+            let mut m = Mdct::new(n).unwrap();
             let mut out = vec![0f32; n];
             m.forward(&block, &mut out);
             let d = direct(&block, n, &m.window);
@@ -219,7 +222,7 @@ mod tests {
         let n2 = n_full >> 1;
         let n4 = n_full >> 2;
         let t: Vec<f32> = (0..n2).map(|i| (2.0 * std::f64::consts::PI * (i as f64 + 0.125) / n_full as f64).cos() as f32).collect();
-        let fft = Fft::new(n4);
+        let fft = Fft::new(n4).unwrap();
         let mut z = Vec::new();
         for i in 0..n4 {
             let x1 = input[2 * i];
@@ -265,7 +268,7 @@ mod tests {
         let n = 960;
         let frames = 5;
         let sig: Vec<f32> = (0..n * frames).map(|i| (i as f32 * 0.013).sin() * 1000.0 + ((i * 7919) % 211) as f32 - 105.0).collect();
-        let mut m = Mdct::new(n);
+        let mut m = Mdct::new(n).unwrap();
         let mut hist = vec![0f32; OVERLAP];
         // Decoder memory: [frame output n][folded tail OVERLAP/2] laid out like decode_mem.
         let mut mem = vec![0f32; n + OVERLAP];

@@ -35,7 +35,7 @@ fn run(enc: OpusEncoder, planar: &[Vec<f32>], reference: &[Vec<f32>]) -> Vec<Run
 
 fn mono(mode: Mode, bw: Bandwidth, rate: u32, x: &[f32], fc: f64) -> Run {
     let reference = if fc < 20_000.0 { lowpass(x, fc) } else { x.to_vec() };
-    run(OpusEncoder::with_mode(1, rate, mode, bw), &[x.to_vec()], &[reference]).remove(0)
+    run(OpusEncoder::with_mode(1, rate, mode, bw).unwrap(), &[x.to_vec()], &[reference]).remove(0)
 }
 
 /// Upper edge of the band a SILK bandwidth keeps (for band-limited references).
@@ -66,7 +66,7 @@ fn every_mode_and_bandwidth_decodes() {
         for c in [1usize, 2] {
             let planar = if c == 1 { vec![left.clone()] } else { vec![left.clone(), right.clone()] };
             let reference: Vec<Vec<f32>> = planar.iter().map(|x| lowpass(x, band_edge(bw))).collect();
-            let enc = OpusEncoder::with_mode(c as u8, rate * c as u32, mode, bw);
+            let enc = OpusEncoder::with_mode(c as u8, rate * c as u32, mode, bw).unwrap();
             assert_eq!((enc.mode(), enc.bandwidth()), (mode, bw));
             let res = run(enc, &planar, &reference);
             for p in &res[0].packets {
@@ -191,7 +191,7 @@ fn stereo_silk_and_hybrid() {
     for (name, l, r) in &cases {
         for (mode, bw, rate, min_snr) in [(Mode::Silk, Bandwidth::Wideband, 32_000u32, 9.0), (Mode::Hybrid, Bandwidth::Fullband, 64_000, 9.0)] {
             let fc = band_edge(bw);
-            let res = run(OpusEncoder::with_mode(2, rate, mode, bw), &[l.clone(), r.clone()], &[lowpass(l, fc), lowpass(r, fc)]);
+            let res = run(OpusEncoder::with_mode(2, rate, mode, bw).unwrap(), &[l.clone(), r.clone()], &[lowpass(l, fc), lowpass(r, fc)]);
             eprintln!(
                 "stereo {name} {mode:?}/{bw:?} @ {} kb/s: {:.1} kb/s, L {:.1} dB, R {:.1} dB",
                 rate / 1000,
@@ -221,18 +221,19 @@ fn application_tables_and_pre_skip() {
         (Application::Audio, 2, 128_000, Mode::Celt, Bandwidth::Fullband),
     ];
     for (app, c, rate, mode, bw) in cases {
-        let e = OpusEncoder::with_application(c, rate, app);
+        let e = OpusEncoder::with_application(c, rate, app).unwrap();
         assert_eq!((e.mode(), e.bandwidth(), e.application()), (mode, bw, app), "{app:?} {c} ch @ {rate}");
         assert_eq!(e.pre_skip(), 120, "every mode is aligned to a 120-sample delay");
     }
-    assert_eq!(OpusEncoder::new(2, 128_000).mode(), Mode::Celt);
-    assert_eq!(OpusEncoder::new(1, 12_000).application(), Application::Audio);
+    assert_eq!(OpusEncoder::new(2, 128_000).unwrap().mode(), Mode::Celt);
+    assert_eq!(OpusEncoder::new(1, 12_000).unwrap().application(), Application::Audio);
 }
 
 #[test]
-#[should_panic(expected = "unsupported mode/bandwidth")]
-fn invalid_mode_bandwidth_panics() {
-    let _ = OpusEncoder::with_mode(1, 16_000, Mode::Silk, Bandwidth::Fullband);
+fn invalid_mode_bandwidth_is_an_error() {
+    assert_eq!(OpusEncoder::with_mode(1, 16_000, Mode::Silk, Bandwidth::Fullband).err(), Some(soundcraft_opus::Error::InvalidMode));
+    assert_eq!(OpusEncoder::with_mode(1, 16_000, Mode::Celt, Bandwidth::Wideband).err(), Some(soundcraft_opus::Error::InvalidMode));
+    assert_eq!(OpusEncoder::with_mode(3, 16_000, Mode::Silk, Bandwidth::Wideband).err(), Some(soundcraft_opus::Error::InvalidChannels(3)));
 }
 
 #[test]
@@ -255,7 +256,7 @@ fn extreme_inputs_stay_decodable() {
         {
             for c in [1usize, 2] {
                 let planar: Vec<Vec<f32>> = if c == 1 { vec![x.clone()] } else { vec![x.clone(), x.iter().map(|v| -0.5 * v).collect()] };
-                let (enc, packets) = encode(OpusEncoder::with_mode(c as u8, rate * c as u32, mode, bw), &planar);
+                let (enc, packets) = encode(OpusEncoder::with_mode(c as u8, rate * c as u32, mode, bw).unwrap(), &planar);
                 assert!(packets.iter().all(|p| p.len() >= 3 && p.len() <= 1276), "{name} {mode:?}: packet sizes");
                 let dec = decode(&enc.opus_head(), &packets);
                 let peak = dec.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
@@ -271,7 +272,7 @@ fn extreme_inputs_stay_decodable() {
 fn silk_and_hybrid_silence() {
     for (mode, bw, rate) in [(Mode::Silk, Bandwidth::Wideband, 16_000u32), (Mode::Hybrid, Bandwidth::Fullband, 32_000)] {
         let x = vec![0f32; 48_000];
-        let (enc, packets) = encode(OpusEncoder::with_mode(1, rate, mode, bw), std::slice::from_ref(&x));
+        let (enc, packets) = encode(OpusEncoder::with_mode(1, rate, mode, bw).unwrap(), std::slice::from_ref(&x));
         let dec = decode(&enc.opus_head(), &packets);
         let peak = dec[0].iter().fold(0f32, |m, v| m.max(v.abs()));
         let kbps = bitrate(&packets) / 1000.0;

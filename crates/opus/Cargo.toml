@@ -1,10 +1,11 @@
 [package]
 name = "soundcraft-opus"
-description = "Clean-room pure-Rust Opus encoder (RFC 6716 SILK NB/MB/WB, hybrid SWB/FB and CELT FB modes, 48 kHz, 20 ms; RFC 7845 OpusHead)"
+description = "Clean-room pure-Rust Opus encoder (RFC 6716 SILK NB/MB/WB, hybrid SWB/FB and CELT FB modes, 20 ms) with an Ogg Opus (RFC 7845) writer and rate conversion to 48 kHz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
@@ -13,3 +14,6 @@ workspace = true
 
 [dev-dependencies]
 soundcraft-opus-decode = { workspace = true }
+soundcraft-ogg = { workspace = true }
+soundcraft-dsp = { workspace = true }
+proptest = { workspace = true }

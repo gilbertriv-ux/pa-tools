@@ -121,7 +121,7 @@ pub fn encode(mut enc: OpusEncoder, planar: &[Vec<f32>]) -> (OpusEncoder, Vec<Ve
     let frames = total.div_ceil(FRAME);
     let mut pcm = interleave(planar);
     pcm.resize(frames * FRAME * c, 0.0);
-    let packets = pcm.chunks(FRAME * c).map(|f| enc.encode_float(f)).collect();
+    let packets = pcm.chunks(FRAME * c).map(|f| enc.encode_float(f).unwrap()).collect();
     (enc, packets)
 }
 
