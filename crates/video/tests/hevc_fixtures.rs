@@ -16,12 +16,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 const MAIN8: &[u8] = include_bytes!("fixtures/hevc/hevc-main-8bit-64x64-4f.mp4");
 const MAIN10: &[u8] = include_bytes!("fixtures/hevc/hevc-main10-64x64-4f.mp4");
 const BFRAMES: &[u8] = include_bytes!("fixtures/hevc/hevc-main-8bit-64x64-bframes2-ref2-48f.mp4");
+/// An open GOP: an IDR picture, then clean random access (CRA) pictures every 8 frames, the third and
+/// fourth of which have leading pictures (RASL) that predict from before the CRA.
+const OPEN_GOP: &[u8] = include_bytes!("fixtures/hevc/hevc-main-8bit-64x64-opengop-32f.mp4");
 
 /// (name, movie, frames, profile label, SHA-256 of the reference decode).
-const MOVIES: [(&str, &[u8], usize, &str, &str); 3] = [
+const MOVIES: [(&str, &[u8], usize, &str, &str); 4] = [
     ("main8", MAIN8, 4, "H.265 Main", "fe81f18a9188107c96b53ee241b477689fdff010dcbd52cec5a1033d5ce3aa40"),
     ("main10", MAIN10, 4, "H.265 Main 10", "3fe0777f821dd7c0ef982a00660a54b80dd24eefb8da4be121c61e2f86876362"),
     ("bframes", BFRAMES, 48, "H.265 Main", "9a995aa1c9902ac309b945ec3126447f2212e97bc2285f5a84b49c6e62030298"),
+    ("opengop", OPEN_GOP, 32, "H.265 Main", "0e6b618e54886fb02efb3ea389cef9f9e5da87308be5c657094cb1efbe6668cf"),
 ];
 
 const ENABLED: bool = cfg!(feature = "hevc-decode");
@@ -313,6 +317,130 @@ mod decoding {
                 let f = m.frame(i).unwrap_or_else(|e| panic!("{name} frame {i}: {e}"));
                 assert!(f.rgba == all[i].rgba, "{name}: frame {i} after seeking differs");
             }
+        }
+    }
+
+    /// The open-GOP sample's SHA-256 of ffmpeg's raw decode (the `opengop` row of `MOVIES`).
+    const OPEN_GOP_SHA: &str = "0e6b618e54886fb02efb3ea389cef9f9e5da87308be5c657094cb1efbe6668cf";
+
+    /// (NAL unit types in decode order of every sample, whether the container flags the sample as a
+    /// sync sample) for the open-GOP sample.
+    fn open_gop_samples() -> Vec<(Vec<u8>, bool)> {
+        let src = OPEN_GOP.to_vec();
+        let mp4 = isobmff::open(src.clone()).expect("mp4");
+        let t = mp4.tracks.iter().position(|t| t.kind == isobmff::TrackKind::Video).expect("video track");
+        let Some(CodecConfig::Hevc(cfg)) = mp4.tracks[t].codec() else { panic!("not HEVC") };
+        let length_size = usize::from(cfg.length_size);
+        (0..mp4.tracks[t].samples.len())
+            .map(|s| {
+                let data = mp4.read_sample(&src, t, s).expect("sample");
+                let (mut types, mut pos) = (Vec::new(), 0);
+                while let Some(len) = data.get(pos..pos + length_size) {
+                    let n = len.iter().fold(0usize, |a, &b| (a << 8) | usize::from(b));
+                    types.push(data.get(pos + length_size).map_or(255, |h| (h >> 1) & 0x3f));
+                    pos += length_size + n;
+                }
+                (types, mp4.tracks[t].samples[s].is_sync)
+            })
+            .collect()
+    }
+
+    /// The fixture must really be an open GOP, or the tests below prove nothing: an IDR picture first,
+    /// then CRA pictures (type 21) flagged as sync samples, with RASL pictures (types 8 and 9, which
+    /// predict from before their CRA) in decode order after some of them.
+    #[test]
+    fn the_open_gop_sample_has_cra_access_points_and_leading_pictures() {
+        let samples = open_gop_samples();
+        assert_eq!(samples.len(), 32);
+        let irap: Vec<(usize, u8)> =
+            samples.iter().enumerate().filter_map(|(i, (t, _))| t.iter().copied().find(|t| (16..=23).contains(t)).map(|t| (i, t))).collect();
+        let types: Vec<u8> = irap.iter().map(|&(_, t)| t).collect();
+        assert_eq!(types, [20, 21, 21, 21], "an IDR_N_LP picture, then three CRA pictures: {irap:?}");
+        let sync: Vec<usize> = samples.iter().enumerate().filter(|(_, (_, s))| *s).map(|(i, _)| i).collect();
+        assert_eq!(sync, irap.iter().map(|&(i, _)| i).collect::<Vec<_>>(), "the container flags exactly the IRAP samples");
+        let rasl = samples.iter().filter(|(t, _)| t.iter().any(|&t| t == 8 || t == 9)).count();
+        assert!(rasl >= 3, "{rasl} leading pictures that depend on pictures before their CRA");
+    }
+
+    /// Frames in presentation order as RGBA. The decoder alone reproduces ffmpeg's raw decode of the
+    /// whole stream (checked here), and each frame is a slice of that decode, so this is ffmpeg's
+    /// picture for every index.
+    fn open_gop_reference() -> Vec<Vec<u8>> {
+        let pics = decode_mp4(OPEN_GOP);
+        assert_eq!(pics.len(), 32);
+        assert_eq!(sha256(&raw(&pics)), OPEN_GOP_SHA, "differs from ffmpeg's decode");
+        pics.iter().map(rgba).collect()
+    }
+
+    /// Presentation index of every sync sample (the CRA pictures and the IDR).
+    fn open_gop_access_points() -> Vec<usize> {
+        let mp4 = isobmff::open(OPEN_GOP.to_vec()).expect("mp4");
+        let t = mp4.tracks.iter().position(|t| t.kind == isobmff::TrackKind::Video).expect("video track");
+        let samples = &mp4.tracks[t].samples;
+        let mut order: Vec<usize> = (0..samples.len()).collect();
+        order.sort_by_key(|&i| (samples[i].pts, i));
+        let mut points: Vec<usize> = order.iter().enumerate().filter(|&(_, &i)| samples[i].is_sync).map(|(rank, _)| rank).collect();
+        points.sort_unstable();
+        points
+    }
+
+    /// Frame requests in any order, into GOPs that start with a CRA picture, give ffmpeg's pictures,
+    /// including the leading pictures that come before their CRA in display order and need pictures
+    /// from the GOP before it. One frame cache entry, so every request decodes.
+    #[test]
+    fn shuffled_seeks_into_cra_gops_match_the_reference() {
+        let want = open_gop_reference();
+        let cras = open_gop_access_points();
+        assert_eq!(cras.len(), 4, "{cras:?}");
+        let check = |order: &[usize], what: &str| {
+            let mut m = open(OPEN_GOP);
+            m.set_cache_frames(1);
+            for &i in order {
+                let f = m.frame(i).unwrap_or_else(|e| panic!("{what}: frame {i}: {e}"));
+                assert!(f.rgba == want[i], "{what}: frame {i} differs from the reference (order {order:?})");
+            }
+        };
+        // Around each CRA: the CRA, the pictures displayed just before it (its leading pictures), then
+        // pictures after it, then back before it.
+        for &c in cras.iter().filter(|&&c| c > 0) {
+            check(&[c, c - 1, c - 2, c + 3, c - 1, c, c - 3], &format!("around the CRA at {c}"));
+            check(&[31, c - 1, 0, c, c - 2, 31], &format!("into the CRA at {c} from the ends"));
+        }
+        // Every picture straight after a jump from the other end.
+        for i in 0..32 {
+            check(&[31 - i, i], &format!("jump to {i}"));
+        }
+        // Shuffles.
+        let mut x = 0x9e3779b97f4a7c15_u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..40 {
+            let mut order: Vec<usize> = (0..32).collect();
+            for k in (1..order.len()).rev() {
+                order.swap(k, (next() as usize) % (k + 1));
+            }
+            check(&order, &format!("shuffle {round}"));
+        }
+    }
+
+    /// The same with the default frame cache, so pictures a decode produced on the way (the `ready`
+    /// ones) are served to later requests.
+    #[test]
+    fn shuffled_seeks_with_the_default_cache_match_the_reference() {
+        let want = open_gop_reference();
+        let mut m = open(OPEN_GOP);
+        let mut x = 0x2545f4914f6cdd1d_u64;
+        for _ in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let i = (x as usize) % 32;
+            let f = m.frame(i).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert!(f.rgba == want[i], "frame {i} differs from the reference");
         }
     }
 
