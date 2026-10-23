@@ -1,5 +1,6 @@
 //! [`Movie`]: open an MP4/MOV, report its picture format, and decode frames at times to RGBA.
 
+use crate::cache::{FrameCache, Lease};
 use crate::convert::{Matrix, Yuv, planar_to_rgba, scale_rgba};
 use crate::gop::{Described, GopDecoder};
 use crate::isobmff::{self, ByteSource, CodecConfig, Mp4File, TrackKind};
@@ -187,14 +188,16 @@ struct GopState {
     ready: BTreeMap<usize, Yuv>,
 }
 
-/// Most bytes of decoded RGBA pictures the full-size frame cache keeps (1 GiB: Gil, decision 5,
-/// 2026-10-23). The cache is an LRU by bytes: about 129 frames at 1080p, 32 at 4K UHD, 8 at 8K UHD
-/// and 4 at 8192 x 8192. It is separate from the decoder's own working-memory budget. See
-/// [`Movie::set_cache_bytes`].
+/// Most bytes of decoded RGBA pictures the full-size frame cache keeps: 1 GiB (Gil, decision 5, then
+/// V4 decision 6, 2026-10-23). The cache is an LRU by bytes: about 129 frames at 1080p, 32 at 4K UHD,
+/// 8 at 8K UHD and 4 at 8192 x 8192. It is separate from the decoder's own working-memory budget. One
+/// [`FrameCache`] of this size is shared by every movie an app opens with
+/// [`Movie::open_source_with_cache`], so the 1 GiB is for the whole app; a movie opened without a cache
+/// has a private one of this size.
 pub const DEFAULT_CACHE_BYTES: usize = 1 << 30;
 
-/// Most frames the full-size cache keeps. This is a ceiling for tiny pictures (the lookup is a linear
-/// scan), not the bound: the byte budget is, from 480p up. [`Movie::set_cache_frames`] lowers it.
+/// Most frames one movie keeps in its frame cache. This is a ceiling for tiny pictures (it bounds the
+/// bookkeeping), not the bound: the byte budget is, from 480p up. [`Movie::set_cache_frames`] lowers it.
 pub const DEFAULT_CACHE_FRAMES: usize = 512;
 
 /// Most bytes the thumbnail cache keeps (a timeline thumbnail is a few tens of kilobytes, so this
@@ -207,7 +210,8 @@ const THUMB_CACHE_BYTES: usize = 256 << 20;
 const READY_MAX_PICTURES: usize = 32;
 const READY_MAX_BYTES: usize = 256 << 20;
 
-/// A tiny LRU of decoded frames, bounded by count and by bytes of picture data. The newest entry is
+/// A tiny LRU of decoded pictures, bounded by count and by bytes of picture data, for one movie's
+/// timeline thumbnails (the full-size frames are in the shared [`FrameCache`]). The newest entry is
 /// always kept, even when it alone is over the byte bound. (Callers that still hold an evicted frame
 /// keep it alive; the bound covers what the cache itself holds.)
 struct Lru<K: PartialEq + Copy> {
@@ -245,6 +249,7 @@ impl<K: PartialEq + Copy> Lru<K> {
             self.bytes = self.bytes.saturating_sub(old.rgba.len());
         }
     }
+    #[cfg(test)]
     fn contains(&self, k: K) -> bool {
         self.items.iter().any(|(x, _)| *x == k)
     }
@@ -260,7 +265,8 @@ fn trim_ready(ready: &mut BTreeMap<usize, Yuv>, max_pictures: usize, max_bytes: 
     }
 }
 
-/// An opened movie: container index plus decoder state and frame caches.
+/// An opened movie: container index plus decoder state, its place in a frame cache (shared with the
+/// other open movies, or private) and its thumbnail cache.
 pub struct Movie {
     src: SharedSource,
     mp4: Mp4File,
@@ -274,7 +280,8 @@ pub struct Movie {
     /// Presentation index → time in seconds.
     times: Vec<f64>,
     gop: Option<GopState>,
-    cache: Lru<usize>,
+    /// This movie's place in the frame cache; dropping the movie gives its frames' bytes back.
+    cache: Lease,
     thumbs: Lru<(usize, u32)>,
     /// Decoded frames since open (statistics for tests and the UI).
     pub decoded: u64,
@@ -287,15 +294,29 @@ impl std::fmt::Debug for Movie {
 }
 
 impl Movie {
-    /// Open a movie held in memory.
+    /// Open a movie held in memory, with a frame cache of its own ([`DEFAULT_CACHE_BYTES`]).
     pub fn open(bytes: impl Into<Arc<[u8]>>) -> Result<Movie> {
+        Movie::open_with_cache(bytes, FrameCache::private())
+    }
+
+    /// Open a movie held in memory whose decoded frames go in `cache`, which other movies can share.
+    pub fn open_with_cache(bytes: impl Into<Arc<[u8]>>, cache: FrameCache) -> Result<Movie> {
         let b: Arc<[u8]> = bytes.into();
-        Movie::open_source(Arc::new(b))
+        Movie::open_source_with_cache(Arc::new(b), cache)
     }
 
     /// Open a movie from any random-access source (e.g. a `std::fs::File` on native targets, so
-    /// large movies are not read into memory).
+    /// large movies are not read into memory), with a frame cache of its own ([`DEFAULT_CACHE_BYTES`]).
     pub fn open_source(src: SharedSource) -> Result<Movie> {
+        Movie::open_source_with_cache(src, FrameCache::private())
+    }
+
+    /// Open a movie from any random-access source whose decoded frames go in `cache`. Give every
+    /// movie of an app the same [`FrameCache`] (clone the handle) and they share one byte budget, with
+    /// the least recently used frame going first whichever movie it belongs to; see [`FrameCache`]. The
+    /// decoder keeps its own working-memory budget. Dropping the movie removes its frames from the
+    /// cache.
+    pub fn open_source_with_cache(src: SharedSource, cache: FrameCache) -> Result<Movie> {
         let mp4 = isobmff::open(&*src).map_err(|e| VideoError::Container(e.to_string()))?;
         let track = mp4
             .tracks
@@ -418,7 +439,7 @@ impl Movie {
             rank,
             times,
             gop: None,
-            cache: Lru::new(DEFAULT_CACHE_FRAMES, DEFAULT_CACHE_BYTES),
+            cache: cache.lease(),
             thumbs: Lru::new(256, THUMB_CACHE_BYTES),
             decoded: 0,
         })
@@ -444,26 +465,33 @@ impl Movie {
         self
     }
 
-    /// Frames kept decoded (full size). Thumbnails have their own cache. The byte bound of
-    /// [`Movie::set_cache_bytes`] applies as well, so a large count of large frames is still held to it.
+    /// Most frames this movie keeps decoded (full size), up to [`DEFAULT_CACHE_FRAMES`]; its oldest go
+    /// first. Thumbnails have their own cache. The byte budget of the [`FrameCache`] applies as well,
+    /// so a large count of large frames is still held to it.
     pub fn set_cache_frames(&mut self, n: usize) {
-        self.cache.cap = n.clamp(1, 512);
-        self.cache.trim();
+        self.cache.set_frame_cap(n.clamp(1, DEFAULT_CACHE_FRAMES));
     }
 
-    /// Most bytes of decoded RGBA pictures the full-size frame cache keeps (default
-    /// [`DEFAULT_CACHE_BYTES`], 1 GiB). The oldest frames are dropped first, and the newest frame
-    /// always stays, so a single picture larger than the bound is still cached. This bounds the cache
-    /// only: decoder state, the pictures a running decoder holds for coming requests, and frames the
-    /// caller keeps are on top (see `docs/video-codecs.md`).
+    /// Change the byte budget of the frame cache this movie uses (default [`DEFAULT_CACHE_BYTES`],
+    /// 1 GiB). **A shared cache has one budget, so this changes it for every movie sharing it**; use
+    /// [`FrameCache::set_budget_bytes`] on the app's handle to do that on purpose. The oldest frames are
+    /// dropped first. The bound is exact: a single picture larger than the whole budget is decoded and
+    /// returned but not cached. It bounds the cache only: decoder state, the pictures a running decoder
+    /// holds for coming requests, and frames the caller keeps are on top (see `docs/video-codecs.md`).
     pub fn set_cache_bytes(&mut self, bytes: usize) {
-        self.cache.byte_cap = bytes.max(1);
-        self.cache.trim();
+        self.cache.cache().set_budget_bytes(bytes);
     }
 
-    /// Bytes of picture data the full-size frame cache holds now.
+    /// Bytes of picture data this movie holds in the frame cache now (the frames of the other movies
+    /// sharing the cache are not counted; [`FrameCache::cached_bytes`] counts them all).
     pub fn cached_bytes(&self) -> usize {
-        self.cache.bytes
+        self.cache.bytes()
+    }
+
+    /// A handle on the frame cache this movie stores its frames in (shared with the movies opened
+    /// with the same cache).
+    pub fn frame_cache(&self) -> FrameCache {
+        self.cache.cache().clone()
     }
 
     /// The frame shown at `secs` (presentation index), or `None` before the first / after the
@@ -511,6 +539,7 @@ impl Movie {
             let s = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
             Arc::new(self.decode_intra(s, index)?)
         };
+        // A frame larger than the whole cache budget is returned all the same, and not cached.
         self.cache.put(index, Arc::clone(&f));
         Ok(f)
     }
@@ -781,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_cache_evicts_the_oldest_frames_by_bytes() {
+    fn the_thumbnail_lru_evicts_the_oldest_entries_by_bytes() {
         let mut c: Lru<usize> = Lru::new(100, 1000);
         for i in 0..5 {
             c.put(i, frame(400, i));

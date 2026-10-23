@@ -7,7 +7,7 @@ use crate::gop::{GopDecoder, Pic};
 use crate::isobmff::{Av1Config, Brand, CodecConfig, FourCc, HevcConfig, Mp4Writer, SampleEntry, TrackConfig, VpcConfig, WriteSample, WriterOptions};
 use crate::movie::{GopFactory, MAX_START_STEPS, PAST_PICTURES_BEFORE_GIVING_UP};
 use crate::synth::h264_mp4;
-use crate::{Frame, Movie, Result, VideoError};
+use crate::{Frame, FrameCache, Movie, Result, VideoError};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -166,6 +166,11 @@ impl GopDecoder for Scripted {
 }
 
 fn scripted(layout: &Layout, script: Script) -> (Movie, Arc<Mutex<Log>>) {
+    scripted_in(layout, script, FrameCache::private())
+}
+
+/// Like [`scripted`], with the frames going into `cache` (shared with the other movies given it).
+fn scripted_in(layout: &Layout, script: Script, cache: FrameCache) -> (Movie, Arc<Mutex<Log>>) {
     let log = Arc::new(Mutex::new(Log::default()));
     let shared = Arc::clone(&log);
     let factory: GopFactory = Arc::new(move || {
@@ -173,7 +178,7 @@ fn scripted(layout: &Layout, script: Script) -> (Movie, Arc<Mutex<Log>>) {
         Ok(Box::new(Scripted { script: script.clone(), log: Arc::clone(&shared), held: Vec::new(), started: false, start_pts: None })
             as Box<dyn GopDecoder>)
     });
-    (Movie::open(movie_bytes(layout)).unwrap().with_test_gop(factory), log)
+    (Movie::open_with_cache(movie_bytes(layout), cache).unwrap().with_test_gop(factory), log)
 }
 
 /// The decode index of the sample shown at presentation index `pts`.
@@ -404,10 +409,13 @@ fn the_frame_cache_is_bounded_by_bytes() {
     }
     assert_eq!(m.cached_bytes(), 32);
     assert!(m.is_cached(9) && m.is_cached(8) && !m.is_cached(7));
-    // lowering the budget trims at once; the newest frame stays whatever the budget
+    // lowering the budget trims at once, to nothing when one frame is bigger than the whole budget; the
+    // frame is still decoded and returned, and not cached
     m.set_cache_bytes(1);
-    assert_eq!(m.cached_bytes(), 16);
-    assert!(m.is_cached(9));
+    assert_eq!(m.cached_bytes(), 0);
+    assert!(!m.is_cached(9));
+    assert_shows(&m.frame(9).unwrap(), &layout, 9);
+    assert_eq!((m.cached_bytes(), m.frame_cache().cached_bytes()), (0, 0));
     // raising the count cannot get round the bytes, and frames come back when asked for
     m.set_cache_bytes(1 << 20);
     for i in 0..10 {
@@ -415,6 +423,250 @@ fn the_frame_cache_is_bounded_by_bytes() {
     }
     assert_eq!(m.cached_bytes(), 160);
     assert_eq!(crate::DEFAULT_CACHE_BYTES, 1 << 30);
+}
+
+// The cache every open movie shares (Gil, V4 decision 6, 2026-10-23). Frames here are 2 x 2 x 4 = 16
+// bytes, so a budget of `16 * n` holds n frames.
+
+/// Frames, in bytes, of the 2 x 2 pictures the scripted decoder makes.
+const FRAME_BYTES: usize = 16;
+
+/// Movies sharing one cache never hold more than its budget between them, whatever they are asked for.
+#[test]
+fn movies_sharing_a_cache_never_exceed_its_budget_in_total() {
+    let layout = long_run();
+    let budget = 10 * FRAME_BYTES;
+    let cache = FrameCache::new(budget, 1000);
+    let mut movies: Vec<Movie> = (0..3).map(|_| scripted_in(&layout, Script::default(), cache.clone()).0).collect();
+    assert_eq!(cache.budget_bytes(), budget);
+    // round-robin forward, then a shuffled order, over all three
+    let mut asked = 0;
+    for i in 0..60 {
+        for (k, m) in movies.iter_mut().enumerate() {
+            let want = if i % 2 == 0 { i } else { 59 - i };
+            assert_shows(&m.frame(want).unwrap(), &layout, want as i64);
+            asked += 1;
+            assert!(cache.cached_bytes() <= budget, "after {asked} requests ({k}): {} bytes", cache.cached_bytes());
+        }
+    }
+    // the per-movie counts add up to the cache's own, and it is full
+    let sum: usize = movies.iter().map(Movie::cached_bytes).sum();
+    assert_eq!((sum, cache.cached_bytes()), (budget, budget));
+    assert_eq!(cache.cached_frames(), 10);
+    // every movie reports the one cache
+    assert!(movies.iter().all(|m| m.frame_cache().cached_bytes() == budget));
+}
+
+/// When the cache is full, the least recently used frame goes, whichever movie it belongs to.
+#[test]
+fn eviction_crosses_movies_in_least_recently_used_order() {
+    let layout = long_run();
+    let cache = FrameCache::new(4 * FRAME_BYTES, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    // oldest to newest: a0 b0 a1 b1
+    for i in 0..2 {
+        a.frame(i).unwrap();
+        b.frame(i).unwrap();
+    }
+    assert_eq!(cache.cached_bytes(), 4 * FRAME_BYTES);
+    // using a0 again makes it the newest: the order is now b0 a1 b1 a0
+    a.frame(0).unwrap();
+    // a new frame of b pushes out the oldest, which is b's own b0 ...
+    b.frame(2).unwrap();
+    assert!(!b.is_cached(0) && a.is_cached(0) && a.is_cached(1) && b.is_cached(1) && b.is_cached(2));
+    // ... and the next one (a3) takes a1: it belongs to the other movie, and is the oldest left
+    a.frame(3).unwrap();
+    assert!(!a.is_cached(1) && b.is_cached(1) && a.is_cached(0) && b.is_cached(2) && a.is_cached(3));
+    // then b1, then a0, then a3's turn would come: the order they were last used
+    b.frame(4).unwrap();
+    assert!(!b.is_cached(1) && a.is_cached(0));
+    b.frame(5).unwrap();
+    assert!(!a.is_cached(0) && a.is_cached(3) && b.is_cached(2) && b.is_cached(4) && b.is_cached(5));
+    assert_eq!(cache.cached_bytes(), 4 * FRAME_BYTES);
+    assert_eq!(a.cached_bytes() + b.cached_bytes(), 4 * FRAME_BYTES);
+}
+
+/// Two movies that take turns both keep hitting the cache while what they need together fits it.
+#[test]
+fn two_movies_taking_turns_both_hit_the_cache_when_their_frames_fit() {
+    let layout = long_run();
+    // 6 frames of each movie are 12 frames: a budget of 12 holds them all
+    let cache = FrameCache::new(12 * FRAME_BYTES, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    for i in 0..6 {
+        a.frame(i).unwrap();
+        b.frame(i).unwrap();
+    }
+    let (da, db) = (a.decoded, b.decoded);
+    assert!(da >= 6 && db >= 6);
+    for _ in 0..5 {
+        // alternate, and not in the order they were decoded
+        for i in [3usize, 0, 5, 1, 4, 2] {
+            assert_shows(&a.frame(i).unwrap(), &layout, i as i64);
+            assert_shows(&b.frame(i).unwrap(), &layout, i as i64);
+        }
+    }
+    assert_eq!((a.decoded, b.decoded), (da, db), "every repeat request was a hit: nothing was decoded again");
+    assert_eq!(cache.cached_frames(), 12);
+    // the same two movies with a budget one frame short thrash in plain LRU on this cyclic pattern, and
+    // are still correct (the docs say so)
+    let small = FrameCache::new(11 * FRAME_BYTES, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), small.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), small.clone());
+    for _ in 0..3 {
+        for i in 0..6 {
+            assert_shows(&a.frame(i).unwrap(), &layout, i as i64);
+            assert_shows(&b.frame(i).unwrap(), &layout, i as i64);
+            assert!(small.cached_bytes() <= 11 * FRAME_BYTES);
+        }
+    }
+}
+
+/// A movie that plays through a long run cannot keep another one out for good: whatever it has pushed
+/// out, the other gets its frames back by asking, and they are then hits.
+#[test]
+fn one_playing_movie_does_not_starve_another_for_good() {
+    let layout = long_run();
+    let cache = FrameCache::new(8 * FRAME_BYTES, 1000);
+    let (mut playing, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut idle, _) = scripted_in(&layout, Script::default(), cache.clone());
+    for i in 0..3 {
+        idle.frame(i).unwrap();
+    }
+    assert_eq!(idle.cached_bytes(), 3 * FRAME_BYTES);
+    // the other movie plays 40 frames: the idle one's frames are the oldest, so they go
+    for i in 0..40 {
+        playing.frame(i).unwrap();
+    }
+    assert_eq!(idle.cached_bytes(), 0, "plain LRU: an idle movie's frames are the first to go");
+    assert_eq!(playing.cached_bytes(), 8 * FRAME_BYTES);
+    // asked again, the idle movie decodes and caches its frames at the newest end ...
+    let before = idle.decoded;
+    for i in 0..3 {
+        idle.frame(i).unwrap();
+    }
+    assert!(idle.decoded > before);
+    assert_eq!(idle.cached_bytes(), 3 * FRAME_BYTES);
+    // ... and hits them from then on, though the other keeps playing between the requests
+    let after = idle.decoded;
+    for i in 40..44 {
+        playing.frame(i).unwrap();
+        for k in 0..3 {
+            idle.frame(k).unwrap();
+        }
+    }
+    assert_eq!(idle.decoded, after, "the idle movie's frames stayed while it was in use");
+    assert!(cache.cached_bytes() <= 8 * FRAME_BYTES);
+}
+
+/// A movie's own frame ceiling holds only that movie to it; the others sharing the cache are untouched.
+#[test]
+fn a_movies_own_frame_ceiling_does_not_touch_the_others_sharing_the_cache() {
+    let layout = long_run();
+    let cache = FrameCache::new(1 << 20, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    a.set_cache_frames(2);
+    for i in 0..6 {
+        a.frame(i).unwrap();
+        b.frame(i).unwrap();
+    }
+    assert_eq!((a.cached_bytes(), b.cached_bytes()), (2 * FRAME_BYTES, 6 * FRAME_BYTES));
+    assert!(a.is_cached(5) && a.is_cached(4) && !a.is_cached(3), "a keeps its two newest");
+    assert!((0..6).all(|i| b.is_cached(i)), "b keeps all six");
+    assert_eq!(cache.cached_bytes(), 8 * FRAME_BYTES);
+    // the ceiling is clamped to 1..=DEFAULT_CACHE_FRAMES
+    a.set_cache_frames(0);
+    assert_eq!(a.cached_bytes(), FRAME_BYTES);
+    a.set_cache_frames(usize::MAX);
+    for i in 10..14 {
+        a.frame(i).unwrap();
+    }
+    assert_eq!(a.cached_bytes(), 5 * FRAME_BYTES);
+}
+
+/// A frame bigger than the whole budget is decoded and returned, and not cached; nothing panics.
+#[test]
+fn a_frame_larger_than_the_whole_shared_budget_is_returned_but_not_cached() {
+    let layout = long_run();
+    let cache = FrameCache::new(FRAME_BYTES - 1, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    for i in 0..5 {
+        assert_shows(&a.frame(i).unwrap(), &layout, i as i64);
+        assert_shows(&b.frame(i).unwrap(), &layout, i as i64);
+    }
+    assert_eq!((cache.cached_bytes(), cache.cached_frames(), a.cached_bytes(), b.cached_bytes()), (0, 0, 0, 0));
+    assert!(!a.is_cached(4));
+    // a request again decodes again, and still works
+    assert_shows(&a.frame(2).unwrap(), &layout, 2);
+    // raising the budget lets frames in from then on
+    cache.set_budget_bytes(2 * FRAME_BYTES);
+    a.frame(2).unwrap();
+    b.frame(2).unwrap();
+    assert_eq!(cache.cached_bytes(), 2 * FRAME_BYTES);
+}
+
+/// Closing a movie (dropping it, as the Video track does when it clears its pool) gives its bytes back.
+#[test]
+fn closing_a_movie_frees_its_bytes_in_the_shared_cache() {
+    let layout = long_run();
+    let cache = FrameCache::new(1 << 20, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    for i in 0..6 {
+        a.frame(i).unwrap();
+    }
+    for i in 0..4 {
+        b.frame(i).unwrap();
+    }
+    assert_eq!((a.cached_bytes(), b.cached_bytes(), cache.cached_bytes()), (6 * FRAME_BYTES, 4 * FRAME_BYTES, 10 * FRAME_BYTES));
+    drop(a);
+    assert_eq!(cache.cached_bytes(), 4 * FRAME_BYTES, "a's six frames are gone with it");
+    assert!(b.is_cached(3) && b.is_cached(0));
+    drop(b);
+    assert_eq!((cache.cached_bytes(), cache.cached_frames()), (0, 0));
+    // a movie opened with a private cache frees its own the same way (nothing to observe from outside, but the
+    // handle it gave out sees it)
+    let (mut p, _) = scripted(&layout, Script::default());
+    p.frame(0).unwrap();
+    let handle = p.frame_cache();
+    assert_eq!(handle.cached_bytes(), FRAME_BYTES);
+    drop(p);
+    assert_eq!(handle.cached_bytes(), 0);
+}
+
+/// A panic in a thread that held the cache's lock poisons it; the cache recovers (it only drops what it
+/// held) and the movies carry on, with no panic anywhere.
+#[test]
+fn a_poisoned_cache_lock_is_recovered_not_a_panic() {
+    let layout = long_run();
+    let cache = FrameCache::new(1 << 20, 1000);
+    let (mut a, _) = scripted_in(&layout, Script::default(), cache.clone());
+    let (mut b, _) = scripted_in(&layout, Script::default(), cache.clone());
+    for i in 0..4 {
+        a.frame(i).unwrap();
+    }
+    cache.poison_for_test();
+    // every call a movie makes on the cache works; what was held is gone and the books agree
+    assert_shows(&a.frame(2).unwrap(), &layout, 2);
+    assert_eq!(a.cached_bytes(), FRAME_BYTES);
+    assert_eq!(cache.cached_bytes(), FRAME_BYTES);
+    cache.poison_for_test();
+    assert_shows(&b.frame(1).unwrap(), &layout, 1);
+    cache.poison_for_test();
+    assert!(!a.is_cached(2), "the poisoned cache was emptied by the first call that found it");
+    cache.poison_for_test();
+    drop(a);
+    cache.poison_for_test();
+    assert_shows(&b.frame(3).unwrap(), &layout, 3);
+    assert_eq!(cache.cached_bytes(), b.cached_bytes());
+    // and a movie can be opened and closed on a poisoned cache
+    cache.poison_for_test();
+    let (c, _) = scripted_in(&layout, Script::default(), cache.clone());
+    drop(c);
 }
 
 /// By default the cache is an LRU by bytes (Gil, decision 5): small frames are not held to a dozen.

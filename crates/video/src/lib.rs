@@ -5,7 +5,10 @@
 //! - [`Movie::info`]: size, duration, frame rate, codec, whether it can be decoded.
 //! - [`Movie::frame_at`]: the frame shown at a time, decoded forward from the previous keyframe,
 //!   with an LRU of decoded frames held to a byte budget, 1 GiB by default (sequential playback keeps
-//!   decoding forward).
+//!   decoding forward). The LRU is a [`FrameCache`]: an app opens every movie with one shared handle
+//!   ([`Movie::open_source_with_cache`]) and the 1 GiB is for all of them together, least recently
+//!   used frame out first whichever movie it belongs to. A movie opened with [`Movie::open`] or
+//!   [`Movie::open_source`] has a cache of its own.
 //! - [`Movie::thumbnail_at`] / [`Movie::thumbnails`]: low-resolution timeline pictures (keyframes).
 //! - Unsupported codecs open fine (so the timeline can show the clip) but frame requests return
 //!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
@@ -56,7 +59,7 @@
 //! bounded allocations, picture-size and memory budgets); [`bitstream`] matches FilmCraft
 //! commit `f47a1f6` apart from the checked arithmetic in `length_prefixed_nals`, and `vc3`, `hevc`
 //! and `av1` were taken from that commit. `ATTRIBUTION.md` lists each with its local changes. Fixes
-//! found here should be offered back upstream. [`Movie`], the pixel conversion and the frame caches
+//! found here should be offered back upstream. [`Movie`], the pixel conversion and the frame cache
 //! are SoundCraft's own.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 // Codec code indexes fixed-size blocks; index loops read more clearly than iterator chains there.
@@ -69,6 +72,7 @@ mod adapt_hevc;
 #[cfg(feature = "av1-decode")]
 pub mod av1;
 pub mod bitstream;
+mod cache;
 pub mod convert;
 mod gop;
 pub mod h264;
@@ -80,6 +84,7 @@ pub mod prores;
 pub mod synth;
 pub mod vc3;
 
+pub use cache::{DEFAULT_SHARED_CACHE_FRAMES, FrameCache};
 pub use isobmff::ByteSource;
 pub use movie::{DEFAULT_CACHE_BYTES, DEFAULT_CACHE_FRAMES, Frame, Movie, MovieInfo, SharedSource, fit_size};
 
