@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e2ccdf6b2b208fb9eeb86bb39c6104a1474322cc4745079475c51fbbff515172 # shrinks to spec = [[ClipSpec { gap: 0, len: 2, offset: 0, gain_half_db: 0, fade_in: (0, 0), fade_out: (0, 0) }]]
