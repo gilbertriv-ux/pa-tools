@@ -672,7 +672,8 @@ fn ffmpeg_reads_our_files_without_errors() {
             .args(["-f", "f32le", "-ac", &ch.to_string(), "-ar", "48000", "-"])
             .output()
             .unwrap();
-        let samples: Vec<f32> = pcm.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let (words, _) = pcm.stdout.as_chunks::<4>();
+        let samples: Vec<f32> = words.iter().map(|b| f32::from_le_bytes(*b)).collect();
         assert_eq!(samples.len(), expected_frames(frames, rate) * usize::from(ch), "ffmpeg decoded length");
         let planar: Vec<Vec<f32>> = (0..usize::from(ch)).map(|c| samples.iter().skip(c).step_by(usize::from(ch)).copied().collect()).collect();
         let delta = lufs(&planar, 48_000) - lufs(&input, rate);
