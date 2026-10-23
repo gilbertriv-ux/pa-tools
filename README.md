@@ -146,8 +146,8 @@ cargo run --release -p soundcraft -- --demo     # builds the `pa-tools` binary a
 
 The Cargo packages keep their upstream names (`soundcraft`, `soundcraft-cli`, `soundcraft-web`), so
 `-p soundcraft` selects the desktop app; the binaries it produces are **`pa-tools`** and
-**`pa-tools-cli`**. `cargo xtask ci` runs formatting, clippy, the tests, the asset and layering
-checks and the WebAssembly build.
+**`pa-tools-cli`**. `cargo xtask ci` runs formatting, clippy, the tests (the video crate also with its
+`hevc-decode` and `av1-decode` features on), the asset and layering checks and the WebAssembly build.
 
 ### macOS: Intel, Apple silicon, universal
 

@@ -150,7 +150,21 @@ fn ci() -> Result<(), String> {
     let steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = vec![
         ("fmt", Box::new(|| cargo(&["fmt", "--all", "--", "--check"]))),
         ("clippy", Box::new(|| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
+        // The HEVC and AV1 decoders are compile-time features, off in shipped builds (docs/video-codecs.md),
+        // so the workspace runs above never compile them. Lint and test the video crate with them on.
+        (
+            "clippy video hevc",
+            Box::new(|| cargo(&["clippy", "-p", "soundcraft-video", "--all-targets", "--features", "hevc-decode", "--", "-D", "warnings"])),
+        ),
+        (
+            "clippy video hevc+av1",
+            Box::new(|| {
+                cargo(&["clippy", "-p", "soundcraft-video", "--all-targets", "--features", "hevc-decode,av1-decode", "--", "-D", "warnings"])
+            }),
+        ),
         ("test", Box::new(|| cargo(&["test", "--workspace"]))),
+        ("test video hevc", Box::new(|| cargo(&["test", "-p", "soundcraft-video", "--features", "hevc-decode"]))),
+        ("test video hevc+av1", Box::new(|| cargo(&["test", "-p", "soundcraft-video", "--features", "hevc-decode,av1-decode"]))),
         ("assets", Box::new(assets)),
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),
