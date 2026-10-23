@@ -82,7 +82,12 @@ pub fn tool_definitions() -> Vec<Value> {
             &["path"],
         ),
         tool("parity", "Feature-parity report against the incumbent's menu catalog.", json!({}), &[]),
-        tool("screenshot", "APP_ONLY. Screenshot the app window (PNG).", json!({"path": {"type": "string"}}), &[]),
+        tool(
+            "screenshot",
+            "APP_ONLY. Restore and focus the app window, then capture its rendered frame (PNG).",
+            json!({"path": {"type": "string"}}),
+            &[],
+        ),
         tool("ui_inspect", "APP_ONLY. UI state: front window, panels, layout rectangles of tracks, dialogs.", json!({}), &[]),
         tool("ui_set", "APP_ONLY. Set UI state fields, e.g. {\"window\": \"Mix\"}.", json!({"state": {"type": "object"}}), &["state"]),
         tool(

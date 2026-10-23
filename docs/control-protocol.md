@@ -1,6 +1,6 @@
 # Control protocol
 
-Last updated: 2026-10-22 (desktop workspace V2 transcript host).
+Last updated: 2026-10-22 (V3 screenshot recovery).
 
 Pa Tools can be driven completely by other programs: scripts, test harnesses and AI agents.
 Every menu item, button, mouse gesture and keystroke maps to a **command** (or to synthetic
@@ -45,7 +45,7 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `engine.commands` | `{filter?}` | Every command: id, label, menu path, shortcut, params doc, enabled + reason. Includes UI-layer commands (`window.*`). |
 | `engine.parity` | `{}` | Parity report against the incumbent's menu catalog. |
 | `session.inspect` | `{detail?: "summary"|"full"}` | The document: tracks, clips (with times), inserts (+params when full), sends, routing, automation, markers, groups, busses, sources (`loaded` true when decoded audio is in the pool), selection, zoom (`samples_per_px`, `scroll`), transport, undo label. |
-| `ui.inspect` | `{}` | UI state (`window`, panels, dialogs), window size, playing/position, audio device, and `edit_layout` (timeline rect and every track row's rect, for clicking). |
+| `ui.inspect` | `{}` | UI state (`window`, panels, dialogs), window size, `viewport` visibility/focus/minimized/occluded flags (null when unknown), playing/position, audio device, and `edit_layout` (timeline rect and every track row's rect, for clicking). |
 | `ui.set` | any `UiState` fields | e.g. `{"window": "Mix", "narrow_mix": true}`. |
 | `ui.menu.list` | `{}` | Every catalog menu path and the command that implements it (or null). |
 | `ui.menu.invoke` | `{path}` or `{id}` | Like clicking the menu item: may open its dialog (e.g. `"Track > New..."`). |
@@ -56,10 +56,16 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `ui.move` | `{x, y}` | Move the pointer. |
 | `ui.key` | `{key, cmd?, shift?, alt?, ctrl?}` | Key press (`Space`, `Enter`, `A`, `F7`, `=`…). |
 | `ui.text` | `{text}` | Type text into the focused field. |
-| `ui.screenshot` | `{path?}` | PNG of the window (base64 in `png_base64` when no path). |
+| `ui.screenshot` | `{path?}` | Restore and focus the app window, then capture a rendered frame as PNG (base64 in `png_base64` when no path). Waits up to 15 seconds. |
 | `app.quit` | `{}` | Quit. |
 
 ## Positions and references
+
+Screenshot requests make the app window visible and unminimized so the native renderer can
+produce a current frame. Capture waits for three UI frames, counting repeated layout passes
+only once. Covered-window logic ticks do not advance capture or exhaust its timeout. The
+15-second wall-clock deadline returns an explicit error if the renderer cannot supply a
+frame. Capturing does not change the session or start playback/recording.
 
 - Tracks: id (number) or name (`"Kick"`).
 - Clips: id (from `session.inspect`).
@@ -113,3 +119,9 @@ A center `move` can include `before` (panel ID or null to append) for tab order.
 The equivalent `{"action": ...}` form accepts a serialized shared docking action;
 this is also the form emitted by the renderer. Protected-canvas and app-specific panel
 rules apply equally to both forms.
+
+## Revision history
+
+| Date | Change |
+|---|---|
+| 2026-10-22 | V3: screenshot restores/focuses the viewport, waits for rendered UI frames and uses a wall-clock timeout. |

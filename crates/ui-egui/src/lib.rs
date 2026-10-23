@@ -1279,6 +1279,7 @@ impl SoundApp {
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
+        control::request_screenshots(self, &ctx);
         // Here, not in logic(): a covered or minimized window runs only logic(), with no vsync to pace it.
         if self.meters_live() {
             let hz = if self.ui.window == MainWindow::Mix { 60 } else { 30 };
@@ -1296,6 +1297,12 @@ impl SoundApp {
         json!({
             "ui": self.ui,
             "window_size": [size.x, size.y],
+            "viewport": ctx.input(|i| json!({
+                "focused": i.viewport().focused,
+                "minimized": i.viewport().minimized,
+                "occluded": i.viewport().occluded,
+                "visible": i.viewport().visible(),
+            })),
             "playing": self.is_playing(),
             "position": self.position(),
             "dialog": self.dialogs.open_name(),
