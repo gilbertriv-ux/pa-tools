@@ -536,6 +536,61 @@ mod tests {
         assert_send_sync::<Lease>();
     }
 
+    /// Threads that share one cache, each through a lease of its own, never see it over its byte or frame
+    /// budget, and when they are done the books agree with what the movies hold; a poisoning in the
+    /// middle (a thread that panicked while it held the lock) changes none of that.
+    #[test]
+    fn threads_sharing_a_cache_keep_the_books_exact_through_a_poisoning() {
+        const THREADS: usize = 4;
+        const BUDGET: usize = 2000;
+        const FRAMES: usize = 64;
+        const KEYS: usize = 40;
+        let cache = FrameCache::new(BUDGET, FRAMES);
+        let leases: Vec<Lease> = (0..THREADS).map(|_| cache.lease()).collect();
+        std::thread::scope(|scope| {
+            for (t, lease) in leases.iter().enumerate() {
+                let cache = &cache;
+                scope.spawn(move || {
+                    // xorshift, seeded differently per thread: no clock, no dependency, the same run every time
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407);
+                    for step in 0..3000usize {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let index = (x % KEYS as u64) as usize;
+                        let len = 20 + ((x >> 20) % 200) as usize;
+                        if (x >> 40) % 3 == 2 {
+                            if let Some(f) = lease.get(index) {
+                                assert_eq!(f.index, index, "a hit returns the frame that was cached under that key");
+                            }
+                        } else {
+                            lease.put(index, frame(len, index));
+                        }
+                        let (bytes, frames) = (cache.cached_bytes(), cache.cached_frames());
+                        assert!(bytes <= BUDGET, "thread {t} step {step}: {bytes} bytes over the {BUDGET} budget");
+                        assert!(frames <= FRAMES, "thread {t} step {step}: {frames} frames over the {FRAMES} ceiling");
+                        if t == 0 && step % 700 == 350 {
+                            cache.poison_for_test();
+                        }
+                    }
+                });
+            }
+        });
+        // everyone is done: what each movie holds adds up to the cache's own count, byte for byte
+        let held: usize = leases.iter().map(Lease::bytes).sum();
+        let frames: usize = leases.iter().map(|l| (0..KEYS).filter(|&i| l.contains(i)).count()).sum();
+        assert_eq!((held, frames), (cache.cached_bytes(), cache.cached_frames()));
+        assert!(held <= BUDGET && frames <= FRAMES);
+        // and closing the movies, one by one, gives every byte back
+        for lease in leases {
+            let before = cache.cached_bytes();
+            let mine = lease.bytes();
+            drop(lease);
+            assert_eq!(cache.cached_bytes(), before - mine);
+        }
+        assert_eq!((cache.cached_bytes(), cache.cached_frames()), (0, 0));
+    }
+
     #[test]
     fn the_defaults_are_a_gibibyte_and_the_old_ceilings() {
         let cache = FrameCache::default();
