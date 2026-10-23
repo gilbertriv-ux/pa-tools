@@ -47,7 +47,7 @@ mod adapt_hevc;
 pub mod av1;
 pub mod bitstream;
 pub mod convert;
-pub mod dnx;
+pub mod vc3;
 mod gop;
 pub mod h264;
 #[cfg(feature = "hevc-decode")]
