@@ -29,7 +29,7 @@ mod symbol;
 mod tile;
 mod transform;
 
-pub use decoder::{DEFAULT_MEMORY_BUDGET, Decoder};
+pub use decoder::{DEFAULT_MEMORY_BUDGET, Decoder, picture_fits_budget};
 pub use header::{ColorConfig, FrameHeader, SequenceHeader};
 pub use stats::{DecodeStats, Stage};
 
@@ -120,4 +120,30 @@ pub fn is_key_frame_unit(data: &[u8]) -> bool {
 /// sequence is a key frame).
 pub fn has_frame_unit(data: &[u8]) -> bool {
     first_frame_byte(data).is_some()
+}
+
+/// The first sequence header OBU in `data` (the `configOBUs` of an `av1C` record, or a temporal
+/// unit), when the OBUs before it are well formed and it parses.
+pub fn find_sequence_header(data: &[u8]) -> Option<SequenceHeader> {
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let h = *data.get(pos)?;
+        let obu_type = (h >> 3) & 0xf;
+        let ext = h & 4 != 0;
+        let has_size = h & 2 != 0;
+        let mut p = pos.checked_add(1)?.checked_add(usize::from(ext))?;
+        let size = if has_size {
+            let (v, n) = bits::leb128(data.get(p..)?).ok()?;
+            p = p.checked_add(n)?;
+            usize::try_from(v).ok()?
+        } else {
+            data.len().saturating_sub(p)
+        };
+        let end = p.checked_add(size).filter(|&e| e <= data.len())?;
+        if obu_type == 1 {
+            return SequenceHeader::parse(data.get(p..end)?).ok();
+        }
+        pos = end;
+    }
+    None
 }

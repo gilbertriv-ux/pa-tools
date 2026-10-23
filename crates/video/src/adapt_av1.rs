@@ -51,7 +51,15 @@ pub(crate) fn describe(cfg: &Av1Config) -> Described {
             return Described { detail: "AV1".into(), unsupported: Some("AV1 with this chroma layout is not supported".into()) };
         }
     };
-    Described { detail: format!("AV1 {profile} {depth}-bit {chroma}"), unsupported: None }
+    // The sequence header the record carries says how large frames get. A picture whose references and
+    // working copies cannot fit the decoder's memory budget (1 GiB, Gil's decision 5) would open as
+    // decodable and then fail on every frame, so it is refused here, up front, the way HEVC is.
+    let unsupported = crate::av1::find_sequence_header(&cfg.config_obus).and_then(|seq| {
+        let (w, h) = (seq.max_frame_width, seq.max_frame_height);
+        (!crate::av1::picture_fits_budget(&seq, w, h, crate::av1::DEFAULT_MEMORY_BUDGET))
+            .then(|| format!("AV1 {w}x{h} pictures are unsupported in this build: picture too large for the memory budget"))
+    });
+    Described { detail: format!("AV1 {profile} {depth}-bit {chroma}"), unsupported }
 }
 
 /// A decoder primed with the sequence header OBUs from `av1C`.
@@ -219,6 +227,75 @@ mod tests {
             assert!(d.unsupported.is_some_and(|w| w.contains("not supported")), "{bad:?}");
             assert_eq!(d.detail, "AV1");
         }
+    }
+
+    /// The sequence header OBU of a reduced still-picture sequence of `w` x `h` (4:2:0, 8-bit).
+    fn sequence_obu(w: u32, h: u32) -> Vec<u8> {
+        let mut b = crate::bitstream::BitWriter::new();
+        b.write_bits(0, 3); // seq_profile
+        b.write_bits(1, 1); // still_picture
+        b.write_bits(1, 1); // reduced_still_picture_header
+        b.write_bits(0, 5); // seq_level_idx
+        b.write_bits(15, 4); // frame_width_bits_minus_1
+        b.write_bits(15, 4); // frame_height_bits_minus_1
+        b.write_bits(w - 1, 16);
+        b.write_bits(h - 1, 16);
+        b.write_bits(0, 3 + 3 + 7 + 1); // superblock size, filter intra, edge filter; superres, cdef, restoration; color config; film grain
+        b.rbsp_trailing();
+        let payload = b.finish();
+        let mut obu = vec![1 << 3 | 0b10, payload.len() as u8];
+        obu.extend(payload);
+        obu
+    }
+
+    /// Gil's decision 5: a 1 GiB decoder budget. An AV1 picture the decoder would refuse on every frame
+    /// is refused when the file opens, with the reason, rather than shown as decodable.
+    #[test]
+    fn a_picture_beyond_the_memory_budget_is_refused_when_the_file_opens() {
+        let base = config(0, false, false, false, true, true);
+        for (w, h, fits) in [
+            (64, 64, true),
+            (1920, 1080, true),
+            (3840, 2160, true),
+            (5120, 2880, true),
+            (7680, 4320, false),
+            (8192, 4320, false),
+            (8192, 8192, false),
+        ] {
+            let d = describe(&Av1Config { config_obus: sequence_obu(w, h), ..base.clone() });
+            assert_eq!(d.detail, "AV1 Main 8-bit 4:2:0");
+            if fits {
+                assert_eq!(d.unsupported, None, "{w}x{h}");
+            } else {
+                let why = d.unsupported.unwrap_or_default();
+                assert!(
+                    why.contains(&format!("{w}x{h}")) && why.contains("unsupported in this build") && why.contains("too large for the memory budget"),
+                    "{why}"
+                );
+            }
+        }
+        // a record with no sequence header (or a damaged one) says nothing about size: the stream decides
+        for obus in [&[][..], &[0x0a, 0x0b][..], &[0xff; 20][..]] {
+            assert_eq!(describe(&Av1Config { config_obus: obus.to_vec(), ..base.clone() }).unsupported, None);
+        }
+    }
+
+    #[test]
+    fn an_8k_av1_movie_opens_as_not_decodable_and_says_why_on_every_request() {
+        use crate::isobmff::{Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+        let cfg = Av1Config { config_obus: sequence_obu(7680, 4320), ..config(0, false, false, false, true, true) };
+        let mut mw = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let entry = SampleEntry::video(FourCc(*b"av01"), crate::isobmff::CodecConfig::Av1(cfg), 7680, 4320);
+        let t = mw.add_track(TrackConfig::new(entry, 24)).unwrap();
+        mw.write_sample(t, WriteSample { data: &[0u8; 16], duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+        let mut m = crate::Movie::open(mw.finish().unwrap().into_inner()).unwrap();
+        let i = m.info().clone();
+        assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", 7680, 4320, false));
+        for _ in 0..2 {
+            let Err(VideoError::Unsupported(why)) = m.frame(0) else { panic!("an 8K AV1 picture must be refused") };
+            assert!(why.contains("too large for the memory budget"), "{why}");
+        }
+        assert!(matches!(m.thumbnail_at(0.0, 16), Err(VideoError::Unsupported(_))));
     }
 
     #[test]
