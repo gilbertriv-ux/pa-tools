@@ -2,6 +2,8 @@
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*", "xtask"]
+# crates/interchange holds the donor files verbatim until the adaptation commit; it does not build yet.
+exclude = ["crates/interchange"]
 
 [workspace.package]
 version = "0.11.0"
