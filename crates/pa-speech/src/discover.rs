@@ -119,7 +119,8 @@ fn bundle_resources(exe: &Path) -> Option<PathBuf> {
 /// lacks the model (or has it half downloaded) is skipped.
 ///
 /// Errors: [`SpeechError::UnknownModel`] for an id outside the catalogue, and
-/// [`SpeechError::ModelUnavailable`] (naming every place searched) when no folder has it.
+/// [`SpeechError::ModelUnavailable`] (naming the model by its display name and every place
+/// searched) when no folder has it.
 pub fn resolve_models_dir(search: &ModelSearch, model_id: &str) -> Result<PathBuf, SpeechError> {
     let model = models::find(model_id).ok_or_else(|| SpeechError::UnknownModel(model_id.into()))?;
     for (_, _, dir) in search.tiers() {
@@ -138,5 +139,5 @@ pub fn resolve_models_dir(search: &ModelSearch, model_id: &str) -> Result<PathBu
         })
         .collect::<Vec<_>>()
         .join(", ");
-    Err(SpeechError::ModelUnavailable(format!("speech model `{model_id}` not found (searched: {searched})")))
+    Err(SpeechError::ModelUnavailable { model: model.id.to_string(), searched })
 }

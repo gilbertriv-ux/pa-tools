@@ -8,6 +8,17 @@
 //! any other edit. Everything else the window does goes through commands too (`transport.locate`,
 //! `edit.select`, `track.rename_speaker`).
 //!
+//! The menu entry and the command palette's Transcribe Track start that same job ([`invoke`]): they
+//! open this window on the track and return at once. Only calls that come in over the control
+//! channel or MCP run `track.transcribe` synchronously, on the calling thread.
+//!
+//! A stopped transcription leaves its worker thread running until the next time the recogniser
+//! checks in; the window keeps the thread's handle and starts no other job until it has finished
+//! (see [`TranscriptState::is_stopping`]), so two recognisers never hold the model in memory at once.
+//!
+//! Nothing here names the speech model's maker or its id: people read the catalogue's display name
+//! ("Speech model, base (multilingual)"), and the folders searched go to the log, not the status line.
+//!
 //! Time origin: a transcript's word times are samples from the session start, the same origin as
 //! markers and clip positions, never relative to a clip or to a render range.
 
@@ -15,7 +26,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold, mono, regular};
 use egui::{Align, Color32, Key, Label, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 use serde_json::{Map, Value, json};
-use soundcraft_engine::cmd::{TranscribeOutcome, track_param, transcribe_job};
+use soundcraft_engine::cmd::{SharedTranscriber, TranscribeOutcome, track_param, transcribe_job, transcribe_job_with_transcriber};
 use soundcraft_model::{Session, TrackId, TrackKind, Transcript, TranscriptWord};
 use soundcraft_time::{SampleRate, Samples};
 use std::sync::Arc;
@@ -177,7 +188,10 @@ impl View {
 /// The window's state, kept on [`SoundApp`].
 pub struct TranscriptState {
     pub open: bool,
-    /// Folder that holds `whisper-base/`; empty uses the app's own models folder.
+    /// The Models folder field: the folder that holds the speech model's folder. Empty (the
+    /// default) lets the engine search: `$PA_SPEECH_MODELS_DIR`, then the app bundle, then the
+    /// app's own data folder. Only what the user typed is sent as `models_dir`, so it is not
+    /// prefilled from the environment (that would turn the first tier into the only one).
     pub models_dir: String,
     /// Keep the line under the playhead in view while playing.
     pub follow: bool,
@@ -187,6 +201,14 @@ pub struct TranscriptState {
     /// What the window last had to say (progress, results, why nothing happened).
     pub status: String,
     job: Option<Running>,
+    /// The worker thread of a transcription that was stopped and has not finished yet. No other
+    /// job starts while it is alive.
+    stopping: Option<std::thread::JoinHandle<()>>,
+    /// A recogniser to use instead of looking for the speech model (see
+    /// [`TranscriptState::inject_transcriber`]); `None` in the program.
+    transcriber: Option<SharedTranscriber>,
+    /// A transcription asked for before there was a frame to start it in (see [`invoke`]).
+    pending: Option<TrackId>,
     view: Option<View>,
     shown: Option<TrackId>,
     editing: Option<SpeakerEdit>,
@@ -200,12 +222,15 @@ impl Default for TranscriptState {
     fn default() -> Self {
         TranscriptState {
             open: false,
-            models_dir: std::env::var("PA_SPEECH_MODELS_DIR").unwrap_or_default(),
+            models_dir: String::new(),
             follow: true,
             query: String::new(),
             track: None,
             status: String::new(),
             job: None,
+            stopping: None,
+            transcriber: None,
+            pending: None,
             view: None,
             shown: None,
             editing: None,
@@ -220,6 +245,25 @@ impl TranscriptState {
     pub fn is_running(&self) -> bool {
         self.job.is_some()
     }
+
+    /// Whether a transcription that was stopped is still winding down on its worker thread. A new
+    /// one does not start until it has finished.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.as_ref().is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Use `transcriber` for every transcription this window starts, instead of looking for the
+    /// speech model on disk. This is the seam for tests of the menu, the command palette and this
+    /// window, which prove that a background job ends in a stored transcript without the model being
+    /// installed; the app itself never calls it, so in the program every job looks for the model.
+    pub fn inject_transcriber(&mut self, transcriber: SharedTranscriber) {
+        self.transcriber = Some(transcriber);
+    }
+
+    /// Whether jobs use an injected recogniser ([`TranscriptState::inject_transcriber`]).
+    pub fn has_injected_transcriber(&self) -> bool {
+        self.transcriber.is_some()
+    }
 }
 
 /// A transcription on its worker thread.
@@ -232,6 +276,8 @@ struct Running {
     stage: String,
     cancel: Arc<AtomicBool>,
     rx: Receiver<Msg>,
+    /// The worker thread, kept so that a stop can wait for it (see [`TranscriptState::stopping`]).
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 enum Msg {
@@ -293,10 +339,49 @@ pub fn run(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, Stri
     Some(Ok(json!({"value": st.open})))
 }
 
+/// The first line of `text`: all a status line shows of an error, whose later lines may be a
+/// backtrace or a list of folders.
+fn first_line(text: &str) -> &str {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// Says `msg` in the window and the main status line, one line of it. A longer message is logged
+/// in full.
 fn set_status(app: &mut SoundApp, msg: impl Into<String>) {
-    let msg = msg.into();
-    app.ui.status.clone_from(&msg);
-    app.transcript.status = msg;
+    let full = msg.into();
+    let shown = first_line(&full).to_string();
+    if shown != full.trim() {
+        log::warn!("transcription: {full}");
+    }
+    app.ui.status.clone_from(&shown);
+    app.transcript.status = shown;
+}
+
+/// `track.transcribe` as the menu and the command palette run it: open this window on the track
+/// and start its background job, then return. The synchronous command would hold the whole app for
+/// as long as the recognition takes (minutes, for a long track); calls over the control channel
+/// or MCP still run it that way, because their caller waits for the answer.
+///
+/// `p` is the command's params: `track` picks the track (else the window's pick, the Edit
+/// selection, or the first audio track).
+pub(crate) fn invoke(app: &mut SoundApp, p: &Value) {
+    let track = match track_param(&app.engine, TRANSCRIBE_CMD, p, "track") {
+        Ok(t) => t,
+        Err(e) => return set_status(app, e.to_string()),
+    };
+    app.transcript.open = true;
+    if let Some(t) = track {
+        app.transcript.track = Some(t);
+    }
+    let session = app.engine.session();
+    let Some(shown) = resolve(app.transcript.track, &candidates(session), session) else {
+        return set_status(app, "No audio track to transcribe");
+    };
+    match app.docking_context.clone() {
+        Some(ctx) => start(app, &ctx, shown),
+        // Before the first frame there is no context to repaint: the next frame starts it.
+        None => app.transcript.pending = Some(shown),
+    }
 }
 
 // ---- running the speech model --------------------------------------------------------------
@@ -306,25 +391,47 @@ fn language_flag(session: &Session) -> Option<String> {
     session.edit.flags.iter().find_map(|f| f.strip_prefix("transcription.language=")).map(str::to_string)
 }
 
+/// The params of the `track.transcribe` job for `track`. `models_dir` is sent only when the user
+/// typed a Models folder: an explicit folder is the only place the engine then looks, so an empty
+/// field must send none and leave the search (environment, app bundle, app data) to the engine.
+fn job_params(track: TrackId, models_dir: &str, language: Option<String>) -> Value {
+    let mut params = Map::new();
+    params.insert("track".into(), json!(track.0));
+    let dir = models_dir.trim();
+    if !dir.is_empty() {
+        params.insert("models_dir".into(), json!(dir));
+    }
+    if let Some(language) = language {
+        params.insert("language".into(), json!(language));
+    }
+    Value::Object(params)
+}
+
+/// What the window says while a stopped transcription is still winding down.
+const STOPPING: &str = "Stopping the previous transcription…";
+
 /// Starts transcribing `track` on a worker thread.
 fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
     if app.transcript.job.is_some() {
-        return;
+        return set_status(app, "A transcription is already running");
+    }
+    // A stopped job's thread may still be working on the model; wait for it, so that two recognisers
+    // never run at once (the button is greyed out for the same reason).
+    if app.transcript.is_stopping() {
+        return set_status(app, STOPPING);
     }
     let Some(track_name) = app.engine.session().track(track).map(|t| t.name.clone()) else {
         set_status(app, "That track no longer exists");
         return;
     };
-    let mut params = Map::new();
-    params.insert("track".into(), json!(track.0));
-    let dir = app.transcript.models_dir.trim();
-    if !dir.is_empty() {
-        params.insert("models_dir".into(), json!(dir));
-    }
-    if let Some(language) = language_flag(app.engine.session()) {
-        params.insert("language".into(), json!(language));
-    }
-    let job = match transcribe_job(&app.engine, &Value::Object(params)) {
+    let params = job_params(track, &app.transcript.models_dir, language_flag(app.engine.session()));
+    // The ordinary job looks for the speech model when it runs; only a recogniser injected on the
+    // state (tests) replaces that.
+    let job = match &app.transcript.transcriber {
+        Some(transcriber) => transcribe_job_with_transcriber(&app.engine, &params, Arc::clone(transcriber)),
+        None => transcribe_job(&app.engine, &params),
+    };
+    let job = match job {
         Ok(job) => job,
         Err(e) => {
             set_status(app, e.to_string());
@@ -347,27 +454,65 @@ fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
         let _ = tx.send(Msg::Done(result));
         repaint.request_repaint();
     });
-    if let Err(e) = spawned {
-        set_status(app, format!("Transcription needs a background thread, and this build cannot start one ({e})"));
-        return;
-    }
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(e) => {
+            set_status(app, format!("Transcription needs a background thread, and this build cannot start one ({e})"));
+            return;
+        }
+    };
     let started = ctx.input(|i| i.time);
-    app.transcript.job = Some(Running { track, track_name: track_name.clone(), started, fraction: 0.0, stage: String::new(), cancel, rx });
+    app.transcript.job =
+        Some(Running { track, track_name: track_name.clone(), started, fraction: 0.0, stage: String::new(), cancel, rx, thread: Some(thread) });
     app.transcript.status = format!("Transcribing {track_name}...");
     ctx.request_repaint();
 }
 
-/// Stops a running transcription. True when there was one.
+/// Stops a running transcription. True when there was one. The worker is told to stop at once; it
+/// finishes what it is doing and ends a moment later, and until it has, no other transcription
+/// starts ([`TranscriptState::is_stopping`]).
 pub(crate) fn cancel(app: &mut SoundApp) -> bool {
-    let Some(job) = app.transcript.job.take() else { return false };
+    // A request that has not started yet belongs to the session being replaced too.
+    app.transcript.pending = None;
+    let Some(mut job) = app.transcript.job.take() else { return false };
     job.cancel.store(true, Ordering::Relaxed);
-    set_status(app, "Transcription stopped");
+    app.transcript.stopping = job.thread.take().filter(|thread| !thread.is_finished());
+    if app.transcript.stopping.is_some() {
+        set_status(app, STOPPING);
+    } else {
+        set_status(app, "Transcription stopped");
+    }
     true
+}
+
+/// Notices that a stopped transcription's thread has ended: joins it and says so, once.
+fn reap_stopped(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some(thread) = &app.transcript.stopping else { return };
+    if !thread.is_finished() {
+        // Nothing wakes the window when the thread ends, so look again shortly.
+        ctx.request_repaint_after_secs(0.1);
+        return;
+    }
+    if let Some(thread) = app.transcript.stopping.take()
+        && thread.join().is_err()
+    {
+        log::warn!("transcription: the stopped worker thread panicked");
+    }
+    // Only replace the message it belongs to: something else may have been said since.
+    if app.transcript.status == STOPPING {
+        set_status(app, "Transcription stopped");
+    }
+    ctx.request_repaint();
 }
 
 /// Collects the worker's progress and result. Called every frame from `logic`, so a result lands
 /// even while the window is hidden.
 pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
+    reap_stopped(app, ctx);
+    if let Some(track) = app.transcript.pending.take() {
+        // Collect its answer from the next frame on, not in the frame that starts it.
+        return start(app, ctx, track);
+    }
     let Some(job) = &mut app.transcript.job else { return };
     let mut done = None;
     loop {
@@ -401,6 +546,7 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
 fn finish(app: &mut SoundApp, job: &Running, result: Result<TranscribeOutcome, String>) {
     let outcome = match result {
         Ok(o) => o,
+        // One line in the status; `set_status` logs the rest (a backtrace, say).
         Err(e) => return set_status(app, e),
     };
     let Some(transcript) = outcome.transcript else {
@@ -430,19 +576,42 @@ fn finish(app: &mut SoundApp, job: &Running, result: Result<TranscribeOutcome, S
 fn nothing_stored(result: &Value) -> String {
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
     match status {
-        "no_models_dir" | "model_unavailable" => {
-            let mut msg =
-                String::from("The speech model is not available. Set the Models folder to the folder that holds whisper-base/, then try again.");
-            if let Some(why) = result.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
-                msg.push_str(" (");
-                msg.push_str(why);
-                msg.push(')');
-            }
-            msg
-        }
+        "no_models_dir" | "model_unavailable" => model_unavailable(result),
         "" => "Transcription finished without a transcript".to_string(),
         other => format!("Transcription finished without a transcript (status: {other})"),
     }
+}
+
+/// Why the speech model cannot be used, in words a status line can carry. The engine's `error` has
+/// the full text, with every folder it searched: that goes to the log. What is shown names the
+/// model by its display name (`model_name`), never by its id or maker, and leaves the folders out.
+fn model_unavailable(result: &Value) -> String {
+    let text = |key: &str| result.get(key).and_then(Value::as_str).map(first_line).filter(|t| !t.is_empty());
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        log::warn!("speech model unavailable: {error}");
+    }
+    let name = text("model_name").unwrap_or("The speech model");
+    let why = text("why").map_or_else(|| format!("{name} is not available"), str::to_string);
+    let advice = match text("reason").unwrap_or("not_found") {
+        "unsupported_build" => "",
+        "invalid_model" | "unknown_model" => " Check the speech model's folder, or choose another Models folder, then try again.",
+        _ => MODEL_ADVICE,
+    };
+    format!("{why}.{advice}")
+}
+
+/// What to do when the speech model was not found.
+const MODEL_ADVICE: &str =
+    " Set the Models folder to the folder that contains it, or leave it empty to use the app's own models folder, then try again.";
+
+/// The Models folder field: its hint while empty, and its tooltip. The model's own folder name is a
+/// file-system detail and stays out of them, as does the model's maker.
+const MODELS_FOLDER_HINT: &str = "App's own models folder";
+const MODELS_FOLDER_TIP: &str = "The folder that contains the speech model's folder. Leave it empty to use the app's own models folder.";
+
+/// What the tooltip over a transcript's summary says about where it came from.
+fn made_with(source: &str) -> String {
+    format!("Made with {}", soundcraft_engine::cmd::source_label(source))
 }
 
 // ---- actions -------------------------------------------------------------------------------
@@ -556,7 +725,9 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
     let t = Tokens::current();
     let choices = candidates(f.s);
     let shown = resolve(st.track, &choices, f.s);
-    let busy = st.job.is_some();
+    let running = st.job.is_some();
+    // A stopped job that is still winding down keeps the button off, too.
+    let busy = running || st.is_stopping();
 
     if let Some(shown) = shown {
         let shown_name = choices.iter().find(|(id, _)| *id == shown).map(|(_, n)| n.clone()).unwrap_or_default();
@@ -576,7 +747,7 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
             {
                 out.push(Action::Transcribe(shown));
             }
-            if busy && ui.button("Cancel").clicked() {
+            if running && ui.button("Cancel").clicked() {
                 out.push(Action::Cancel);
             }
         });
@@ -586,10 +757,8 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Models folder").font(regular(12.0)).color(t.text_dim));
-        ui.add(egui::TextEdit::singleline(&mut st.models_dir).hint_text("holds whisper-base/").desired_width(f32::INFINITY)).on_hover_text(
-            "Folder that holds whisper-base/ (config.json, generation_config.json, tokenizer.json, model.safetensors). \
-             Leave empty to use the app's own models folder.",
-        );
+        ui.add(egui::TextEdit::singleline(&mut st.models_dir).hint_text(MODELS_FOLDER_HINT).desired_width(f32::INFINITY))
+            .on_hover_text(MODELS_FOLDER_TIP);
     });
 
     if let Some(job) = &st.job {
@@ -638,7 +807,7 @@ fn transcript_view(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, tr: &Transc
         let meta =
             ui.label(RichText::new(format!("{words} {} · {language}", if words == 1 { "word" } else { "words" })).font(regular(12.0)).color(t.text));
         if !tr.source.is_empty() {
-            meta.on_hover_text(format!("Made with {}", tr.source));
+            meta.on_hover_text(made_with(&tr.source));
         }
         if ui.add_enabled(!view.rows.is_empty(), egui::Button::new("Copy")).on_hover_text("Copy the listed lines as time, speaker and text").clicked()
         {
@@ -1036,15 +1205,75 @@ mod tests {
         assert!(candidates(&s).iter().any(|(id, _)| *id == midi));
     }
 
+    /// What the engine's `model_unavailable` outcome carries when the model is not on disk.
+    fn not_found() -> Value {
+        json!({
+            "status": "model_unavailable", "model": "whisper-base", "model_name": "Speech model, base (multilingual)", "reason": "not_found",
+            "why": "Speech model, base (multilingual) was not found",
+            "error": "Speech model, base (multilingual) not found (searched: PA_SPEECH_MODELS_DIR /home/me/whisper-stuff, app bundle resources \
+                      (not running from an app bundle), application data /home/me/.local/share/patools/models)"
+        })
+    }
+
     #[test]
-    fn a_missing_model_is_explained_with_the_folder_to_set() {
+    fn a_missing_model_is_explained_without_its_id_or_the_folders_searched() {
         for status in ["no_models_dir", "model_unavailable"] {
-            let msg = nothing_stored(&json!({"status": status, "error": "no such file"}));
-            assert!(msg.contains("Models folder") && msg.contains("whisper-base/") && msg.contains("(no such file)"), "{msg}");
+            let mut result = not_found();
+            result["status"] = json!(status);
+            let msg = nothing_stored(&result);
+            assert_eq!(
+                msg,
+                "Speech model, base (multilingual) was not found. Set the Models folder to the folder that contains it, \
+                 or leave it empty to use the app's own models folder, then try again."
+            );
+            assert!(!msg.to_lowercase().contains("whisper") && !msg.contains("/home") && !msg.contains("PA_SPEECH"), "{msg}");
         }
-        assert!(!nothing_stored(&json!({"status": "no_models_dir"})).contains('('));
+        // An engine that says nothing more than the status still gets a sentence, and still no id.
+        let bare = nothing_stored(&json!({"status": "no_models_dir"}));
+        assert!(bare.starts_with("The speech model is not available.") && bare.contains("Models folder"), "{bare}");
+        // A build without the speech feature has no folder to fix.
+        let build = nothing_stored(&json!({"status": "model_unavailable", "reason": "unsupported_build",
+            "why": "speech-to-text is not available in this build (this build does not include the speech feature)"}));
+        assert_eq!(build, "speech-to-text is not available in this build (this build does not include the speech feature).");
+        // Files that are there but unusable: say what is wrong (one line), without the folder.
+        let invalid =
+            nothing_stored(&json!({"status": "model_unavailable", "reason": "invalid_model", "model_name": "Speech model, base (multilingual)",
+            "why": "model: tokenizer.json: <|0.00|> has id 3\n   0: backtrace frame"}));
+        assert!(invalid.starts_with("model: tokenizer.json: <|0.00|> has id 3.") && !invalid.contains("backtrace"), "{invalid}");
         assert!(nothing_stored(&json!({"status": "weird"})).contains("weird"));
         assert!(nothing_stored(&json!({})).contains("without a transcript"));
+    }
+
+    #[test]
+    fn a_status_is_one_line() {
+        assert_eq!(first_line("one\ntwo\nthree"), "one");
+        assert_eq!(first_line("\n  \n  first real line  \nnext"), "first real line");
+        assert_eq!(first_line(""), "");
+        let mut app = app();
+        set_status(&mut app, "transcription failed: out of memory\nstack backtrace:\n   0: frame\n   1: frame");
+        assert_eq!(app.transcript.status, "transcription failed: out of memory");
+        assert_eq!(app.ui.status, "transcription failed: out of memory");
+    }
+
+    #[test]
+    fn the_models_folder_is_sent_only_when_typed() {
+        let track = TrackId(7);
+        // Empty (the default, however the environment is set) or blank: no `models_dir`, so the
+        // engine's search (environment, app bundle, app data) stays in force.
+        assert_eq!(TranscriptState::default().models_dir, "");
+        for typed in ["", "   ", "\t"] {
+            assert_eq!(job_params(track, typed, None), json!({"track": 7}), "{typed:?}");
+        }
+        assert_eq!(
+            job_params(track, "  /Volumes/Models  ", Some("de".into())),
+            json!({"track": 7, "models_dir": "/Volumes/Models", "language": "de"})
+        );
+    }
+
+    #[test]
+    fn a_transcript_source_is_shown_by_its_display_name() {
+        assert_eq!(made_with("whisper-base"), "Made with Speech model, base (multilingual)");
+        assert_eq!(made_with("manual"), "Made with manual");
     }
 
     #[test]
@@ -1075,7 +1304,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let track_name = app.engine.session().track(track).unwrap().name.clone();
         let stop = Arc::clone(&cancel);
-        app.transcript.job = Some(Running { track, track_name, started: 0.0, fraction: 0.0, stage: String::new(), cancel, rx });
+        app.transcript.job = Some(Running { track, track_name, started: 0.0, fraction: 0.0, stage: String::new(), cancel, rx, thread: None });
         (tx, stop)
     }
 
@@ -1164,10 +1393,13 @@ mod tests {
         let track = first_audio(&app);
         for status in ["no_models_dir", "model_unavailable"] {
             let (tx, _) = fake_job(&mut app, track);
-            tx.send(done(None, json!({"status": status, "error": "model `whisper-base` is not installed"}))).unwrap();
+            let mut result = not_found();
+            result["status"] = json!(status);
+            tx.send(done(None, result)).unwrap();
             step(&mut app, &ctx);
             let shown = &app.transcript.status;
-            assert!(shown.contains("Models folder") && shown.contains("not installed"), "{shown}");
+            assert!(shown.contains("Models folder") && shown.contains("was not found"), "{shown}");
+            assert!(!shown.to_lowercase().contains("whisper") && !shown.contains("searched"), "{shown}");
         }
         let (tx, _) = fake_job(&mut app, track);
         tx.send(Msg::Done(Err("transcription failed: out of memory".into()))).unwrap();
@@ -1199,6 +1431,153 @@ mod tests {
         assert!(app.transcript.job.is_none());
         assert_eq!(app.transcript.status, "Transcription stopped");
         assert_eq!(app.ui.status, "Transcription stopped");
+    }
+
+    /// A worker thread that stays alive until the returned sender is used (or dropped), standing in
+    /// for a recogniser that takes a while to notice it was told to stop.
+    fn slow_worker() -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, wait) = mpsc::channel::<()>();
+        (
+            release,
+            std::thread::spawn(move || {
+                let _ = wait.recv();
+            }),
+        )
+    }
+
+    /// Steps the window until `done`, up to ten seconds.
+    fn step_until(app: &mut SoundApp, ctx: &egui::Context, done: impl Fn(&SoundApp) -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(app) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            step(app, ctx);
+        }
+        assert!(done(app), "timed out; status is `{}`", app.transcript.status);
+    }
+
+    /// After Cancel the worker thread may still be running the model. A new job must not start
+    /// until it has ended: the window says so, keeps the handle, and starts again once it is done.
+    #[test]
+    fn after_cancel_no_new_job_starts_until_the_old_thread_has_finished() {
+        let (mut app, ctx) = (app(), egui::Context::default());
+        let track = first_audio(&app);
+        let (_tx, stop) = fake_job(&mut app, track);
+        let (release, thread) = slow_worker();
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+
+        assert!(cancel(&mut app));
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(app.transcript.job.is_none() && !app.transcript.is_running());
+        assert!(app.transcript.is_stopping(), "the old thread is still alive");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        assert_eq!(app.ui.status, "Stopping the previous transcription…");
+
+        // Every way of asking for a job is refused, with the same message, while it winds down.
+        start(&mut app, &ctx, track);
+        assert!(app.transcript.job.is_none(), "start() refused");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        app.transcript.status.clear();
+        crate::menus::invoke_menu(&mut app, "track.transcribe", "Track > Transcribe Track");
+        step(&mut app, &ctx);
+        assert!(app.transcript.job.is_none() && !app.transcript.is_running(), "the menu entry started nothing");
+        assert_eq!(app.transcript.status, "Stopping the previous transcription…");
+        step(&mut app, &ctx);
+        assert!(app.transcript.is_stopping(), "stepping does not forget a thread that is alive");
+
+        // The old thread ends; the window notices, says so, and a new job can start.
+        drop(release);
+        step_until(&mut app, &ctx, |app| !app.transcript.is_stopping());
+        step(&mut app, &ctx);
+        assert!(app.transcript.stopping.is_none(), "the finished thread was joined and let go");
+        assert_eq!(app.transcript.status, "Transcription stopped");
+        app.transcript.models_dir =
+            std::env::temp_dir().join(format!("pa-tools-no-model-stop-{}", std::process::id())).to_string_lossy().into_owned();
+        start(&mut app, &ctx, track);
+        assert!(app.transcript.job.is_some(), "Transcribe works again");
+        step_until(&mut app, &ctx, |app| app.transcript.job.is_none());
+    }
+
+    /// A stopped job whose thread has already ended is not "stopping" at all.
+    #[test]
+    fn cancel_does_not_wait_for_a_thread_that_has_already_ended() {
+        let (mut app, ctx) = (app(), egui::Context::default());
+        let track = first_audio(&app);
+        let (_tx, _) = fake_job(&mut app, track);
+        let thread = std::thread::spawn(|| ());
+        while !thread.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+        assert!(cancel(&mut app));
+        assert!(!app.transcript.is_stopping());
+        assert_eq!(app.transcript.status, "Transcription stopped");
+        step(&mut app, &ctx);
+        assert_eq!(app.transcript.status, "Transcription stopped");
+    }
+
+    /// The Transcribe button is greyed out while the old thread winds down, and Cancel is not shown.
+    #[test]
+    fn the_transcribe_button_is_off_while_the_stopped_thread_is_alive() {
+        let mut app = app();
+        let track = first_audio(&app);
+        app.run("window.transcript", json!({"value": true})).unwrap();
+        let (_tx, _) = fake_job(&mut app, track);
+        let (release, thread) = slow_worker();
+        if let Some(job) = &mut app.transcript.job {
+            job.thread = Some(thread);
+        }
+        assert!(cancel(&mut app));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut SoundApp| -> Vec<egui::epaint::ClippedShape> {
+            let raw =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            });
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // How the text is painted: a greyed-out label differs in colour or opacity from a live one.
+        let colour_of = |shapes: &[egui::epaint::ClippedShape], text: &str| {
+            shapes.iter().find_map(|c| match &c.shape {
+                Shape::Text(t) if t.galley.text() == text => Some((t.fallback_color, t.override_text_color, t.opacity_factor.to_bits())),
+                _ => None,
+            })
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = frame(&mut app);
+        }
+        let waiting = colour_of(&shapes, "Transcribe Track").expect("the button is drawn");
+        assert!(colour_of(&shapes, "Cancel").is_none(), "there is nothing to cancel");
+        assert!(
+            shapes.iter().any(|c| matches!(&c.shape, Shape::Text(t) if t.galley.text() == "Stopping the previous transcription…")),
+            "the window says why"
+        );
+
+        drop(release);
+        step_until(&mut app, &ctx, |app| !app.transcript.is_stopping());
+        for _ in 0..4 {
+            shapes = frame(&mut app);
+        }
+        let ready = colour_of(&shapes, "Transcribe Track").expect("the button is drawn");
+        assert_ne!(waiting, ready, "the button is enabled again (drawn in the normal text colour)");
+    }
+
+    #[test]
+    fn the_program_looks_for_the_model_unless_a_recogniser_is_injected() {
+        let mut app = app();
+        assert!(!app.transcript.has_injected_transcriber(), "a fresh window uses the model on disk");
+        app.transcript.inject_transcriber(std::sync::Arc::new(soundcraft_pa_speech::FixedTranscriber {
+            transcript: soundcraft_pa_speech::Transcript::default(),
+            id: "fixed".into(),
+        }));
+        assert!(app.transcript.has_injected_transcriber());
     }
 
     #[test]
@@ -1384,7 +1763,7 @@ mod tests {
             app.transcript.editing = Some(SpeakerEdit { row: 1, speaker: 0, text: "Speaker 0".into(), focus: true, fresh: true, seen: false });
         });
         shoot("model-missing.png", false, &|app| {
-            app.transcript.status = nothing_stored(&json!({"status": "model_unavailable", "error": "model `whisper-base` is not installed"}));
+            app.transcript.status = nothing_stored(&not_found());
         });
         shoot("empty.png", false, &|app| {
             let track = first_audio(app);

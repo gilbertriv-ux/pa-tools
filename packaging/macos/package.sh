@@ -18,7 +18,10 @@
 # Speech-to-text (env, optional):
 #   PT_FEATURES           cargo features for both binaries, e.g. "whisper,download" (default: none)
 #   PT_MODELS_DIR         a models folder (holding e.g. whisper-base/) copied into
-#                         Contents/Resources/models before signing, where the app looks for it
+#                         Contents/Resources/models before signing, where the app looks for it.
+#                         Visible entries only, symbolic links followed (a self-contained bundle;
+#                         a link to nowhere is skipped with a warning); an empty folder or one
+#                         with no <model>/model.safetensors only warns.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -120,16 +123,11 @@ plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
 
 # Speech models go in before signing (the signature seals Resources). The app finds them through
-# its bundle tier: <bundle>/Contents/Resources/models/<model id>/.
+# its bundle tier: <bundle>/Contents/Resources/models/<model id>/. See bundle-models.sh.
 if [ -n "${PT_MODELS_DIR:-}" ]; then
-  if [ -d "$PT_MODELS_DIR" ] && [ -n "$(ls -A "$PT_MODELS_DIR" 2>/dev/null)" ]; then
-    mkdir -p "$APP/Contents/Resources/models"
-    cp -R "$PT_MODELS_DIR/." "$APP/Contents/Resources/models/"
-    echo "==> bundled speech models from $PT_MODELS_DIR:"
-    ls -l "$APP/Contents/Resources/models"/*
-  else
-    warn "macOS: PT_MODELS_DIR=$PT_MODELS_DIR is missing or empty; no speech model bundled"
-  fi
+  # shellcheck source=bundle-models.sh
+  . "$HERE/bundle-models.sh"
+  bundle_speech_models "$PT_MODELS_DIR" "$APP/Contents/Resources"
 fi
 
 # Drop extended attributes picked up during the build (quarantine, FinderInfo) before signing:

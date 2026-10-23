@@ -768,6 +768,8 @@ impl SoundApp {
         self.close_autosave();
         match soundcraft_engine::autosave::recover(&mut self.engine, left) {
             Ok(missing) => {
+                // The session was replaced: a transcription belongs to the session it started in.
+                transcript_window::cancel(self);
                 if self.write_autosave() {
                     soundcraft_engine::autosave::discard(left);
                 }

@@ -52,6 +52,9 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     let path = dir.join("Song.scraft");
     let mut first = launch(&root);
     first.run("session.save_as", json!({"path": path})).unwrap();
+    // An autosave is a leftover only when it is newer than the file it came from; file times have
+    // a coarse tick, so give the clock one (a fast build otherwise writes both in the same tick).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     first.run("track.new", json!({"name": "Vocal"})).unwrap();
     first.close_autosave();
     drop(first);
@@ -172,5 +175,35 @@ fn a_panic_in_a_frame_autosaves_and_the_app_carries_on() {
     let mut next = launch(&root);
     next.recover(&left[0]);
     assert!(next.engine.session().track_by_name("Vocal").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recovering_stops_a_running_transcription() {
+    let _one = one_at_a_time();
+    let dir = folder("recovery-transcribe");
+    let root = dir.join("Autosave");
+    let mut first = launch(&root);
+    first.run("track.new", json!({"name": "Vocal"})).unwrap();
+    first.close_autosave();
+    let left = leftovers(&root);
+
+    // Another session is open, with a transcription running in it (a folder with no model, so the
+    // worker ends at once; the job stays until a frame collects its answer).
+    let mut next = launch(&root);
+    next.run("track.new", json!({"name": "Drums"})).unwrap();
+    next.transcript.models_dir = dir.join("no-models").to_string_lossy().into_owned();
+    let ctx = egui::Context::default();
+    soundcraft_ui_egui::menus::invoke_menu(&mut next, "track.transcribe", "Track > Transcribe Track");
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(next.transcript.is_running(), "a transcription is running in the session about to be replaced");
+
+    next.recover(&left[0]);
+    assert!(next.engine.session().track_by_name("Vocal").is_some(), "the recovered session is open");
+    assert!(!next.transcript.is_running(), "its transcription was stopped with the session it belonged to");
+
+    // And its answer, whenever it arrives, is not stored in the recovered session.
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(next.engine.session().transcripts.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

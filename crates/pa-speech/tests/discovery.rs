@@ -89,7 +89,7 @@ fn a_folder_without_the_model_is_skipped() {
 
     // The first three tiers lack `whisper-base` (empty / other model / truncated): the last good one wins.
     let search = ModelSearch { env: Some(empty_env.clone()), bundle_resources: Some(bundle_other.clone()), app_support: Some(support.clone()) };
-    assert!(matches!(resolve_models_dir(&search, MODEL), Err(SpeechError::ModelUnavailable(_))));
+    assert!(matches!(resolve_models_dir(&search, MODEL), Err(SpeechError::ModelUnavailable { .. })));
     let with_good_bundle = ModelSearch { bundle_resources: Some(bundle.clone()), ..search.clone() };
     assert_eq!(resolve_models_dir(&with_good_bundle, MODEL), Ok(bundle));
     // The other model is found where it is.
@@ -102,15 +102,18 @@ fn nothing_installed_is_model_unavailable_naming_every_place_searched() {
     let search =
         ModelSearch { env: Some(tmp.path().join("env-models")), bundle_resources: None, app_support: Some(tmp.path().join("support-models")) };
     let err = resolve_models_dir(&search, MODEL).expect_err("no model anywhere");
-    let SpeechError::ModelUnavailable(text) = &err else { panic!("expected ModelUnavailable, got {err:?}") };
-    assert!(text.starts_with("speech model `whisper-base` not found (searched: "), "{text}");
+    let SpeechError::ModelUnavailable { model, searched: text } = &err else { panic!("expected ModelUnavailable, got {err:?}") };
+    assert_eq!(model, MODEL);
+    // The message names the model by its display name, never by its id.
+    assert!(err.to_string().starts_with("Speech model, base (multilingual) not found (searched: "), "{err}");
+    assert!(!err.to_string().to_lowercase().contains("whisper"), "{err}");
     assert!(text.contains("PA_SPEECH_MODELS_DIR") && text.contains("env-models"), "{text}");
     assert!(text.contains("app bundle resources (not running from an app bundle)"), "{text}");
     assert!(text.contains("application data") && text.contains("support-models"), "{text}");
-    assert_eq!(err.to_string(), *text, "the error prints as its text");
+    assert!(err.to_string().ends_with(&format!("(searched: {text})")), "the error prints the places searched");
 
     // No tier at all is the same error, never a panic or an empty Ok.
-    assert!(matches!(resolve_models_dir(&ModelSearch::default(), MODEL), Err(SpeechError::ModelUnavailable(_))));
+    assert!(matches!(resolve_models_dir(&ModelSearch::default(), MODEL), Err(SpeechError::ModelUnavailable { .. })));
     // An id outside the catalogue is a different error.
     assert_eq!(resolve_models_dir(&search, "whisper-nope"), Err(SpeechError::UnknownModel("whisper-nope".into())));
 }
@@ -205,7 +208,7 @@ fn a_macos_style_install_resolves_end_to_end() {
     );
     let resources = tmp.path().join("Pa Tools.app").join("Contents").join("Resources").join("models");
     assert_eq!(search.bundle_resources.as_deref(), Some(resources.as_path()));
-    assert!(matches!(resolve_models_dir(&search, MODEL), Err(SpeechError::ModelUnavailable(_))), "nothing installed yet");
+    assert!(matches!(resolve_models_dir(&search, MODEL), Err(SpeechError::ModelUnavailable { .. })), "nothing installed yet");
 
     // A download in Application Support is found when the bundle has nothing...
     let support = tmp.path().join("home").join("Library").join("Application Support").join("Pa Tools").join("models");
