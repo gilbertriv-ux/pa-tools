@@ -293,15 +293,17 @@ fn eight_references_at_720p_stay_under_the_estimate() {
     check(1280, 720);
 }
 
-/// The largest 16:9 picture (width in steps of 64) the 1.5 GiB budget admits in 4:2:0, which is
-/// 7424 x 4176: eight references of it stay under the budget itself. About 1 GB and some seconds, so
-/// it runs on request: `cargo test -p soundcraft-video --features av1-decode --test av1_peak -- --ignored`.
+/// The largest 16:9 picture the 1.6 GiB budget admits in 4:2:0 is full 8K UHD, 7680 x 4320: eight
+/// references of it stay under the budget itself. About 1.2 GB and some seconds, so it runs on request:
+/// `cargo test -p soundcraft-video --features av1-decode --test av1_peak -- --ignored`.
 #[test]
-#[ignore = "allocates about 1 GB"]
+#[ignore = "allocates about 1.2 GB"]
 fn eight_references_at_the_largest_admitted_picture_stay_under_the_budget() {
     let fm = FORMATS[0];
-    let peak = peak_of_eight_references(fm, 7424, 4176);
+    assert!(picture_fits_budget(&seq_for(fm), 7680, 4320, DEFAULT_MEMORY_BUDGET), "8K UHD 4:2:0 is admitted");
+    let peak = peak_of_eight_references(fm, 7680, 4320);
     if let Some(peak) = peak {
-        assert!(peak <= DEFAULT_MEMORY_BUDGET, "peak {peak} bytes is over the 1.5 GiB budget");
+        eprintln!("7680x4320 {fm:?}: peak {} MB, budget {} MB", peak / 1_000_000, DEFAULT_MEMORY_BUDGET / 1_000_000);
+        assert!(peak <= DEFAULT_MEMORY_BUDGET, "peak {peak} bytes is over the 1.6 GiB budget");
     }
 }

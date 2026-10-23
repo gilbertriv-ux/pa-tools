@@ -137,14 +137,15 @@ fn frames_past_the_level_6_limits_are_refused() {
 }
 
 /// Frames inside the level limits whose references and working copies would need more than the
-/// default 1.5 GiB (Gil, decision 5 amended) are refused up front, before any of it is allocated.
+/// default 1.6 GiB (Gil, decision 5b) are refused up front, before any of it is allocated. (Full 8K UHD,
+/// 7680 x 4320 in 4:2:0, is under it now: `adapt_av1.rs` and `av1::decoder` test that it is admitted.)
 #[test]
 fn frames_beyond_the_memory_budget_are_refused_fast() {
     let start = std::time::Instant::now();
     refused_by_budget(16384, 2176); // exactly MaxPicSize
     refused_by_budget(8192, 4352);
-    refused_by_budget(7680, 4320); // 8K UHD: 1.594 GiB estimated, 96 MiB over
-    refused_by_budget(8192, 4096);
+    refused_by_budget(8192, 4320); // 1.698 GiB estimated
+    refused_by_budget(8192, 4096); // DCI 8K: 1.604 GiB estimated, 3.8 MB over
     assert!(start.elapsed().as_secs() < 5, "refusing must not allocate or decode");
 }
 
@@ -160,7 +161,7 @@ fn a_frame_that_fits_is_decoded_and_the_budget_is_adjustable() {
     let mut dec = Decoder::with_threads(1);
     dec.set_memory_budget(0);
     assert!(matches!(decode(&mut dec, &stream(64, 48)), Err(Error::Unsupported(_))));
-    assert_eq!(DEFAULT_MEMORY_BUDGET, 3 << 29, "1.5 GiB");
+    assert_eq!(DEFAULT_MEMORY_BUDGET, 1_717_986_918, "1.6 GiB");
 }
 
 /// A 64x48 4:2:0 key frame whose sequence profile bit was flipped to 2 (4:2:2): blocks such as 4x16 then have no

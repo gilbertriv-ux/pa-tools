@@ -52,7 +52,7 @@ pub(crate) fn describe(cfg: &Av1Config) -> Described {
         }
     };
     // The sequence header the record carries says how large frames get. A picture whose references and
-    // working copies cannot fit the decoder's memory budget (1.5 GiB, Gil's decision 5 as amended) would open as
+    // working copies cannot fit the decoder's memory budget (1.6 GiB, Gil's decision 5b) would open as
     // decodable and then fail on every frame, so it is refused here, up front, the way HEVC is.
     let unsupported = crate::av1::find_sequence_header(&cfg.config_obus).and_then(|seq| {
         let (w, h) = (seq.max_frame_width, seq.max_frame_height);
@@ -233,10 +233,24 @@ mod tests {
         }
     }
 
-    /// The sequence header OBU of a reduced still-picture sequence of `w` x `h` (4:2:0, 8-bit).
-    fn sequence_obu(w: u32, h: u32) -> Vec<u8> {
+    /// The chroma layouts the sequence header builder below writes (each needs its own profile).
+    #[derive(Clone, Copy)]
+    enum Chroma {
+        C420,
+        C422,
+        C444,
+    }
+
+    /// The sequence header OBU of a reduced still-picture sequence of `w` x `h`, 8 or 10 bits
+    /// (`high`), with or without film grain.
+    fn sequence_obu_of(w: u32, h: u32, chroma: Chroma, high: bool, grain: bool) -> Vec<u8> {
+        let profile = match chroma {
+            Chroma::C420 => 0,
+            Chroma::C444 => 1,
+            Chroma::C422 => 2,
+        };
         let mut b = crate::bitstream::BitWriter::new();
-        b.write_bits(0, 3); // seq_profile
+        b.write_bits(profile, 3); // seq_profile
         b.write_bits(1, 1); // still_picture
         b.write_bits(1, 1); // reduced_still_picture_header
         b.write_bits(0, 5); // seq_level_idx
@@ -244,7 +258,21 @@ mod tests {
         b.write_bits(15, 4); // frame_height_bits_minus_1
         b.write_bits(w - 1, 16);
         b.write_bits(h - 1, 16);
-        b.write_bits(0, 3 + 3 + 7 + 1); // superblock size, filter intra, edge filter; superres, cdef, restoration; color config; film grain
+        b.write_bits(0, 3 + 3); // superblock size, filter intra, edge filter; superres, cdef, restoration
+        b.write_bits(u32::from(high), 1); // color_config: high_bitdepth
+        if profile == 2 && high {
+            b.write_bits(0, 1); // twelve_bit
+        }
+        if profile != 1 {
+            b.write_bits(0, 1); // mono_chrome
+        }
+        b.write_bits(0, 1); // color_description_present_flag
+        b.write_bits(0, 1); // color_range
+        if profile == 0 {
+            b.write_bits(0, 2); // chroma_sample_position
+        }
+        b.write_bits(0, 1); // separate_uv_delta_q
+        b.write_bits(u32::from(grain), 1); // film_grain_params_present
         b.rbsp_trailing();
         let payload = b.finish();
         let mut obu = vec![1 << 3 | 0b10, payload.len() as u8];
@@ -252,7 +280,22 @@ mod tests {
         obu
     }
 
-    /// Gil's decision 5 (amended): a 1.5 GiB decoder budget. An AV1 picture the decoder would refuse on every frame
+    /// The sequence header OBU of a reduced still-picture sequence of `w` x `h` (4:2:0, 8-bit).
+    fn sequence_obu(w: u32, h: u32) -> Vec<u8> {
+        sequence_obu_of(w, h, Chroma::C420, false, false)
+    }
+
+    /// The `av1C` record for a sequence of `w` x `h` in `chroma`, 8 or 10 bits, with or without film grain.
+    fn record(w: u32, h: u32, chroma: Chroma, high: bool, grain: bool) -> Av1Config {
+        let (profile, ssx, ssy) = match chroma {
+            Chroma::C420 => (0, true, true),
+            Chroma::C422 => (2, true, false),
+            Chroma::C444 => (1, false, false),
+        };
+        Av1Config { config_obus: sequence_obu_of(w, h, chroma, high, grain), ..config(profile, high, false, false, ssx, ssy) }
+    }
+
+    /// Gil's decision 5b (V4): a 1.6 GiB decoder budget. An AV1 picture the decoder would refuse on every frame
     /// is refused when the file opens, with the reason, rather than shown as decodable.
     #[test]
     fn a_picture_beyond_the_memory_budget_is_refused_when_the_file_opens() {
@@ -263,7 +306,9 @@ mod tests {
             (3840, 2160, true, ""),
             (5120, 2880, true, ""),
             (7424, 4176, true, ""),
-            (7680, 4320, false, "too large for the memory budget"),
+            (7680, 4320, true, ""), // full 8K UHD: 1.594 GiB estimated, under the 1.6 GiB budget
+            (7680, 4352, true, ""),
+            (8192, 4096, false, "too large for the memory budget"), // DCI 8K: 3.8 MB over
             (8192, 4320, false, "too large for the memory budget"),
             (8192, 4352, false, "too large for the memory budget"), // the level 6.3 maximum: only the budget stops it
             (8192, 8192, false, "size beyond the decoder's limits"), // past level 6.3 and the 8192 x 8192 area: no budget would do
@@ -283,22 +328,64 @@ mod tests {
         }
     }
 
+    /// 7680 x 4320 at 4:2:0 is admitted at 8 and 10 bits; at 4:2:2, at 4:4:4 and with film grain it is not.
     #[test]
-    fn an_8k_av1_movie_opens_as_not_decodable_and_says_why_on_every_request() {
+    fn full_8k_uhd_is_admitted_in_4_2_0_but_not_in_4_4_4_or_with_film_grain() {
+        for high in [false, true] {
+            let depth = if high { 10 } else { 8 };
+            let d = describe(&record(7680, 4320, Chroma::C420, high, false));
+            assert_eq!((d.detail.as_str(), d.unsupported), (format!("AV1 Main {depth}-bit 4:2:0").as_str(), None), "8K UHD 4:2:0 at {depth} bits");
+            for (chroma, grain, name, detail) in [
+                (Chroma::C444, false, "4:4:4", "AV1 High 8-bit 4:4:4"),
+                (Chroma::C420, true, "4:2:0 with film grain", "AV1 Main 8-bit 4:2:0"),
+                (Chroma::C444, true, "4:4:4 with film grain", "AV1 High 8-bit 4:4:4"),
+                (Chroma::C422, false, "4:2:2", "AV1 Professional 8-bit 4:2:2"),
+            ] {
+                let d = describe(&record(7680, 4320, chroma, high, grain));
+                let want_detail = if high { detail.replace("8-bit", "10-bit") } else { detail.to_string() };
+                assert_eq!(d.detail, want_detail);
+                let why = d.unsupported.unwrap_or_default();
+                assert!(
+                    why.contains("AV1 7680x4320 pictures are unsupported in this build") && why.contains("picture too large for the memory budget"),
+                    "8K UHD {name} at {depth} bits must be refused up front, got {why:?}"
+                );
+            }
+        }
+        // film grain and 4:4:4 are fine at sizes their cost allows
+        assert_eq!(describe(&record(1920, 1080, Chroma::C444, true, true)).unsupported, None);
+        assert_eq!(describe(&record(5232, 2943, Chroma::C444, false, true)).unsupported, None);
+        assert!(describe(&record(5248, 2952, Chroma::C444, false, true)).unsupported.is_some());
+    }
+
+    /// An MP4 with one AV1 sample whose `av1C` carries `cfg`.
+    fn av1_movie(w: u16, h: u16, cfg: Av1Config) -> crate::Movie {
         use crate::isobmff::{Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
-        let cfg = Av1Config { config_obus: sequence_obu(7680, 4320), ..config(0, false, false, false, true, true) };
         let mut mw = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
-        let entry = SampleEntry::video(FourCc(*b"av01"), crate::isobmff::CodecConfig::Av1(cfg), 7680, 4320);
+        let entry = SampleEntry::video(FourCc(*b"av01"), crate::isobmff::CodecConfig::Av1(cfg), w, h);
         let t = mw.add_track(TrackConfig::new(entry, 24)).unwrap();
         mw.write_sample(t, WriteSample { data: &[0u8; 16], duration: 1, composition_offset: 0, is_sync: true }).unwrap();
-        let mut m = crate::Movie::open(mw.finish().unwrap().into_inner()).unwrap();
-        let i = m.info().clone();
-        assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", 7680, 4320, false));
-        for _ in 0..2 {
-            let Err(VideoError::Unsupported(why)) = m.frame(0) else { panic!("an 8K AV1 picture must be refused") };
-            assert!(why.contains("too large for the memory budget"), "{why}");
+        crate::Movie::open(mw.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[test]
+    fn an_8k_uhd_av1_movie_opens_as_decodable_and_the_refused_ones_say_why_on_every_request() {
+        // 4:2:0 at 8 and 10 bits: decodable (no frame is requested; the sample is not a real picture)
+        for high in [false, true] {
+            let m = av1_movie(7680, 4320, record(7680, 4320, Chroma::C420, high, false));
+            let i = m.info();
+            assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", 7680, 4320, true));
         }
-        assert!(matches!(m.thumbnail_at(0.0, 16), Err(VideoError::Unsupported(_))));
+        // 4:4:4, film grain and DCI 8K: not decodable, with the reason, on every request
+        for (w, h, chroma, grain) in [(7680, 4320, Chroma::C444, false), (7680, 4320, Chroma::C420, true), (8192, 4320, Chroma::C420, false)] {
+            let mut m = av1_movie(w as u16, h as u16, record(w, h, chroma, false, grain));
+            let i = m.info().clone();
+            assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", w, h, false));
+            for _ in 0..2 {
+                let Err(VideoError::Unsupported(why)) = m.frame(0) else { panic!("an {w}x{h} AV1 picture must be refused") };
+                assert!(why.contains("too large for the memory budget"), "{why}");
+            }
+            assert!(matches!(m.thumbnail_at(0.0, 16), Err(VideoError::Unsupported(_))));
+        }
     }
 
     #[test]
