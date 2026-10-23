@@ -90,8 +90,10 @@ ecosystem proposes bumps of these SHAs.
 - **Triggers:** push to `pa-tools` and `feat/**`, every pull request, `workflow_dispatch`. A branch
   that has an open pull request therefore runs twice (once per event); that is accepted, the two runs
   have separate concurrency groups.
-- **Timing** (GitHub-hosted, cache warm): macOS about 5 minutes, Windows about 11, the Linux gate about
-  {{LINUX}}.
+- **Timing** (GitHub-hosted runners): with a warm dependency cache the Linux gate takes about 8
+  minutes (`cargo xtask ci` itself 5.6), macOS about 5 and Windows about 6; the first, cold run of each
+  took 13 to 15 minutes. `rust-cache` also saves after a failed run, so a red run does not throw the
+  compiled dependencies away.
 - **Provenance:** the `gate` job is adapted from FilmCraft's `ci.yml`, the OS matrix from PhotoCraft's
   (both MIT OR Apache-2.0); see the comment at the top of the file and `ATTRIBUTION.md`.
 
@@ -109,10 +111,10 @@ ecosystem proposes bumps of these SHAs.
   on a Windows 11 ARM64 runner is what the thin caller `windows-arm64.yml` does.
 - Unsigned: no signing secret is passed in, so `sign.ps1` prints its "leaving unsigned" warning and
   exits 0. Signed installers are the release workflow's job.
-- Artifacts (14 days): `patools-windows-x64-msi` (holds `patools-0.11.0-windows-x64.msi`; the artifact is 11.4 MB) and
-  `patools-windows-arm64-msi` (holds `patools-0.11.0-windows-arm64.msi`; 10.1 MB). The two portable zips that
+- Artifacts (14 days): `patools-windows-x64-msi` (holds `patools-0.11.0-windows-x64.msi`; the artifact
+  is 11.4 MB) and `patools-windows-arm64-msi` (holds `patools-0.11.0-windows-arm64.msi`; 10.2 MB). The two portable zips that
   `package.ps1` also makes are not uploaded.
-- Timing: about 6 minutes for x64, 10 for arm64 (cold cache).
+- Timing: about 6 to 7 minutes per architecture warm (cold: 6 for x64, 10 for arm64).
 
 ### Reading a failed run when the job log is out of reach
 
@@ -136,7 +138,30 @@ annotation. The macOS/Windows job always uses `--no-fail-fast`.
 Putting the workspace tests on Linux and Windows for the first time showed that some tests had only
 ever run on a Mac:
 
-{{FOUND}}
+- **Windows:** `io::save_tests::saved_audio_is_trusted_only_in_the_folder_it_was_saved_in`
+  (`crates/engine/src/io.rs`) built its expected path with a `/` inside one `join()`, which differs
+  from the backslash path the engine returns. Test-only fix: join the components one by one.
+- **Linux:** the recovery tests (`crates/ui-egui/tests/recovery.rs`) failed at random, a different one
+  on each run, with three separate causes:
+  1. *Test:* an autosave counts as unsaved work only if it is newer than the session file it came
+     from; Linux file systems stamp files from a clock that ticks every few milliseconds, so a save and
+     the autosave right after it could carry the same time. The test now pauses 50 ms between them.
+  2. *Test:* `SoundApp::recover()` hands the recovered session to the background autosave writer, but a
+     test counted the autosave folders at once. It now waits with the file's own `eventually()`.
+  3. *Product bug (data loss):* an autosave folder was named `<name> <epoch ms>-<pid>` and made with
+     `create_dir_all`, so when one session closed (its folder kept for the next launch, holding unsaved
+     work) and the next opened within the same millisecond, the new autosave reused the kept folder and
+     overwrote its `session.scraft`; the folder was then locked, so the next launch could not offer it.
+     `Autosave::create` (`crates/engine/src/autosave.rs`) now uses `create_dir` and gives a name that
+     already exists a numeric suffix, with a regression test that makes 50 folders back to back.
+  After the fixes the recovery test binary passed 20 of 20 runs on the runner (10 normal, 10 pinned to
+  one CPU); before, about half of the runs failed.
+- **`ATTRIBUTION.md`:** the Pa Tools screenshots row listed `mix.jpg` and `about.jpg` without their
+  folder, so `cargo xtask assets` (and so `cargo xtask ci`) failed on `pa-tools` itself.
+
+Upstream SoundCraft has no `ci.yml` either, which is why none of this had been seen. The engine and
+ui-egui changes are separate commits (test-only, apart from the autosave fix) so the lane holders of
+those crates can carry or drop them.
 
 ## The thin callers (unchanged)
 
