@@ -514,7 +514,8 @@ impl FrameHeader {
                 r.f(seq.frame_presentation_time_length_minus_1 + 1)?;
             }
             h.showable_frame = if h.show_frame { h.frame_type != KEY_FRAME as u8 } else { r.flag()? };
-            h.error_resilient_mode = if h.frame_type == SWITCH_FRAME as u8 || (h.frame_type == KEY_FRAME as u8 && h.show_frame) { true } else { r.flag()? };
+            h.error_resilient_mode =
+                if h.frame_type == SWITCH_FRAME as u8 || (h.frame_type == KEY_FRAME as u8 && h.show_frame) { true } else { r.flag()? };
         }
         if h.frame_type == KEY_FRAME as u8 && h.show_frame {
             for rs in st.refs.iter_mut() {
@@ -526,8 +527,11 @@ impl FrameHeader {
             }
         }
         h.disable_cdf_update = r.flag()?;
-        h.allow_screen_content_tools =
-            if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS as u32 { r.flag()? } else { seq.seq_force_screen_content_tools != 0 };
+        h.allow_screen_content_tools = if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS as u32 {
+            r.flag()?
+        } else {
+            seq.seq_force_screen_content_tools != 0
+        };
         if h.allow_screen_content_tools {
             h.force_integer_mv = if seq.seq_force_integer_mv == SELECT_INTEGER_MV as u32 { r.flag()? } else { seq.seq_force_integer_mv != 0 };
         }
@@ -571,7 +575,8 @@ impl FrameHeader {
                 }
             }
         }
-        h.refresh_frame_flags = if h.frame_type == SWITCH_FRAME as u8 || (h.frame_type == KEY_FRAME as u8 && h.show_frame) { all_frames } else { r.f(8)? };
+        h.refresh_frame_flags =
+            if h.frame_type == SWITCH_FRAME as u8 || (h.frame_type == KEY_FRAME as u8 && h.show_frame) { all_frames } else { r.f(8)? };
         if (!h.frame_is_intra || h.refresh_frame_flags != all_frames) && h.error_resilient_mode && seq.enable_order_hint {
             for rs in st.refs.iter_mut() {
                 let roh = r.f(seq.order_hint_bits)?;
@@ -1252,7 +1257,10 @@ impl FrameHeader {
             g.point_y_scaling[i] = r.f(8)? as u8;
         }
         g.chroma_scaling_from_luma = if seq.color.mono_chrome { false } else { r.flag()? };
-        if seq.color.mono_chrome || g.chroma_scaling_from_luma || (seq.color.subsampling_x == 1 && seq.color.subsampling_y == 1 && g.num_y_points == 0) {
+        if seq.color.mono_chrome
+            || g.chroma_scaling_from_luma
+            || (seq.color.subsampling_x == 1 && seq.color.subsampling_y == 1 && g.num_y_points == 0)
+        {
             g.num_cb_points = 0;
             g.num_cr_points = 0;
         } else {

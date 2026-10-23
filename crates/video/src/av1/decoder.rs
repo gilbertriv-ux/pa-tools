@@ -15,7 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::av1::bits::{BitReader, leb128};
 use crate::av1::cdf::Cdfs;
 use crate::av1::frame::FrameBuf;
-use crate::av1::header::{FilmGrainParams, FrameHeader, HeaderState, LoopFilterDeltas, RefInfo, SegmentationFeatures, SequenceHeader, default_gm_params};
+use crate::av1::header::{
+    FilmGrainParams, FrameHeader, HeaderState, LoopFilterDeltas, RefInfo, SegmentationFeatures, SequenceHeader, default_gm_params,
+};
 use crate::av1::par::Pool;
 use crate::av1::spec_tables::*;
 use crate::av1::state::{FrameShared, FrameState, TileState};

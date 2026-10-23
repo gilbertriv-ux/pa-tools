@@ -91,7 +91,10 @@ impl TileDecoder<'_, '_> {
                 if fh.allow_high_precision_mv {
                     mv = [round2_signed64(yc, WARPEDMODEL_PREC_BITS as u32 - 3) as i32, round2_signed64(xc, WARPEDMODEL_PREC_BITS as u32 - 3) as i32];
                 } else {
-                    mv = [round2_signed64(yc, WARPEDMODEL_PREC_BITS as u32 - 2) as i32 * 2, round2_signed64(xc, WARPEDMODEL_PREC_BITS as u32 - 2) as i32 * 2];
+                    mv = [
+                        round2_signed64(yc, WARPEDMODEL_PREC_BITS as u32 - 2) as i32 * 2,
+                        round2_signed64(xc, WARPEDMODEL_PREC_BITS as u32 - 2) as i32 * 2,
+                    ];
                 }
             }
         }
@@ -316,8 +319,10 @@ impl TileDecoder<'_, '_> {
             self.lower_mv_precision(&mut c1);
             if delta_row == 0 && delta_col == 0 {
                 let g = self.mvs.global_mvs;
-                self.mvs.zero_mv_context =
-                    ((c0[0] - g[0][0]).abs() >= 16 || (c0[1] - g[0][1]).abs() >= 16 || (c1[0] - g[1][0]).abs() >= 16 || (c1[1] - g[1][1]).abs() >= 16) as usize;
+                self.mvs.zero_mv_context = ((c0[0] - g[0][0]).abs() >= 16
+                    || (c0[1] - g[0][1]).abs() >= 16
+                    || (c1[0] - g[1][0]).abs() >= 16
+                    || (c1[1] - g[1][1]).abs() >= 16) as usize;
             }
             let n = self.mvs.num_mv_found;
             let idx = (0..n).find(|&i| self.mvs.ref_stack_mv[i][0] == c0 && self.mvs.ref_stack_mv[i][1] == c1);

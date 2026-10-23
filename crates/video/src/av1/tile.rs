@@ -573,8 +573,11 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             !self.b.lossless && block_width(ms).max(block_height(ms)) <= 32
         };
         let y = self.b.y_mode;
-        self.b.uv_mode =
-            if cfl_allowed { self.sd.read_symbol(&mut self.cdf.uv_mode_cfl_allowed[y]) } else { self.sd.read_symbol(&mut self.cdf.uv_mode_cfl_not_allowed[y]) };
+        self.b.uv_mode = if cfl_allowed {
+            self.sd.read_symbol(&mut self.cdf.uv_mode_cfl_allowed[y])
+        } else {
+            self.sd.read_symbol(&mut self.cdf.uv_mode_cfl_not_allowed[y])
+        };
     }
 
     pub(crate) fn intra_angle_info_y(&mut self) {
@@ -731,7 +734,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let multi = fh.delta_lf_multi;
             let res = fh.delta_lf_res;
             for i in 0..count {
-                let mut abs = if multi { self.sd.read_symbol(&mut self.cdf.delta_lf_multi[i]) } else { self.sd.read_symbol(&mut self.cdf.delta_lf) } as i32;
+                let mut abs =
+                    if multi { self.sd.read_symbol(&mut self.cdf.delta_lf_multi[i]) } else { self.sd.read_symbol(&mut self.cdf.delta_lf) } as i32;
                 if abs == DELTA_LF_SMALL as i32 {
                     let n = self.sd.read_literal(3) + 1;
                     let bits = self.sd.read_literal(n) as i32;
@@ -1276,7 +1280,14 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                         while y < num4x4_h {
                             let mut x = 0;
                             while x < num4x4_w {
-                                self.transform_block(plane, base_x_block, base_y_block, tx_sz, x + ((chunk_x << 4) >> sub_x), y + ((chunk_y << 4) >> sub_y))?;
+                                self.transform_block(
+                                    plane,
+                                    base_x_block,
+                                    base_y_block,
+                                    tx_sz,
+                                    x + ((chunk_x << 4) >> sub_x),
+                                    y + ((chunk_y << 4) >> sub_y),
+                                )?;
                                 x += step_x;
                             }
                             y += step_y;
@@ -1570,8 +1581,11 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
 
     fn transform_type(&mut self, x4: usize, y4: usize, tx_sz: usize) {
         let set = self.get_tx_set(tx_sz);
-        let qidx =
-            if self.fs.fh.seg.enabled { self.fs.fh.get_qindex(true, self.b.segment_id, self.current_q_index) } else { self.fs.fh.quant.base_q_idx as i32 };
+        let qidx = if self.fs.fh.seg.enabled {
+            self.fs.fh.get_qindex(true, self.b.segment_id, self.current_q_index)
+        } else {
+            self.fs.fh.quant.base_q_idx as i32
+        };
         let tx_type = if set > 0 && qidx > 0 {
             let sqr = TX_SIZE_SQR[tx_sz] as usize;
             if self.b.is_inter {
@@ -1581,7 +1595,8 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                     _ => TX_TYPE_INTER_INV_SET3[self.sd.read_symbol(&mut self.cdf.inter_tx_type_set3[sqr])] as usize,
                 }
             } else {
-                let intra_dir = if self.b.use_filter_intra { FILTER_INTRA_MODE_TO_INTRA_DIR[self.b.filter_intra_mode] as usize } else { self.b.y_mode };
+                let intra_dir =
+                    if self.b.use_filter_intra { FILTER_INTRA_MODE_TO_INTRA_DIR[self.b.filter_intra_mode] as usize } else { self.b.y_mode };
                 if set == TX_SET_INTRA_1 {
                     TX_TYPE_INTRA_INV_SET1[self.sd.read_symbol(&mut self.cdf.intra_tx_type_set1[sqr][intra_dir])] as usize
                 } else {
@@ -1996,8 +2011,11 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             let (unit_rows, unit_cols) = (self.fs.lr_unit_rows[plane], self.fs.lr_unit_cols[plane]);
             let unit_row_start = (r * (4 >> sub_y)).div_ceil(unit_size);
             let unit_row_end = unit_rows.min(((r + h) * (4 >> sub_y)).div_ceil(unit_size));
-            let (numerator, denominator) =
-                if self.fs.fh.use_superres { ((4 >> sub_x) * self.fs.fh.superres_denom as usize, unit_size * SUPERRES_NUM) } else { (4 >> sub_x, unit_size) };
+            let (numerator, denominator) = if self.fs.fh.use_superres {
+                ((4 >> sub_x) * self.fs.fh.superres_denom as usize, unit_size * SUPERRES_NUM)
+            } else {
+                (4 >> sub_x, unit_size)
+            };
             let unit_col_start = (c * numerator).div_ceil(denominator);
             let unit_col_end = unit_cols.min(((c + w) * numerator).div_ceil(denominator));
             for unit_row in unit_row_start..unit_row_end {

@@ -52,7 +52,8 @@ pub(crate) fn setup_shear(p: &[i32; 6]) -> (bool, i32, i32, i32, i32) {
     let rb = WARP_PARAM_REDUCE_BITS as u32;
     let red = |x: i64| (round2_signed64(x, rb) << rb) as i32;
     let (alpha, beta, gamma, delta) = (red(alpha0), red(beta0), red(gamma0), red(delta0));
-    let valid = !(4 * alpha.abs() + 7 * beta.abs() >= (1 << WARPEDMODEL_PREC_BITS) || 4 * gamma.abs() + 4 * delta.abs() >= (1 << WARPEDMODEL_PREC_BITS));
+    let valid =
+        !(4 * alpha.abs() + 7 * beta.abs() >= (1 << WARPEDMODEL_PREC_BITS) || 4 * gamma.abs() + 4 * delta.abs() >= (1 << WARPEDMODEL_PREC_BITS));
     (valid, alpha, beta, gamma, delta)
 }
 
@@ -411,7 +412,8 @@ impl TileDecoder<'_, '_> {
         for ref_list in 0..1 + is_compound as usize {
             let ref_frame = cand_refs[ref_list];
             let ym = self.b.y_mode;
-            let global = (ym == GLOBALMV || ym == GLOBAL_GLOBALMV) && ref_frame > INTRA_FRAME as i8 && fh.gm_type[ref_frame as usize] as usize > TRANSLATION;
+            let global =
+                (ym == GLOBALMV || ym == GLOBAL_GLOBALMV) && ref_frame > INTRA_FRAME as i8 && fh.gm_type[ref_frame as usize] as usize > TRANSLATION;
             let global_valid = global && setup_shear(&fh.gm_params[ref_frame as usize]).0;
             let ref_idx: i32 = if self.b.use_intrabc { -1 } else { fh.ref_frame_idx[ref_frame as usize - LAST_FRAME] as i32 };
             let use_warp = if w < 8 || h < 8 || fh.force_integer_mv {

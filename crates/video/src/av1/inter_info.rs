@@ -235,8 +235,10 @@ impl TileDecoder<'_, '_> {
         Self::ref_count_ctx(self.count_refs(BWDREF_FRAME as i8), self.count_refs(ALTREF2_FRAME as i8))
     }
     fn ctx_single_ref_p1(&self) -> usize {
-        let fwd =
-            self.count_refs(LAST_FRAME as i8) + self.count_refs(LAST2_FRAME as i8) + self.count_refs(LAST3_FRAME as i8) + self.count_refs(GOLDEN_FRAME as i8);
+        let fwd = self.count_refs(LAST_FRAME as i8)
+            + self.count_refs(LAST2_FRAME as i8)
+            + self.count_refs(LAST3_FRAME as i8)
+            + self.count_refs(GOLDEN_FRAME as i8);
         let bwd = self.count_refs(BWDREF_FRAME as i8) + self.count_refs(ALTREF2_FRAME as i8) + self.count_refs(ALTREF_FRAME as i8);
         Self::ref_count_ctx(fwd, bwd)
     }
@@ -264,8 +266,10 @@ impl TileDecoder<'_, '_> {
                     if self.sd.read_symbol(&mut self.cdf.uni_comp_ref[ctx][0]) == 1 {
                         self.b.ref_frame = [BWDREF_FRAME as i8, ALTREF_FRAME as i8];
                     } else {
-                        let ctx1 =
-                            Self::ref_count_ctx(self.count_refs(LAST2_FRAME as i8), self.count_refs(LAST3_FRAME as i8) + self.count_refs(GOLDEN_FRAME as i8));
+                        let ctx1 = Self::ref_count_ctx(
+                            self.count_refs(LAST2_FRAME as i8),
+                            self.count_refs(LAST3_FRAME as i8) + self.count_refs(GOLDEN_FRAME as i8),
+                        );
                         if self.sd.read_symbol(&mut self.cdf.uni_comp_ref[ctx1][1]) == 1 {
                             let ctx2 = self.ctx_comp_ref_p2();
                             if self.sd.read_symbol(&mut self.cdf.uni_comp_ref[ctx2][2]) == 1 {

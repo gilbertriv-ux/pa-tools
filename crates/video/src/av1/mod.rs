@@ -21,6 +21,7 @@ mod mvpred;
 mod par;
 mod postfilter;
 mod restoration;
+#[rustfmt::skip]
 mod spec_tables;
 mod state;
 mod stats;
