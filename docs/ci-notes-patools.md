@@ -1,7 +1,7 @@
 # CI notes for Pa Tools
 
-**Status: revised 2026-10-23 (rev 2), after Pa Tools' own CI workflows ran on GitHub (draft PR #4,
-gap G-14).** Read before you touch anything under `.github/`. Rev 1 was written on 2026-10-22 at the
+**Status: revised 2026-10-23 (rev 2.1), after Pa Tools' own CI workflows ran on GitHub (draft PR #4,
+gap G-14) and an independent review of that pull request.** Read before you touch anything under `.github/`. Rev 1 was written on 2026-10-22 at the
 fork point (upstream `9b8283b`), before the shared workflow repository could be read or anything was
 run; several of its beliefs turned out wrong and are corrected here.
 
@@ -11,6 +11,7 @@ run; several of its beliefs turned out wrong and are corrected here.
 |---|---|---|
 | 2026-10-22 | 1 | Written by the packaging worker at the fork point. The six workflows were thin callers to `storytold/craft-common-actions`, which was believed to be **private** and was not read. Included an untested sketch of a Windows MSI job that lacked the `wix extension add` step. |
 | 2026-10-23 | 2 | craft-common-actions read (public, **no licence**, trust and cost findings below). Gil decided to write Pa Tools' own workflows. Added `ci.yml` (PR gate on Linux, build and test on macOS and Windows) and `windows-msi.yml` (unsigned x64 and arm64 MSIs, built and run on GitHub). Replaced the MSI sketch with the real file. Added the failure-annotation scheme and the Dependabot ignore block. Corrected the "private" claim. |
+| 2026-10-23 | 2.1 | Review fixes on draft PR #4. **Provenance:** a smoke-test step in the first `windows-msi.yml` was derived from craft-common-actions (no licence); removed and rewritten (see "Provenance incident" below). Pinned the Rust toolchain. Recovery-test note corrected; `leftovers()` keeps a tie; one concurrency group per commit on `pa-tools`; cache saved only from `pa-tools`; Dependabot egui ignores narrowed; NOTICE and licences installed by the MSI. |
 
 ## Where things stand
 
@@ -27,7 +28,8 @@ run; several of its beliefs turned out wrong and are corrected here.
 - **It is public.** Calls from `gilbertriv-ux/pa-tools` start and run: SonarCloud, Packaging lint and
   Nix have all run on pull requests here. Rev 1's "private, every workflow fails at startup" was wrong.
 - **It has no licence file.** Cloning and forking are allowed by GitHub's terms; copying its YAML into
-  another repository is not licensed. **Nothing from it is copied into this repository.**
+  another repository is not licensed. Nothing from it is meant to be copied into this repository; the
+  one case where that went wrong, and how it was put right, is under "Provenance incident" below.
 - **It has no build-and-test workflow.** It holds `release.yml` (1,192 lines: macOS universal, Windows
   x64/x86/arm64, Linux, Flatpak, FreeBSD VM, Arch, web, riscv64, draft release), `freebsd.yml`,
   `windows-arm64.yml`, `packaging-lint.yml`, `nix.yml`, `sonarcloud.yml`, `supply-chain.yml`,
@@ -47,8 +49,8 @@ run; several of its beliefs turned out wrong and are corrected here.
 2. **Ask storytold for a licence line.** The clean way to vendor or fork it, but it depends on them.
 3. **Write Pa Tools' own workflows.** **Chosen.** Nothing from craft-common-actions is copied. The
    permissively licensed app workflows (FilmCraft, PhotoCraft; MIT OR Apache-2.0) may be adapted, with a
-   provenance line in the YAML and a row in `ATTRIBUTION.md`; writing a `wix extension add` step or
-   pinning a public action to its commit SHA is just using facts about public tools.
+   provenance line in the YAML and a row in `ATTRIBUTION.md`; pinning a public action to its commit SHA
+   is just using facts about public tools.
 
 The release workflow (signing, notarisation, draft release) is therefore still to be written; see
 "What still has to be written". Until then the six thin callers stay as they are.
@@ -120,19 +122,60 @@ turns red because the tool changed, not the code, teaches people to ignore it.
 - Runs `packaging/windows/package.ps1 -Arch x64` and `-Arch arm64` on `windows-latest`; the arm64 build
   is cross-compiled there (the image has the MSVC ARM64 build tools), and `package.ps1` itself checks
   both exes' PE machine type and subsystem. `package.ps1` needed no change.
-- Installs WiX with `dotnet tool install --global wix --version 5.0.2`, then `wix extension add -g
-  WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2`. `patools.wxs` uses neither extension today;
-  they are installed so a dialog set or a util element can be added without touching the workflow.
-  (Rev 1's sketch lacked this step.)
-- The x64 MSI is then installed, `pa-tools-cli --version` is run from `C:\Program Files\Pa Tools`, and
-  it is uninstalled again, on the same runner. The arm64 MSI cannot run on an x64 runner; installing it
-  on a Windows 11 ARM64 runner is what the thin caller `windows-arm64.yml` does.
+- Installs WiX as a .NET tool into a folder of its own (`dotnet tool install wix --version 5.0.2
+  --tool-path ...`), **without extensions**: `patools.wxs` uses core WiX elements only. If a dialog set
+  or a util element is added one day, install the matching extension then.
+- **Smoke test of the x64 MSI** (`packaging/windows/smoke-test.ps1`, run by the step "Smoke test the
+  MSI", after the MSI has been uploaded). In plain words it:
+  1. reads the expected version from Cargo: `cargo metadata --no-deps` lists the workspace packages
+     (all inherit `[workspace.package] version`; the step fails if they disagree). `package.ps1` reads
+     the same key to build the MSI and `patools.wxs` takes `Version` from it (`-d Version=`); no version
+     is typed anywhere else, so the test compares what two readers of one key produced;
+  2. opens the MSI's database through the `WindowsInstaller.Installer` object and asserts that
+     `ProductVersion` is that version (a pre-release tag such as `-rc.1` is dropped from an MSI
+     version), the file name carries it, and the File table holds the notice and licence files;
+  3. installs it with `msiexec /i ... /qn /norestart /l*v`, under a 10-minute limit;
+  4. finds `pa-tools.exe` through the App Paths key the MSI writes, checks it is in `C:\Program Files\Pa
+     Tools`, that both exes, `NOTICE`, `LICENSE-MIT`, `LICENSE-APACHE` and `ATTRIBUTION.md` are there
+     (the last four byte-identical to the repository's), and that one "Pa Tools" entry with that version
+     is listed under Uninstall;
+  5. runs `pa-tools.exe --version` and `pa-tools-cli.exe --version` (both print the name and the Cargo
+     version) and requires "Pa Tools" and exactly that version;
+  6. uninstalls with `msiexec /x ... /qn` and checks the install folder, the App Paths key and the
+     Uninstall entry are gone.
+  On failure it writes one error annotation (readable through the check-runs API) and the step uploads
+  the msiexec logs and captured output as the artifact `patools-windows-x64-msi-smoke-logs`; on success
+  it writes one notice annotation with the MSI size and the files in it. The arm64 MSI cannot run on an
+  x64 runner; installing it on a Windows 11 ARM64 runner is what the thin caller `windows-arm64.yml`
+  does.
+- **The MSI installs the notice.** Pa Tools links Symphonia (MPL-2.0); section 3.2 of the MPL asks that
+  a recipient of the executable form is told the source is available and where. `NOTICE` says so, and
+  `patools.wxs` now installs `NOTICE`, `LICENSE-MIT`, `LICENSE-APACHE` and `ATTRIBUTION.md` next to the
+  exes (the files the portable zip already carries); `package.ps1` passes the repository root as
+  `LegalDir`, and a missing file fails `wix build`.
 - Unsigned: no signing secret is passed in, so `sign.ps1` prints its "leaving unsigned" warning and
   exits 0. Signed installers are the release workflow's job.
 - Artifacts (14 days): `patools-windows-x64-msi` (holds `patools-0.11.0-windows-x64.msi`; the artifact
   is 11.4 MB) and `patools-windows-arm64-msi` (holds `patools-0.11.0-windows-arm64.msi`; 10.2 MB). The two portable zips that
   `package.ps1` also makes are not uploaded.
 - Timing: about 6 to 7 minutes per architecture warm (cold: 6 for x64, 10 for arm64).
+
+### Provenance incident (review of draft PR #4, fixed in the same pull request)
+
+An independent review found that about 14 lines of the first `windows-msi.yml`, in its smoke-test step,
+were derived from `storytold/craft-common-actions`, which has no licence file. The header of that file
+said nothing had been copied.
+
+- **Removed** in commit `ab50b38` (that step, and the `wix extension add` lines, which `patools.wxs`
+  does not need); the WiX tool is installed without extensions (commit `b598957`).
+- **Rewritten** as `packaging/windows/smoke-test.ps1`, written for Pa Tools from public documentation
+  only (Microsoft Learn on msiexec, the Windows Installer automation objects and the Uninstall registry
+  key; the GitHub Actions workflow-command docs) and from this repository's own `patools.wxs` and
+  `package.ps1`. It was written without opening craft-common-actions or the removed lines.
+- **History:** Gil approved a **squash merge** of the pull request, so the removed lines never enter
+  `pa-tools` history. The `ci-probe/*` branches used while testing are deleted only after the squash
+  merge has landed.
+- The headers of `windows-msi.yml` and the `ATTRIBUTION.md` rows say this, briefly.
 
 ### Reading a failed run when the job log is out of reach
 
