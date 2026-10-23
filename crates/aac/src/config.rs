@@ -235,7 +235,8 @@ impl AudioSpecificConfig {
         if frame_length_flag {
             return Err(Error::Unsupported("960-sample frames"));
         }
-        let cfg = AudioSpecificConfig { object_type: aot, sample_rate, sf_index, channel_config, frame_length_flag, sbr, ps, extension_sample_rate, pce };
+        let cfg =
+            AudioSpecificConfig { object_type: aot, sample_rate, sf_index, channel_config, frame_length_flag, sbr, ps, extension_sample_rate, pce };
         if cfg.channels() == 0 {
             return Err(Error::InvalidConfig("no channels"));
         }

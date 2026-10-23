@@ -758,7 +758,15 @@ impl<W: Write> FragmentedWriter<W> {
             return Err(Error::Mux("PCM is not supported by the fragmented writer".into()));
         }
         let handler = handler_of(&cfg.entry);
-        self.tracks.push(WTrack { id: self.tracks.len() as u32 + 1, handler, pcm_frame_bytes: None, t: Tables::new(), cfg, tmcd_ref: None, tmcd_source: None });
+        self.tracks.push(WTrack {
+            id: self.tracks.len() as u32 + 1,
+            handler,
+            pcm_frame_bytes: None,
+            t: Tables::new(),
+            cfg,
+            tmcd_ref: None,
+            tmcd_source: None,
+        });
         self.pending.push(Vec::new());
         self.next_dts.push(0);
         Ok(self.tracks.len() - 1)
@@ -909,8 +917,11 @@ mod tests {
             let a = w.add_track(TrackConfig::new(SampleEntry::pcm(pcm), 48000)).unwrap();
             for i in 0..10u8 {
                 let data = vec![i; 100 + i as usize];
-                w.write_sample(v, WriteSample { data: &data, duration: 512, composition_offset: if i % 2 == 0 { 1024 } else { 0 }, is_sync: i % 5 == 0 })
-                    .unwrap();
+                w.write_sample(
+                    v,
+                    WriteSample { data: &data, duration: 512, composition_offset: if i % 2 == 0 { 1024 } else { 0 }, is_sync: i % 5 == 0 },
+                )
+                .unwrap();
                 w.write_sample(a, WriteSample { data: &[i; 400], duration: 0, composition_offset: 0, is_sync: true }).unwrap();
             }
             let out = if fast { w.finish_faststart() } else { w.finish() }.unwrap().into_inner();

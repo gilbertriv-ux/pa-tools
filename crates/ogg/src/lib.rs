@@ -254,7 +254,15 @@ pub fn open(src: &(impl ByteSource + ?Sized)) -> Result<OggFile> {
         let lacing = page[27..27 + nseg].to_vec();
         let body_off = pos + 27 + nseg as u64;
         let si = *by_serial.entry(serial).or_insert_with(|| {
-            streams.push(Stream { serial, codec: Codec::Unknown, headers: Vec::new(), packets: Vec::new(), pages: 0, last_granule: None, saw_eos: false });
+            streams.push(Stream {
+                serial,
+                codec: Codec::Unknown,
+                headers: Vec::new(),
+                packets: Vec::new(),
+                pages: 0,
+                last_granule: None,
+                saw_eos: false,
+            });
             streams.len() - 1
         });
         let st = &mut streams[si];

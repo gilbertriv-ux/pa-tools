@@ -30,7 +30,8 @@ impl Reson {
 /// formant resonators whose frequencies change per syllable, with syllable envelopes, short
 /// pauses and a little aspiration noise.
 pub fn speech(len: usize, seed: u32) -> Vec<f32> {
-    let vowels: [[f64; 3]; 5] = [[730.0, 1090.0, 2440.0], [270.0, 2290.0, 3010.0], [530.0, 1840.0, 2480.0], [570.0, 840.0, 2410.0], [300.0, 870.0, 2240.0]];
+    let vowels: [[f64; 3]; 5] =
+        [[730.0, 1090.0, 2440.0], [270.0, 2290.0, 3010.0], [530.0, 1840.0, 2480.0], [570.0, 840.0, 2410.0], [300.0, 870.0, 2240.0]];
     let syl = (0.24 * SR) as usize;
     let mut out = Vec::with_capacity(len);
     let mut res = [Reson { y1: 0.0, y2: 0.0 }, Reson { y1: 0.0, y2: 0.0 }, Reson { y1: 0.0, y2: 0.0 }];

@@ -51,7 +51,11 @@ fn log2lin(in_log_q7: i32) -> i32 {
     }
     let out = 1i32 << (in_log_q7 >> 7);
     let frac = in_log_q7 & 0x7F;
-    if in_log_q7 < 2048 { out + ((out * smlawb(frac, frac * (128 - frac), -174)) >> 7) } else { out + (out >> 7) * smlawb(frac, frac * (128 - frac), -174) }
+    if in_log_q7 < 2048 {
+        out + ((out * smlawb(frac, frac * (128 - frac), -174)) >> 7)
+    } else {
+        out + (out >> 7) * smlawb(frac, frac * (128 - frac), -174)
+    }
 }
 
 fn gain_q16(index: i32) -> i32 {

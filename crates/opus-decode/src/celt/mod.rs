@@ -298,7 +298,20 @@ impl CeltDecoder {
         let bits_left = len as i32 * 8 - dec.tell();
         unquant_energy_finalise(start, end, &mut self.old_band_e, &alloc.fine_quant, &alloc.fine_priority, bits_left, dec, c);
         if anti_collapse_on {
-            anti_collapse(&mut x, &collapse_masks, lm, c, n, start, end, &self.old_band_e, &self.old_log_e, &self.old_log_e2, &alloc.pulses, self.rng);
+            anti_collapse(
+                &mut x,
+                &collapse_masks,
+                lm,
+                c,
+                n,
+                start,
+                end,
+                &self.old_band_e,
+                &self.old_log_e,
+                &self.old_log_e2,
+                &alloc.pulses,
+                self.rng,
+            );
         }
         if silence {
             for v in self.old_band_e[..c * NB_EBANDS].iter_mut() {

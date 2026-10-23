@@ -1051,8 +1051,14 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
             b"ec-3" => CodecConfig::Eac3 { dec3: get(b"dec3").unwrap_or(&[]).to_vec() },
             b"lpcm" | b"sowt" | b"twos" | b"in24" | b"in32" | b"fl32" | b"fl64" | b"raw " | b"NONE" => CodecConfig::Pcm(qt_pcm(f, &a)),
             b"ipcm" | b"fpcm" => {
-                let mut pcm =
-                    PcmConfig { bits: a.sample_size, float: f == b"fpcm", big_endian: true, signed: true, channels: a.channels, sample_rate: a.sample_rate };
+                let mut pcm = PcmConfig {
+                    bits: a.sample_size,
+                    float: f == b"fpcm",
+                    big_endian: true,
+                    signed: true,
+                    channels: a.channels,
+                    sample_rate: a.sample_rate,
+                };
                 if let Some(p) = get(b"pcmC") {
                     let mut c = Cur::new(p, "pcmC");
                     c.full_header()?;
@@ -1116,7 +1122,9 @@ fn parse_colr(p: &[u8]) -> Result<ColorInfo> {
     let mut c = Cur::new(p, "colr");
     let kind = c.fourcc()?;
     Ok(match &kind.0 {
-        b"nclx" => ColorInfo::Nclx { primaries: c.u16()?, transfer: c.u16()?, matrix: c.u16()?, full_range: c.u8().map(|v| v & 0x80 != 0).unwrap_or(false) },
+        b"nclx" => {
+            ColorInfo::Nclx { primaries: c.u16()?, transfer: c.u16()?, matrix: c.u16()?, full_range: c.u8().map(|v| v & 0x80 != 0).unwrap_or(false) }
+        }
         b"nclc" => ColorInfo::Nclc { primaries: c.u16()?, transfer: c.u16()?, matrix: c.u16()? },
         _ => ColorInfo::Icc { kind, profile: c.rest().to_vec() },
     })
@@ -1593,7 +1601,8 @@ mod tests {
         e.video.as_mut().unwrap().color = Some(ColorInfo::Nclx { primaries: 1, transfer: 1, matrix: 1, full_range: false });
         e.video.as_mut().unwrap().pixel_aspect = Some((4, 3));
         e.video.as_mut().unwrap().field_info = Some(FieldInfo { fields: 2, detail: 9 });
-        e.video.as_mut().unwrap().clean_aperture = Some(CleanAperture { width: (1920, 1), height: (1080, 1), horiz_offset: (-2, 1), vert_offset: (0, 1) });
+        e.video.as_mut().unwrap().clean_aperture =
+            Some(CleanAperture { width: (1920, 1), height: (1080, 1), horiz_offset: (-2, 1), vert_offset: (0, 1) });
         e.video.as_mut().unwrap().mastering_display = Some(MasteringDisplay::bt2020(1000.0, 0.0001));
         e.video.as_mut().unwrap().content_light = Some((1000, 400));
         e.bitrate = Some(BitRate { buffer_size: 1, max_bitrate: 2, avg_bitrate: 3 });
@@ -1642,7 +1651,14 @@ mod tests {
             codec_init: vec![],
         };
         assert_eq!(VpcConfig::parse(&v.to_bytes()).unwrap(), v);
-        let o = OpusConfig { output_channels: 2, pre_skip: 312, input_sample_rate: 48000, output_gain: 0, channel_mapping_family: 0, channel_mapping: vec![] };
+        let o = OpusConfig {
+            output_channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            output_gain: 0,
+            channel_mapping_family: 0,
+            channel_mapping: vec![],
+        };
         assert_eq!(OpusConfig::parse(&o.to_bytes()).unwrap(), o);
     }
 
@@ -1699,7 +1715,8 @@ mod tests {
 
     #[test]
     fn timecode_and_prores() {
-        let tc = TimecodeConfig { flags: 1, timescale: 30000, frame_duration: 1001, frames_per_second: 30, start_frame: None, name: Some("reel".into()) };
+        let tc =
+            TimecodeConfig { flags: 1, timescale: 30000, frame_duration: 1001, frames_per_second: 30, start_frame: None, name: Some("reel".into()) };
         let e = SampleEntry {
             format: FourCc(*b"tmcd"),
             data_reference_index: 1,

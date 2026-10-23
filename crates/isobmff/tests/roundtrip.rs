@@ -1,7 +1,7 @@
 //! Property tests: write with our muxers, read back, compare sample tables and bytes.
 
-use soundcraft_isobmff::*;
 use proptest::prelude::*;
+use soundcraft_isobmff::*;
 use std::io::Cursor;
 
 #[derive(Clone, Debug)]

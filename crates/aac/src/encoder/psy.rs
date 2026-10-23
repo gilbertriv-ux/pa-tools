@@ -96,7 +96,10 @@ pub struct PsyResult {
 
 impl Psy {
     pub fn new(sample_rate: u32, sf_index: u8) -> Psy {
-        Psy { long: BandModel::new(sample_rate, swb_offsets_long(sf_index), 1024), short: BandModel::new(sample_rate, swb_offsets_short(sf_index), 128) }
+        Psy {
+            long: BandModel::new(sample_rate, swb_offsets_long(sf_index), 1024),
+            short: BandModel::new(sample_rate, swb_offsets_short(sf_index), 128),
+        }
     }
 
     /// Analyse a spectrum: 1024 lines (long) or 8×128 (short).

@@ -139,7 +139,14 @@ pub fn encode(cfg: EncoderConfig, planar: &[Vec<f32>]) -> Encoded {
         adts.extend(au);
     }
     let stats = enc.stats();
-    Encoded { raw_bytes: stats.bytes as usize, frames: stats.frames as usize, stats, asc: enc.audio_specific_config(), bandwidth: enc.bandwidth(), adts }
+    Encoded {
+        raw_bytes: stats.bytes as usize,
+        frames: stats.frames as usize,
+        stats,
+        asc: enc.audio_specific_config(),
+        bandwidth: enc.bandwidth(),
+        adts,
+    }
 }
 
 /// Decode with ffmpeg → planar f32 (ffmpeg's own channel order), plus stderr.

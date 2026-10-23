@@ -164,7 +164,13 @@ fn bitrate_tracking() {
         ] {
             let r = mono(mode, bw, rate, x, band_edge(bw));
             let ratio = r.kbps * 1000.0 / rate as f64;
-            eprintln!("{name} {mode:?}/{bw:?} target {} kb/s: actual {:.2} kb/s ({:+.0} %), SNR {:.1} dB", rate / 1000, r.kbps, (ratio - 1.0) * 100.0, r.snr);
+            eprintln!(
+                "{name} {mode:?}/{bw:?} target {} kb/s: actual {:.2} kb/s ({:+.0} %), SNR {:.1} dB",
+                rate / 1000,
+                r.kbps,
+                (ratio - 1.0) * 100.0,
+                r.snr
+            );
             assert!((0.75..=1.25).contains(&ratio), "{name} {mode:?}/{bw:?} @ {rate}: {:.2} kb/s", r.kbps);
         }
     }
@@ -186,7 +192,13 @@ fn stereo_silk_and_hybrid() {
         for (mode, bw, rate, min_snr) in [(Mode::Silk, Bandwidth::Wideband, 32_000u32, 9.0), (Mode::Hybrid, Bandwidth::Fullband, 64_000, 9.0)] {
             let fc = band_edge(bw);
             let res = run(OpusEncoder::with_mode(2, rate, mode, bw), &[l.clone(), r.clone()], &[lowpass(l, fc), lowpass(r, fc)]);
-            eprintln!("stereo {name} {mode:?}/{bw:?} @ {} kb/s: {:.1} kb/s, L {:.1} dB, R {:.1} dB", rate / 1000, res[0].kbps, res[0].snr, res[1].snr);
+            eprintln!(
+                "stereo {name} {mode:?}/{bw:?} @ {} kb/s: {:.1} kb/s, L {:.1} dB, R {:.1} dB",
+                rate / 1000,
+                res[0].kbps,
+                res[0].snr,
+                res[1].snr
+            );
             assert!(res[0].snr > min_snr && res[1].snr > min_snr, "stereo {name} {mode:?}: L {:.1} R {:.1}", res[0].snr, res[1].snr);
         }
     }

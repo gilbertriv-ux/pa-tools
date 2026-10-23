@@ -678,7 +678,8 @@ fn parse_stbl(stbl: &[u8], t: &mut Track, is_qt: bool, file_len: u64) -> Result<
             _ => {}
         }
     }
-    t.sample_groups = sbgp.into_iter().map(|(gt, runs)| SampleGroup { grouping_type: gt, runs, descriptions: sgpd.remove(&gt).unwrap_or_default() }).collect();
+    t.sample_groups =
+        sbgp.into_iter().map(|(gt, runs)| SampleGroup { grouping_type: gt, runs, descriptions: sgpd.remove(&gt).unwrap_or_default() }).collect();
     if sample_count == 0 || chunks.is_empty() || stsc.is_empty() {
         return Ok(());
     }

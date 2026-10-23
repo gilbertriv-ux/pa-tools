@@ -363,7 +363,17 @@ impl BandCtx<'_, '_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn quant_partition(&mut self, x: &mut [f32], n: usize, mut b: i32, mut bb: usize, lowband: Option<&[f32]>, mut lm: i32, gain: f32, mut fill: u32) -> u32 {
+    fn quant_partition(
+        &mut self,
+        x: &mut [f32],
+        n: usize,
+        mut b: i32,
+        mut bb: usize,
+        lowband: Option<&[f32]>,
+        mut lm: i32,
+        gain: f32,
+        mut fill: u32,
+    ) -> u32 {
         let b0 = bb;
         let i = self.i;
         let cache = self.m.cache(lm, i);
@@ -876,7 +886,16 @@ pub fn anti_collapse(
 
 /// Multiplies the normalised shapes by the band energies (`denormalise_bands`).
 #[allow(clippy::too_many_arguments)]
-pub fn denormalise_bands(x: &[f32], freq: &mut [f32], band_log_e: &[f32], mut start: usize, mut end: usize, mm: usize, downsample: usize, silence: bool) {
+pub fn denormalise_bands(
+    x: &[f32],
+    freq: &mut [f32],
+    band_log_e: &[f32],
+    mut start: usize,
+    mut end: usize,
+    mm: usize,
+    downsample: usize,
+    silence: bool,
+) {
     let n = mm * SHORT_MDCT;
     let mut bound = mm * EBANDS[end] as usize;
     if downsample != 1 {

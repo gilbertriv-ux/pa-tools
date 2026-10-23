@@ -192,7 +192,8 @@ mod tests {
         }
         (0..n)
             .map(|k| {
-                (0..2 * n).map(|t| u[t] * (std::f64::consts::PI / n as f64 * (t as f64 + 0.5 + n as f64 / 2.0) * (k as f64 + 0.5)).cos()).sum::<f64>() * 2.0
+                (0..2 * n).map(|t| u[t] * (std::f64::consts::PI / n as f64 * (t as f64 + 0.5 + n as f64 / 2.0) * (k as f64 + 0.5)).cos()).sum::<f64>()
+                    * 2.0
                     / n as f64
             })
             .collect()

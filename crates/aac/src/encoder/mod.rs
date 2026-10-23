@@ -141,7 +141,8 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(cfg: EncoderConfig) -> Result<Encoder> {
-        let sf_index = sample_rate_index(cfg.sample_rate).ok_or(Error::InvalidConfig("sample rate must be one of the 13 AAC rates (7350–96000 Hz)"))?;
+        let sf_index =
+            sample_rate_index(cfg.sample_rate).ok_or(Error::InvalidConfig("sample rate must be one of the 13 AAC rates (7350–96000 Hz)"))?;
         if !(1..=8).contains(&cfg.channels) {
             return Err(Error::InvalidConfig("channels must be 1..=8"));
         }
@@ -477,7 +478,8 @@ impl Encoder {
         let mut info = IcsInfo { window_sequence: seq, window_shape: self.cfg.window_shape, max_sfb: self.max_sfb(short, lfe), ..Default::default() };
         if short {
             // group windows of similar energy; an attack starts a new group
-            let en: Vec<f32> = (0..8).map(|w| specs.iter().map(|s| s[w * 128..(w + 1) * 128].iter().map(|v| v * v).sum::<f32>()).sum::<f32>() + 1.0).collect();
+            let en: Vec<f32> =
+                (0..8).map(|w| specs.iter().map(|s| s[w * 128..(w + 1) * 128].iter().map(|v| v * v).sum::<f32>()).sum::<f32>() + 1.0).collect();
             info.num_groups = 1;
             info.group_len = [1, 0, 0, 0, 0, 0, 0, 0];
             for w in 1..8 {
