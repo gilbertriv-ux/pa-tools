@@ -366,13 +366,14 @@ fn one_sample_movie(entry: SampleEntry) -> Movie {
 }
 
 /// What an unsupported HEVC / AV1 track says, by build: the feature's decoder is not written yet, or
-/// the build leaves it out.
+/// the build leaves it out. (AV1 has a decoder; a build with `av1-decode` decodes AV1 tracks and
+/// `tests/av1.rs` covers them, so AV1 is only a stub here when the feature is off.)
 fn hevc_phrase() -> &'static str {
     if cfg!(feature = "hevc-decode") { "not supported yet" } else { "unsupported in this build" }
 }
 
 fn av1_phrase() -> &'static str {
-    if cfg!(feature = "av1-decode") { "not supported yet" } else { "unsupported in this build" }
+    "unsupported in this build"
 }
 
 #[test]
@@ -380,6 +381,9 @@ fn codecs_without_a_decoder_open_but_say_so() {
     let av1 = SampleEntry::video(FourCc(*b"av01"), CodecConfig::Av1(Av1Config::default()), 64, 48);
     let cases = [(SampleEntry::hevc(HevcConfig::default(), 64, 48), "hevc", "HEVC", hevc_phrase()), (av1, "av1", "AV1", av1_phrase())];
     for (entry, id, label, phrase) in cases {
+        if id == "av1" && cfg!(feature = "av1-decode") {
+            continue;
+        }
         let mut m = one_sample_movie(entry);
         let info = m.info().clone();
         assert_eq!((info.codec.as_str(), info.codec_detail.as_str(), info.decodable), (id, label, false));
@@ -397,9 +401,12 @@ fn the_codec_stubs_return_clean_errors() {
     assert!(matches!(crate::adapt_hevc::open(&[]), Err(VideoError::Unsupported(why)) if why.contains(hevc_phrase())));
     #[cfg(feature = "hevc-decode")]
     assert!(matches!(crate::adapt_hevc::open(&[]), Err(VideoError::Decode(_))));
-    assert!(matches!(crate::adapt_av1::open(&[0x0a, 0x0b]), Err(VideoError::Unsupported(why)) if why.contains(av1_phrase())));
+    // AV1 is a stub only when its feature is off; `tests/av1.rs` covers the decoder.
+    if !cfg!(feature = "av1-decode") {
+        assert!(matches!(crate::adapt_av1::open(&[0x0a, 0x0b]), Err(VideoError::Unsupported(why)) if why.contains(av1_phrase())));
+        assert!(crate::adapt_av1::describe(&Av1Config::default()).unsupported.is_some_and(|w| w.contains(av1_phrase())));
+    }
     assert!(crate::adapt_hevc::describe(&HevcConfig::default()).unsupported.is_some_and(|w| w.contains(hevc_phrase())));
-    assert!(crate::adapt_av1::describe(&Av1Config::default()).unsupported.is_some_and(|w| w.contains(av1_phrase())));
 }
 
 /// Words that must never appear in anything the app shows about a codec.
