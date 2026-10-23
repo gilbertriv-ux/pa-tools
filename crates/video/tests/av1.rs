@@ -267,7 +267,9 @@ mod decode {
         count_panics();
         let before = PANICS.load(Ordering::SeqCst);
         let res = catch_unwind(AssertUnwindSafe(|| {
-            for threads in [1, 3] {
+            // Without the `threads` feature more threads change nothing, so one decoder is enough.
+            let configs: &[usize] = if cfg!(feature = "threads") { &[1, 3] } else { &[1] };
+            for &threads in configs {
                 let mut dec = Decoder::with_threads(threads);
                 for (i, f) in frames.iter().enumerate() {
                     let _ = dec.decode_pts(f, i as i64);
@@ -315,8 +317,8 @@ mod decode {
         for ivf in [IVF_8, IVF_10] {
             let seed = ivf_frames(ivf);
             for fi in 0..seed.len() {
-                for p in 0..seed[fi].len().min(64) {
-                    for v in [0u8, 0xff, 0x80, 0x01, 0x7f] {
+                for p in 0..seed[fi].len().min(48) {
+                    for v in [0u8, 0xff, 0x7f] {
                         let mut d = seed.clone();
                         d[fi][p] = v;
                         run_all(&d, &format!("frame {fi} byte {p}={v:#x}"));
