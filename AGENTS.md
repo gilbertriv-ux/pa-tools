@@ -49,6 +49,7 @@ The crate names are upstream's and stay (`UPSTREAM.md`).
 | Layer | Crate | Role |
 |---|---|---|
 | L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops |
+| L0 | `soundcraft-bitstream`, `soundcraft-isobmff`, `soundcraft-aac`, `soundcraft-ogg`, `soundcraft-opus-decode`, `soundcraft-opus` | Compressed-audio export: bit I/O, MP4 container, AAC-LC encoder/decoder (feature `aac-encode`, off in shipped builds), Ogg demuxer and Opus decoder (test tools), Opus encoder + Ogg writer (`docs/audio-codecs.md`) |
 | L1 | `soundcraft-dsp` | Plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utility, instruments), offline processing, meters, FFT |
 | L2 | `soundcraft-model` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups) |
 | L3 | `soundcraft-mix` | Mix engine shared by realtime playback and offline bounce |
