@@ -176,15 +176,34 @@ struct GopState {
     ready: BTreeMap<usize, Yuv>,
 }
 
-/// A tiny LRU of decoded frames.
+/// Most bytes of decoded RGBA pictures the full-size frame cache keeps by default (1 GiB). The frame
+/// count cap alone is not a memory bound: 12 frames are 400 MB at 4K but 1.7 GB at 8K UHD and 3.2 GB
+/// at 8192 x 8192. See [`Movie::set_cache_bytes`].
+pub const DEFAULT_CACHE_BYTES: usize = 1 << 30;
+
+/// Most bytes the thumbnail cache keeps (a timeline thumbnail is a few tens of kilobytes, so this
+/// only bites if someone asks for very tall ones).
+const THUMB_CACHE_BYTES: usize = 256 << 20;
+
+/// Most pictures, and most bytes of them, a running decoder keeps for requests that have not come
+/// yet. In practice it is the reorder depth (a few pictures); the byte bound is for 8K pictures, which
+/// are about 100 MB each in 10-bit 4:2:0.
+const READY_MAX_PICTURES: usize = 32;
+const READY_MAX_BYTES: usize = 256 << 20;
+
+/// A tiny LRU of decoded frames, bounded by count and by bytes of picture data. The newest entry is
+/// always kept, even when it alone is over the byte bound. (Callers that still hold an evicted frame
+/// keep it alive; the bound covers what the cache itself holds.)
 struct Lru<K: PartialEq + Copy> {
     cap: usize,
+    byte_cap: usize,
+    bytes: usize,
     items: VecDeque<(K, Arc<Frame>)>,
 }
 
 impl<K: PartialEq + Copy> Lru<K> {
-    fn new(cap: usize) -> Self {
-        Lru { cap: cap.max(1), items: VecDeque::new() }
+    fn new(cap: usize, byte_cap: usize) -> Self {
+        Lru { cap: cap.max(1), byte_cap: byte_cap.max(1), bytes: 0, items: VecDeque::new() }
     }
     fn get(&mut self, k: K) -> Option<Arc<Frame>> {
         let i = self.items.iter().position(|(x, _)| *x == k)?;
@@ -194,14 +213,34 @@ impl<K: PartialEq + Copy> Lru<K> {
         Some(f)
     }
     fn put(&mut self, k: K, f: Arc<Frame>) {
-        self.items.retain(|(x, _)| *x != k);
+        if let Some(i) = self.items.iter().position(|(x, _)| *x == k)
+            && let Some((_, old)) = self.items.remove(i)
+        {
+            self.bytes = self.bytes.saturating_sub(old.rgba.len());
+        }
+        self.bytes = self.bytes.saturating_add(f.rgba.len());
         self.items.push_back((k, f));
-        while self.items.len() > self.cap {
-            self.items.pop_front();
+        self.trim();
+    }
+    /// Drop the oldest entries until the count and byte bounds hold (the newest one stays).
+    fn trim(&mut self) {
+        while self.items.len() > 1 && (self.items.len() > self.cap || self.bytes > self.byte_cap) {
+            let Some((_, old)) = self.items.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(old.rgba.len());
         }
     }
     fn contains(&self, k: K) -> bool {
         self.items.iter().any(|(x, _)| *x == k)
+    }
+}
+
+/// Drop the highest-numbered pictures of `ready` until at most `max_pictures` and `max_bytes` are
+/// held. The lowest-numbered one always stays (it is the next one a sequential reader asks for).
+fn trim_ready(ready: &mut BTreeMap<usize, Yuv>, max_pictures: usize, max_bytes: usize) {
+    let mut bytes: usize = ready.values().fold(0, |a, y| a.saturating_add(y.byte_len()));
+    while ready.len() > 1 && (ready.len() > max_pictures || bytes > max_bytes) {
+        let Some((_, y)) = ready.pop_last() else { break };
+        bytes = bytes.saturating_sub(y.byte_len());
     }
 }
 
@@ -353,7 +392,20 @@ impl Movie {
             has_audio,
             quicktime: mp4.is_quicktime,
         };
-        Ok(Movie { src, mp4, track, info, codec, order, rank, times, gop: None, cache: Lru::new(12), thumbs: Lru::new(256), decoded: 0 })
+        Ok(Movie {
+            src,
+            mp4,
+            track,
+            info,
+            codec,
+            order,
+            rank,
+            times,
+            gop: None,
+            cache: Lru::new(12, DEFAULT_CACHE_BYTES),
+            thumbs: Lru::new(256, THUMB_CACHE_BYTES),
+            decoded: 0,
+        })
     }
 
     pub fn info(&self) -> &MovieInfo {
@@ -376,9 +428,26 @@ impl Movie {
         self
     }
 
-    /// Frames kept decoded (full size). Thumbnails have their own cache.
+    /// Frames kept decoded (full size). Thumbnails have their own cache. The byte bound of
+    /// [`Movie::set_cache_bytes`] applies as well, so a large count of large frames is still held to it.
     pub fn set_cache_frames(&mut self, n: usize) {
         self.cache.cap = n.clamp(1, 512);
+        self.cache.trim();
+    }
+
+    /// Most bytes of decoded RGBA pictures the full-size frame cache keeps (default
+    /// [`DEFAULT_CACHE_BYTES`], 1 GiB). The oldest frames are dropped first, and the newest frame
+    /// always stays, so a single picture larger than the bound is still cached. This bounds the cache
+    /// only: decoder state, the pictures a running decoder holds for coming requests, and frames the
+    /// caller keeps are on top (see `docs/video-codecs.md`).
+    pub fn set_cache_bytes(&mut self, bytes: usize) {
+        self.cache.byte_cap = bytes.max(1);
+        self.cache.trim();
+    }
+
+    /// Bytes of picture data the full-size frame cache holds now.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.bytes
     }
 
     /// The frame shown at `secs` (presentation index), or `None` before the first / after the
@@ -602,6 +671,14 @@ impl Movie {
             if let Some(yuv) = st.ready.remove(&index) {
                 return Ok(Arc::new(self.yuv_frame(&yuv, index)?));
             }
+            // Decoders output in presentation order, so once output has gone past `index` without
+            // producing it the picture is not coming (a damaged sample, or a picture the stream does
+            // not output). Stop here rather than decode the rest of the movie, and leave the decoder
+            // where it is: the pictures after `index` that it already output wait in `ready`, so the
+            // next frame still comes from this decoder.
+            if st.last_out.is_some_and(|lo| lo > index) {
+                break;
+            }
             if st.next == usize::MAX {
                 break;
             }
@@ -637,17 +714,113 @@ impl Movie {
             let Some(st) = self.gop.as_mut() else { break };
             for p in pics {
                 let q = usize::try_from(p.pts).unwrap_or(usize::MAX);
-                st.last_out = Some(q);
+                st.last_out = Some(st.last_out.map_or(q, |lo| lo.max(q)));
                 self.decoded += 1;
                 if q >= index {
                     st.ready.insert(q, p.yuv);
                 }
             }
-            // Pictures waiting for a later request (bounded by the reorder depth in practice).
-            while st.ready.len() > 32 {
-                st.ready.pop_last();
-            }
+            // Pictures waiting for a later request: bounded by count and by bytes.
+            trim_ready(&mut st.ready, READY_MAX_PICTURES, READY_MAX_BYTES);
         }
-        Err(VideoError::Decode(last_err.unwrap_or_else(|| format!("frame {index} was not produced"))))
+        Err(VideoError::Decode(last_err.unwrap_or_else(|| format!("frame {index} could not be decoded"))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::Planes;
+
+    fn frame(bytes: usize, index: usize) -> Arc<Frame> {
+        Arc::new(Frame { width: 1, height: 1, rgba: vec![0; bytes], index, time: 0.0 })
+    }
+
+    fn yuv(bytes: usize, wide: bool) -> Yuv {
+        let planes = if wide {
+            Planes::U16 { y: vec![0; bytes / 2], u: Vec::new(), v: Vec::new() }
+        } else {
+            Planes::U8 { y: vec![0; bytes], u: Vec::new(), v: Vec::new() }
+        };
+        Yuv {
+            width: 1,
+            height: 1,
+            planes,
+            y_stride: 1,
+            uv_stride: 1,
+            cx: 2,
+            cy: 2,
+            bit_depth: if wide { 10 } else { 8 },
+            matrix: 1,
+            full_range: false,
+        }
+    }
+
+    #[test]
+    fn the_frame_cache_evicts_the_oldest_frames_by_bytes() {
+        let mut c: Lru<usize> = Lru::new(100, 1000);
+        for i in 0..5 {
+            c.put(i, frame(400, i));
+        }
+        // 400-byte frames under a 1000-byte bound: only the two newest fit
+        assert_eq!((c.items.len(), c.bytes), (2, 800));
+        assert!(!c.contains(2) && c.contains(3) && c.contains(4));
+        // a hit makes a frame the newest, so it outlives an older one
+        assert!(c.get(3).is_some());
+        c.put(5, frame(400, 5));
+        assert!(c.contains(3) && c.contains(5) && !c.contains(4));
+        // replacing a key swaps its bytes instead of adding them
+        c.put(5, frame(100, 5));
+        assert_eq!(c.bytes, 500);
+        // the count cap still applies when the bytes are small
+        let mut small: Lru<usize> = Lru::new(3, 1 << 30);
+        for i in 0..10 {
+            small.put(i, frame(10, i));
+        }
+        assert_eq!((small.items.len(), small.bytes), (3, 30));
+    }
+
+    #[test]
+    fn a_picture_over_the_byte_bound_is_still_kept_alone() {
+        let mut c: Lru<usize> = Lru::new(12, 100);
+        c.put(0, frame(50, 0));
+        c.put(1, frame(5000, 1));
+        assert_eq!((c.items.len(), c.bytes), (1, 5000));
+        assert!(c.contains(1));
+        c.put(2, frame(60, 2));
+        assert!(c.contains(2) && !c.contains(1) && c.bytes == 60, "the huge frame goes once a newer one arrives");
+    }
+
+    #[test]
+    fn the_default_budget_is_one_gibibyte_and_holds_eight_k_frames() {
+        assert_eq!(DEFAULT_CACHE_BYTES, 1 << 30);
+        // 12 RGBA frames: 400 MB at 4K but 1.7 GB at 8K UHD and 3.2 GB at 8192 x 8192, so the count
+        // alone is no bound; the byte budget holds 6 frames of 8K UHD and 4 of 8192 x 8192.
+        let uhd8k = 7680usize * 4320 * 4;
+        let square = 8192usize * 8192 * 4;
+        assert!(12 * uhd8k > DEFAULT_CACHE_BYTES && 12 * square > DEFAULT_CACHE_BYTES);
+        assert_eq!((DEFAULT_CACHE_BYTES / uhd8k, DEFAULT_CACHE_BYTES / square), (8, 4));
+        assert!(12 * 3840 * 2160 * 4 < DEFAULT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn ready_pictures_are_bounded_by_count_and_bytes_and_the_lowest_stays() {
+        let mut r: BTreeMap<usize, Yuv> = (10..20).map(|i| (i, yuv(1000, false))).collect();
+        trim_ready(&mut r, 32, 3500);
+        assert_eq!(r.keys().copied().collect::<Vec<_>>(), [10, 11, 12], "the highest numbers go first");
+        trim_ready(&mut r, 2, usize::MAX);
+        assert_eq!(r.len(), 2);
+        // 16-bit pictures count two bytes a sample
+        let mut w: BTreeMap<usize, Yuv> = (0..4).map(|i| (i, yuv(1000, true))).collect();
+        assert_eq!(w[&0].byte_len(), 1000);
+        trim_ready(&mut w, 32, 2500);
+        assert_eq!(w.len(), 2);
+        // one picture over the bound is kept: it is the one being asked for
+        let mut one: BTreeMap<usize, Yuv> = BTreeMap::from([(7, yuv(10_000, false)), (8, yuv(10_000, false))]);
+        trim_ready(&mut one, 32, 5);
+        assert_eq!(one.keys().copied().collect::<Vec<_>>(), [7]);
+        let mut empty: BTreeMap<usize, Yuv> = BTreeMap::new();
+        trim_ready(&mut empty, 0, 0);
+        assert!(empty.is_empty());
     }
 }

@@ -252,6 +252,14 @@ pub struct Yuv {
 }
 
 impl Yuv {
+    /// Bytes the sample planes occupy (what holding the picture costs).
+    pub fn byte_len(&self) -> usize {
+        match &self.planes {
+            Planes::U8 { y, u, v } => y.len().saturating_add(u.len()).saturating_add(v.len()),
+            Planes::U16 { y, u, v } => y.len().saturating_add(u.len()).saturating_add(v.len()).saturating_mul(2),
+        }
+    }
+
     /// Convert to packed 8-bit RGBA (`width * height * 4` bytes; empty when the size is zero or
     /// larger than this crate decodes).
     pub fn to_rgba(&self) -> Vec<u8> {

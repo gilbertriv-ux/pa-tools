@@ -301,6 +301,64 @@ fn a_damaged_sample_is_skipped_and_reported_plainly() {
     assert_shows(&m.frame(4).unwrap(), &layout, 4);
 }
 
+/// A long run of 60 pictures in display order (one key frame, then inter pictures).
+fn long_run() -> Layout {
+    (0..60).map(|i| (i, if i == 0 { KEY } else { INTER })).collect()
+}
+
+/// A request for a picture the stream never produces (here a damaged sample) must not decode the rest
+/// of the movie: it stops once the decoder's output has gone past the picture. Before this, asking for
+/// the damaged frame of a 48-frame HEVC file decoded 47 pictures, holding up to 32 of them.
+#[test]
+fn a_request_for_a_damaged_frame_stops_early_and_the_next_frame_still_decodes() {
+    let layout = long_run();
+    let (mut m, log) = scripted(&layout, Script { fail_on: Some(30), ..Script::default() }); // sample 30 shows picture 30
+    let err = m.frame(30).unwrap_err();
+    assert_eq!(err, VideoError::Decode("mock damaged".into()));
+    let fed_now = fed(&log);
+    // the decoder holds `depth` (2) pictures back, so it is past picture 30 a few samples later
+    assert!(fed_now.len() <= 30 + 1 + 3, "fed {} of 60 samples", fed_now.len());
+    assert_eq!(fed_now, (0..fed_now.len() as u8).collect::<Vec<_>>(), "decode order, from the key frame");
+    assert!(m.decoded <= 33, "{} of 60 pictures decoded", m.decoded);
+    assert_eq!(created(&log), 1);
+    // the pictures after it that were already output are still available, from the same decoder
+    let fed_before = fed(&log).len();
+    assert_shows(&m.frame(31).unwrap(), &layout, 31);
+    assert_shows(&m.frame(32).unwrap(), &layout, 32);
+    assert_eq!(created(&log), 1, "the running decoder carries on");
+    assert!(fed(&log).len() <= fed_before + 3, "no restart, no extra samples beyond the next frames");
+    // and asking for the damaged frame again fails the same way, again without running to the end
+    let before = fed(&log).len();
+    assert_eq!(m.frame(30).unwrap_err(), VideoError::Decode("mock damaged".into()));
+    assert!(fed(&log).len() - before <= 30 + 1 + 3, "a second request is bounded the same way");
+}
+
+/// The full-size frame cache is held to its byte budget, not only to its frame count.
+#[test]
+fn the_frame_cache_is_bounded_by_bytes() {
+    let layout = long_run();
+    let (mut m, _) = scripted(&layout, Script::default());
+    m.set_cache_frames(512);
+    // each decoded frame is 2 x 2 x 4 = 16 bytes: a 40-byte budget keeps two
+    m.set_cache_bytes(40);
+    for i in 0..10 {
+        assert_shows(&m.frame(i).unwrap(), &layout, i as i64);
+    }
+    assert_eq!(m.cached_bytes(), 32);
+    assert!(m.is_cached(9) && m.is_cached(8) && !m.is_cached(7));
+    // lowering the budget trims at once; the newest frame stays whatever the budget
+    m.set_cache_bytes(1);
+    assert_eq!(m.cached_bytes(), 16);
+    assert!(m.is_cached(9));
+    // raising the count cannot get round the bytes, and frames come back when asked for
+    m.set_cache_bytes(1 << 20);
+    for i in 0..10 {
+        let _ = m.frame(i).unwrap();
+    }
+    assert_eq!(m.cached_bytes(), 160);
+    assert_eq!(crate::DEFAULT_CACHE_BYTES, 1 << 30);
+}
+
 #[test]
 fn an_unsupported_stream_stops_decoding_at_once() {
     let layout = open_gop();

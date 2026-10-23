@@ -67,7 +67,7 @@ pub mod synth;
 pub mod vc3;
 
 pub use isobmff::ByteSource;
-pub use movie::{Frame, Movie, MovieInfo, SharedSource, fit_size};
+pub use movie::{DEFAULT_CACHE_BYTES, Frame, Movie, MovieInfo, SharedSource, fit_size};
 
 /// Errors from opening or decoding a movie.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
