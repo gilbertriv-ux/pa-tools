@@ -49,6 +49,26 @@ fn merr(e: candle_core::Error) -> SpeechError {
     SpeechError::Model(e.to_string())
 }
 
+/// The error for numbers that are not numbers: a network whose weights are all finite can still
+/// overflow while it runs (a weight of 3e38 makes the first layer's sums infinite), and what it
+/// then answers is noise that reads as a transcript (`!!!!!!!!!!`). `what` says where it was seen.
+fn invalid_numbers(what: &str) -> SpeechError {
+    SpeechError::Model(format!(
+        "the speech model produced invalid numbers in its {what} (not a number, or too large); its files may be damaged, so nothing was transcribed"
+    ))
+}
+
+/// `Ok` when every value is finite, else [`invalid_numbers`] for `what`.
+fn ensure_finite(values: &[f32], what: &str) -> Result<(), SpeechError> {
+    if values.iter().all(|v| v.is_finite()) { Ok(()) } else { Err(invalid_numbers(what)) }
+}
+
+/// [`ensure_finite`] for a whole tensor (the encoder's output: 1500 x width values per window).
+fn ensure_tensor_finite(t: &Tensor, what: &str) -> Result<(), SpeechError> {
+    let values = t.flatten_all().and_then(|f| f.to_dtype(candle_core::DType::F32)).and_then(|f| f.to_vec1::<f32>()).map_err(merr)?;
+    ensure_finite(&values, what)
+}
+
 /// Convert the internal tick-based transcript to the public `f64`-seconds transcript.
 fn to_public(t: &Transcript) -> crate::Transcript {
     crate::Transcript {
@@ -175,6 +195,7 @@ impl Whisper {
         m.decoder.reset();
         let (logits, _) = m.decoder.forward(&[self.tok.sot], xa, false, None).map_err(merr)?;
         let l = Model::last_logits(&logits).map_err(merr)?;
+        ensure_finite(&l, "language detection")?;
         let score = |id: u32| l.get(id as usize).copied().unwrap_or(f32::NEG_INFINITY);
         let best = self.tok.languages.iter().max_by(|a, b| score(a.1).total_cmp(&score(b.1))).map(|x| x.0.clone());
         Ok(best.unwrap_or_else(|| "en".into()))
@@ -244,8 +265,10 @@ impl Whisper {
         let (logits, _) = m.decoder.forward(prompt, xa, true, None).map_err(merr)?;
         // no-speech probability from the start-of-transcript position
         let first = logits.get(0).and_then(|l| l.get(0)).and_then(|l| l.to_vec1::<f32>()).map_err(merr)?;
+        ensure_finite(&first, "word choices")?;
         let no_speech = self.tok.no_speech.map(|ns| softmax_at(&first, ns as usize)).unwrap_or(0.0);
         let mut cur = Model::last_logits(&logits).map_err(merr)?;
+        ensure_finite(&cur, "word choices")?;
         let mut sum_lp = 0f32;
         for _ in 0..MAX_TOKENS.min(m.cfg.max_target_positions / 2) {
             let lp = log_softmax(&cur);
@@ -261,6 +284,7 @@ impl Whisper {
             }
             let (logits, _) = m.decoder.forward(&[next], xa, true, None).map_err(merr)?;
             cur = Model::last_logits(&logits).map_err(merr)?;
+            ensure_finite(&cur, "word choices")?;
         }
         let avg = sum_lp / (seq.len() + 1) as f32;
         Ok((seq, avg, no_speech))
@@ -297,6 +321,7 @@ impl Whisper {
             let win = Self::window(&mel, n_mels, frames, seek);
             let x = Tensor::from_vec(win, (1, n_mels, N_FRAMES), &m.device).map_err(merr)?;
             let xa = m.encoder.forward(&x).map_err(merr)?;
+            ensure_tensor_finite(&xa, "audio analysis")?;
             let mut prompt = vec![self.tok.sot];
             if self.tok.multilingual() {
                 if language.is_none() {
@@ -519,6 +544,26 @@ mod tests {
         assert!(alignment_heads(&serde_json::json!({"alignment_heads": [[2, 3], [4, 0]]}), &cfg).is_err());
         // None listed: the decoder's second half.
         assert_eq!(alignment_heads(&serde_json::json!({}), &cfg).unwrap().len(), 2 * 6);
+    }
+
+    #[test]
+    fn numbers_that_are_not_numbers_are_an_error_naming_where() {
+        assert!(ensure_finite(&[], "x").is_ok());
+        assert!(ensure_finite(&[0.0, -1.5, f32::MAX, f32::MIN, f32::MIN_POSITIVE / 2.0], "x").is_ok(), "large and subnormal values are numbers");
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = ensure_finite(&[1.0, bad, 2.0], "audio analysis").unwrap_err();
+            let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+            assert!(text.starts_with("the speech model produced invalid numbers in its audio analysis"), "{text}");
+            assert!(!text.to_lowercase().contains("whisper"), "no third-party name in what people read: {text}");
+        }
+        // The same for a tensor (what the encoder returns).
+        let dev = candle_core::Device::Cpu;
+        let fine = Tensor::from_vec(vec![0.5f32, -2.0, 1e30, 0.0], (1, 2, 2), &dev).unwrap();
+        assert!(ensure_tensor_finite(&fine, "audio analysis").is_ok());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let t = Tensor::from_vec(vec![0.5f32, bad, 1.0, 0.0], (1, 2, 2), &dev).unwrap();
+            assert!(matches!(ensure_tensor_finite(&t, "audio analysis"), Err(SpeechError::Model(m)) if m.contains("invalid numbers")), "{bad}");
+        }
     }
 
     #[test]

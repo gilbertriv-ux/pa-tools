@@ -107,12 +107,20 @@ impl Tokenizer {
             return Err(bad(&format!("{} added tokens, but the model's vocab_size is {vocab_size}", added.len())));
         }
         let mut special = HashMap::new();
-        let mut special_by_id = HashMap::new();
+        let mut special_by_id: HashMap<u32, String> = HashMap::new();
         for a in added {
             let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str()) else { continue };
             let id = u32::try_from(id).ok().filter(|&i| (i as usize) < vocab_size);
             let Some(id) = id else { return Err(bad(&format!("added token {c:?} has an id outside 0..{vocab_size}"))) };
-            special.insert(c.to_string(), id);
+            // Every special token has an id of its own. Two that share one (the start token given
+            // the end token's id, say) make the decoder start where it should stop, and the model
+            // answers with noise that reads as a transcript.
+            if let Some(other) = special_by_id.get(&id).filter(|other| other.as_str() != c) {
+                return Err(bad(&format!("the special tokens {other} and {c} share the id {id}; each one needs an id of its own")));
+            }
+            if let Some(first) = special.insert(c.to_string(), id).filter(|first| *first != id) {
+                return Err(bad(&format!("the special token {c} is listed with two ids ({first} and {id})")));
+            }
             special_by_id.insert(id, c.to_string());
         }
         let get = |k: &str| special.get(k).copied();
@@ -331,7 +339,9 @@ mod tests {
         // `<|0.00|>` at id 0: "id >= timestamp_begin" would be true of every token.
         for id in [0u32, 1, 50, 89, 93, 99] {
             let err = Tokenizer::from_json(&with_timestamp_begin(id), VOCAB).err().unwrap_or_else(|| panic!("<|0.00|> at {id} was accepted"));
-            assert!(err.to_string().contains("timestamp"), "{id}: {err}");
+            // On the id of another special token (90..=95 here) the clash is the first thing said.
+            let expect = if (90..=95).contains(&id) { "share the id" } else { "timestamp" };
+            assert!(err.to_string().contains(expect), "{id}: {err}");
         }
     }
 
@@ -366,6 +376,73 @@ mod tests {
         // A text token past `<|0.00|>`.
         let err = Tokenizer::from_json(&json(r#"{"a": 0, "late": 600}"#, ""), VOCAB).err().unwrap();
         assert!(err.to_string().contains("after every other token"), "{err}");
+    }
+
+    /// A tokenizer whose special tokens are exactly `added` (content, id); text ids are 0 only.
+    fn with_specials(added: &[(&str, u32)]) -> String {
+        let list: Vec<String> = added.iter().map(|(c, id)| format!(r#"{{"id": {id}, "content": {}}}"#, serde_json::to_string(c).unwrap())).collect();
+        format!(r#"{{"model": {{"vocab": {{"a": 0, "b": 1}}}}, "added_tokens": [{}]}}"#, list.join(", "))
+    }
+
+    /// Every token the decoder gives a job to, in their usual places: end, start, two languages,
+    /// translate, transcribe, start-of-previous, no-speech, no-timestamps, then the timestamps.
+    const ROLES: [(&str, u32); 11] = [
+        ("<|endoftext|>", 90),
+        ("<|startoftranscript|>", 91),
+        ("<|en|>", 92),
+        ("<|de|>", 93),
+        ("<|translate|>", 94),
+        ("<|transcribe|>", 95),
+        ("<|startofprev|>", 96),
+        ("<|nospeech|>", 97),
+        ("<|notimestamps|>", 98),
+        ("<|0.00|>", 100),
+        ("<|0.02|>", 101),
+    ];
+
+    /// Two special tokens that share an id are refused, whichever two they are, and the message
+    /// names both. The reviewer's case: the start token given the end token's id (50257).
+    #[test]
+    fn special_tokens_that_share_an_id_are_refused_naming_both() {
+        let ok = Tokenizer::from_json(&with_specials(&ROLES), VOCAB).unwrap();
+        assert_eq!((ok.eot, ok.sot, ok.transcribe, ok.no_timestamps, ok.timestamp_begin), (90, 91, 95, 98, 100));
+        assert_eq!((ok.translate, ok.no_speech), (Some(94), Some(97)));
+        assert_eq!(ok.languages, vec![("en".to_string(), 92), ("de".to_string(), 93)]);
+        let mut clashes = 0;
+        for (i, (moved, _)) in ROLES.iter().enumerate() {
+            for (j, (other, id)) in ROLES.iter().enumerate().filter(|(j, _)| *j != i) {
+                let mut roles = ROLES;
+                roles[i].1 = *id;
+                let err = Tokenizer::from_json(&with_specials(&roles), VOCAB)
+                    .err()
+                    .unwrap_or_else(|| panic!("{moved} given the id of {other} was accepted"));
+                let text = err.to_string();
+                assert!(
+                    text.contains(moved) && text.contains(other) && text.contains(&format!("share the id {id}")),
+                    "{moved} on {other} ({j}): {text}"
+                );
+                clashes += 1;
+            }
+        }
+        assert_eq!(clashes, ROLES.len() * (ROLES.len() - 1));
+        // The craft case, spelled out: <|startoftranscript|> on the end-of-text id.
+        let mut roles = ROLES;
+        roles[1].1 = roles[0].1;
+        let text = Tokenizer::from_json(&with_specials(&roles), VOCAB).err().unwrap().to_string();
+        assert_eq!(
+            text,
+            "model: tokenizer.json: the special tokens <|endoftext|> and <|startoftranscript|> share the id 90; each one needs an id of its own"
+        );
+    }
+
+    #[test]
+    fn a_special_token_listed_twice_is_fine_only_with_the_same_id() {
+        let mut twice = ROLES.to_vec();
+        twice.push(("<|transcribe|>", 95));
+        assert!(Tokenizer::from_json(&with_specials(&twice), VOCAB).is_ok(), "the same token and id twice is harmless");
+        twice.push(("<|transcribe|>", 99));
+        let err = Tokenizer::from_json(&with_specials(&twice), VOCAB).err().unwrap().to_string();
+        assert!(err.contains("<|transcribe|>") && err.contains("two ids") && err.contains("95") && err.contains("99"), "{err}");
     }
 
     #[test]
