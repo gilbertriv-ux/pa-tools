@@ -108,3 +108,16 @@ So: the `transcribe` engine command + MCP tool add real capability but flip **no
 ## Lane boundary
 Codex edits only `crates/pa-speech/**`, `ATTRIBUTION.md`, the one root-`Cargo.toml` members/deps line, and the
 two `xtask/src/main.rs` layer lines. The `transcribe` command + MCP tool, transcript store, and UI are Claude's.
+
+## Addendum — after the hardening pass (what differs from the contract above)
+- `SpeechError` has two more variants than listed: `ModelUnavailable(String)` (no searched folder has
+  the model; the text names every place looked in) and `TooLong(String)` (audio over
+  `MAX_AUDIO_SECS`, 4 hours). `NotInstalled` now reads "is not installed" (nothing downloads a model
+  yet).
+- `ModelSearch::from_environment(product_folder, xdg_folder)` takes the two application-data folder
+  names from the caller's brand. Windows looks in `%LOCALAPPDATA%` first, `%APPDATA%` as the fallback.
+- `track.transcribe` reports `status: "ok"` or `status: "model_unavailable"` (with `error` naming every
+  place searched, and a `hint`). There is no `no_models_dir` status: every miss reads the same way.
+  Both `track.transcribe` and `track.set_transcript` are undoable.
+- `Whisper::load` validates the folder's contents (configuration ranges, every token id against the
+  vocabulary, alignment heads) before it reads the weights; a bad folder is an `Err`.

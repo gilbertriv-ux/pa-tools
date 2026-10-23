@@ -8,15 +8,17 @@
 //! 2. the application bundle's resources, `<bundle>/Contents/Resources/models` (macOS: found from
 //!    the running executable at `<bundle>/Contents/MacOS/<bin>`; elsewhere that path never matches);
 //! 3. the user's application data folder, where a download is stored:
-//!    - macOS: `~/Library/Application Support/<product name>/models`;
-//!    - Windows: `%APPDATA%\<product name>\models`;
-//!    - elsewhere: `$XDG_DATA_HOME/<folder>/models`, else `~/.local/share/<folder>/models`, where
-//!      `<folder>` is the product name in lower case without spaces ([`folder_slug`]).
+//!    - macOS: `~/Library/Application Support/<product folder>/models`;
+//!    - Windows: `%LOCALAPPDATA%\<product folder>\models`, else `%APPDATA%\<product folder>\models`
+//!      (downloaded models are large and belong to this machine, so they go in the local, non-roaming
+//!      folder; the roaming one is only the fallback when the other is not set);
+//!    - elsewhere: `$XDG_DATA_HOME/<xdg folder>/models`, else `~/.local/share/<xdg folder>/models`.
 //!
-//! The crate is standalone and does not know the product's name: the caller passes it in
-//! ([`ModelSearch::from_environment`]). Nothing here reads the environment except
-//! `from_environment`; [`ModelSearch::from_parts`] takes the lookups as arguments so that the
-//! locations can be tested without touching the process environment.
+//! The crate is standalone and does not know the product's names: the caller passes in the folder
+//! names ([`ModelSearch::from_environment`]; the engine passes the brand's `CONFIG_DIR_NAME` and
+//! `CONFIG_DIR_XDG`, so the models sit beside the settings under the same names). Nothing here
+//! reads the environment except `from_environment`; [`ModelSearch::from_parts`] takes the lookups
+//! as arguments so that the locations can be tested without touching the process environment.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -63,26 +65,33 @@ pub struct ModelSearch {
 }
 
 impl ModelSearch {
-    /// The search for the running program on this system. `product_name` is the product's display
-    /// name (it names the application data folder on macOS and Windows).
-    pub fn from_environment(product_name: &str) -> ModelSearch {
+    /// The search for the running program on this system. `product_folder` names the application
+    /// data folder on macOS and Windows (`Pa Tools`), `xdg_folder` the one on Linux and the other
+    /// Unixes (`patools`); the caller takes both from its brand.
+    pub fn from_environment(product_folder: &str, xdg_folder: &str) -> ModelSearch {
         // Follow symbolic links, so a command-line shim that points into a bundle still finds it.
         let exe = std::env::current_exe().ok().map(|p| p.canonicalize().unwrap_or(p));
-        ModelSearch::from_parts(Platform::current(), product_name, |name| std::env::var_os(name), exe.as_deref())
+        ModelSearch::from_parts(Platform::current(), product_folder, xdg_folder, |name| std::env::var_os(name), exe.as_deref())
     }
 
     /// [`from_environment`](Self::from_environment) with the environment lookup, the executable's
     /// path and the platform given. An unset or empty variable counts as absent.
-    pub fn from_parts(platform: Platform, product_name: &str, env: impl Fn(&str) -> Option<OsString>, exe: Option<&Path>) -> ModelSearch {
+    pub fn from_parts(
+        platform: Platform,
+        product_folder: &str,
+        xdg_folder: &str,
+        env: impl Fn(&str) -> Option<OsString>,
+        exe: Option<&Path>,
+    ) -> ModelSearch {
         let var = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
         let app_support = match platform {
-            Platform::Mac => var("HOME").map(|h| h.join("Library").join("Application Support").join(product_name).join(MODELS_SUBDIR)),
-            Platform::Windows => var("APPDATA").map(|a| a.join(product_name).join(MODELS_SUBDIR)),
+            Platform::Mac => var("HOME").map(|h| h.join("Library").join("Application Support").join(product_folder).join(MODELS_SUBDIR)),
+            Platform::Windows => var("LOCALAPPDATA").or_else(|| var("APPDATA")).map(|a| a.join(product_folder).join(MODELS_SUBDIR)),
             // The XDG rules ignore a relative `XDG_DATA_HOME`.
             Platform::Other => var("XDG_DATA_HOME")
                 .filter(|d| d.is_absolute())
                 .or_else(|| var("HOME").map(|h| h.join(".local").join("share")))
-                .map(|d| d.join(folder_slug(product_name)).join(MODELS_SUBDIR)),
+                .map(|d| d.join(xdg_folder).join(MODELS_SUBDIR)),
         };
         ModelSearch { env: var(MODELS_DIR_ENV), bundle_resources: exe.and_then(bundle_resources), app_support }
     }
@@ -95,12 +104,6 @@ impl ModelSearch {
             ("application data", "no home folder", self.app_support.as_deref()),
         ]
     }
-}
-
-/// The product name as a folder name for the XDG locations: lower case letters and digits only
-/// (`"Pa Tools"` becomes `"patools"`).
-pub fn folder_slug(product_name: &str) -> String {
-    product_name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// `<bundle>/Contents/Resources/models` for an executable at `<bundle>/Contents/MacOS/<bin>`.

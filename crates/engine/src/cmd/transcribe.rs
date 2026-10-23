@@ -1,11 +1,12 @@
 //! Speech-to-text (`soundcraft-pa-speech`). Render a track's audio, downmix to mono, resample to
 //! 16 kHz, run the recogniser, and store the resulting transcript on the session.
 //!
-//! Actual recognition needs a downloaded Whisper model and a build with the `whisper` feature; the
-//! command reports a clear status (`model_unavailable`, with the reason and every place searched)
-//! when either is missing instead of failing. Where the model is looked for: an explicit
-//! `models_dir` parameter, else [`soundcraft_pa_speech::resolve_models_dir`] (`$PA_SPEECH_MODELS_DIR`,
-//! then the app bundle's resources, then the user's application data folder).
+//! Actual recognition needs the speech model on disk and a build with the speech feature (the
+//! `whisper` cargo feature); the command reports a clear status (`model_unavailable`, with the
+//! reason and every place searched) when either is missing instead of failing. Where the model is
+//! looked for: an explicit `models_dir` parameter, else [`soundcraft_pa_speech::resolve_models_dir`]
+//! (`$PA_SPEECH_MODELS_DIR`, then the app bundle's resources, then the user's application data
+//! folder). Nothing downloads the model yet: it has to be put in one of those places.
 //!
 //! Two ways in, one code path:
 //! - `track.transcribe` does everything on the calling thread (CLI, MCP, scripts).
@@ -43,8 +44,9 @@ pub fn specs() -> Vec<CommandSpec> {
             ["Track"],
             None,
             "{track?: id|name, model?: 'whisper-base', models_dir?: path, language?: 'en', diarize?: bool} — \
-             speech-to-text for a track; the model downloads first via Setup › Transcription Settings and is \
-             found automatically (`models_dir` overrides the search)",
+             speech-to-text for a track (undoable); needs a build with the speech feature and the speech model on \
+             disk: it is looked for in $PA_SPEECH_MODELS_DIR, then the app bundle's resources, then the application \
+             data folder (`models_dir` overrides the search); nothing downloads it yet; sessions over 4 hours are refused",
             always,
             transcribe
         ),
@@ -85,9 +87,10 @@ pub struct TranscribeOutcome {
 }
 
 /// Gather what `track.transcribe` needs for `p`, without recognising anything yet. The model is
-/// looked for where the running program would find it ([`ModelSearch::from_environment`]).
+/// looked for where the running program would find it ([`ModelSearch::from_environment`], with the
+/// brand's folder names).
 pub fn transcribe_job(e: &Engine, p: &Value) -> Result<TranscribeJob> {
-    transcribe_job_with(e, p, &ModelSearch::from_environment(soundcraft_brand::APP_NAME))
+    transcribe_job_with(e, p, &ModelSearch::from_environment(soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG))
 }
 
 /// [`transcribe_job`] with the places to look for the model given (tests pass their own, so no
@@ -130,6 +133,19 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
     Ok(TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts })
 }
 
+/// What to do about a `model_unavailable` outcome: where the app looks for the model, and what the
+/// build needs. Nothing here promises a download, because nothing downloads the model yet.
+fn model_hint() -> String {
+    let looked_for = "the speech model (the folder `whisper-base` with its four files) is looked for in $PA_SPEECH_MODELS_DIR, then the app \
+                      bundle's resources, then the application data folder (`error` lists the exact folders and says why a folder was \
+                      refused); pass `models_dir` to use another folder; nothing downloads the model yet, so put the folder there by hand";
+    if soundcraft_pa_speech::available() {
+        looked_for.to_string()
+    } else {
+        format!("this build does not include the speech feature, so it cannot recognise speech whatever is on disk; {looked_for}")
+    }
+}
+
 /// Refuse a session longer than [`MAX_TRANSCRIBE_SECS`] (`end` samples at `sr`) before rendering it.
 fn check_length(end: Samples, sr: SampleRate) -> Result<()> {
     let secs = end.max(0) as f64 / sr.as_f64().max(1.0);
@@ -159,15 +175,13 @@ impl TranscribeJob {
     pub fn run(self, progress: soundcraft_pa_speech::ProgressFn) -> Result<TranscribeOutcome> {
         let TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts } = self;
 
-        // A model must be on disk (and the `whisper` feature built in) to recognise speech.
+        // A model must be on disk (and the speech feature built in) to recognise speech.
         let transcriber = match models_dir.and_then(|dir| soundcraft_pa_speech::load(&dir, &model)) {
             Ok(t) => t,
             Err(err) => {
                 let result = json!({
                     "status": "model_unavailable", "track": track.0, "model": model, "error": err.to_string(),
-                    "samples_16k": audio.len(),
-                    "hint": "download the model (Setup › Transcription Settings), pass models_dir or set PA_SPEECH_MODELS_DIR, \
-                             or build with the `whisper` feature"
+                    "samples_16k": audio.len(), "hint": model_hint()
                 });
                 return Ok(TranscribeOutcome { result, transcript: None });
             }
@@ -419,6 +433,12 @@ mod tests {
         );
         assert!(out.result["samples_16k"].as_u64().unwrap() > 0);
         assert!(out.transcript.is_none());
+        // The hint says where the model is looked for and promises no download.
+        let hint = out.result["hint"].as_str().unwrap();
+        assert!(hint.contains("PA_SPEECH_MODELS_DIR") && hint.contains("app bundle") && hint.contains("application data folder"), "{hint}");
+        assert!(hint.contains("models_dir") && hint.contains("nothing downloads the model yet"), "{hint}");
+        assert!(!hint.contains("Transcription Settings"), "{hint}");
+        assert_eq!(hint.contains("does not include the speech feature"), !soundcraft_pa_speech::available(), "{hint}");
         // The old status for "no folder to look in" is gone: every miss reads the same way.
         let none = transcribe_job_with(&e, &json!({"track": t.0}), &ModelSearch::default()).unwrap().run(&mut |_, _| true).unwrap();
         assert_eq!(none.result["status"], "model_unavailable");
@@ -454,17 +474,18 @@ mod tests {
         let out =
             transcribe_job_with(&e, &json!({"track": t.0, "models_dir": empty.to_string_lossy()}), &search).unwrap().run(&mut |_, _| true).unwrap();
         assert_eq!(out.result["status"], "model_unavailable");
-        assert_eq!(out.result["error"], "the speech model `whisper-base` is not downloaded");
+        assert_eq!(out.result["error"], "the speech model `whisper-base` is not installed");
     }
 
     #[test]
     fn model_folders_are_named_from_the_brand() {
         let home = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/gil"));
-        let mac = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Mac, soundcraft_brand::APP_NAME, home, None);
+        let (name, xdg) = (soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG);
+        let mac = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Mac, name, xdg, home, None);
         let expected = std::path::Path::new("/home/gil/Library/Application Support").join(soundcraft_brand::CONFIG_DIR_NAME).join("models");
         assert_eq!(mac.app_support, Some(expected));
         // On the other Unixes the folder is the brand's XDG name, the same one the settings use.
-        let other = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Other, soundcraft_brand::APP_NAME, home, None);
+        let other = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Other, name, xdg, home, None);
         let expected = std::path::Path::new("/home/gil/.local/share").join(soundcraft_brand::CONFIG_DIR_XDG).join("models");
         assert_eq!(other.app_support, Some(expected));
     }

@@ -107,7 +107,7 @@ impl Transcript {
 pub enum SpeechError {
     #[error("stopped")]
     Cancelled,
-    #[error("the speech model `{0}` is not downloaded")]
+    #[error("the speech model `{0}` is not installed")]
     NotInstalled(String),
     /// No searched folder has the model; the text names the model and every place looked in.
     #[error("{0}")]
@@ -186,10 +186,14 @@ impl Transcriber for FixedTranscriber {
     }
 }
 
-/// Load the transcriber for catalogue model `id` from `models_dir` (feature `whisper`).
+/// Load the transcriber for catalogue model `id` from `models_dir`.
 ///
-/// Validates the catalogue and that the model is installed, then (feature `whisper`) returns a real
-/// candle-backed Whisper transcriber; without the feature it reports `Unavailable`.
+/// Checks the id is in the catalogue and that every file of the model is installed at its catalogue
+/// size ([`SpeechError::UnknownModel`], [`SpeechError::NotInstalled`]). In a build with the `whisper`
+/// feature it then validates the model's contents (an `Err` for a damaged or hostile folder, never
+/// a panic) and returns the recogniser; without the feature it reports
+/// [`SpeechError::Unavailable`]. Nothing is downloaded: where `models_dir` comes from is
+/// [`resolve_models_dir`]'s business.
 pub fn load(models_dir: &std::path::Path, id: &str) -> Result<std::sync::Arc<dyn Transcriber>, SpeechError> {
     let m = models::find(id).ok_or_else(|| SpeechError::UnknownModel(id.into()))?;
     if !models::installed(models_dir, m) {
@@ -202,7 +206,7 @@ pub fn load(models_dir: &std::path::Path, id: &str) -> Result<std::sync::Arc<dyn
     #[cfg(not(feature = "whisper"))]
     {
         let _ = m;
-        Err(SpeechError::Unavailable("built without the `whisper` feature".into()))
+        Err(SpeechError::Unavailable("this build does not include the speech feature".into()))
     }
 }
 

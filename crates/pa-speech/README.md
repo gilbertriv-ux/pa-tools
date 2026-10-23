@@ -39,20 +39,28 @@ plain `f64` seconds.
   the real-model test skips there.
 
 ## Models
-Whisper weights (`openai/whisper-*` on Hugging Face, MIT) are downloaded on first use into
-`<models_dir>/<id>/` and verified against pinned SHA-256s. **Weights are never bundled or
-committed** — see `.gitignore`. Default model: `whisper-base`.
+Whisper weights (`openai/whisper-*` on Hugging Face, MIT) are listed in the catalogue with pinned
+SHA-256s; the `download` feature has a verified downloader that fills `<models_dir>/<id>/`, but no
+program calls it yet. **Weights are never bundled or committed** — see `.gitignore`. Default model:
+`whisper-base`. The catalogue's display names are neutral ("Speech model, base (multilingual)");
+the author, licence and source fields keep the attribution.
 
 A running program finds the weights in this order (a folder counts only if every file of the model is
 there at its catalogue size; the first folder that has it wins):
 1. `$PA_SPEECH_MODELS_DIR`;
 2. `<app bundle>/Contents/Resources/models` (macOS, from the executable at `Contents/MacOS/<bin>`);
-3. the user's application data folder: macOS `~/Library/Application Support/<product name>/models`,
-   Windows `%APPDATA%\<product name>\models`, elsewhere `$XDG_DATA_HOME/<folder>/models` or
-   `~/.local/share/<folder>/models` (`<folder>` = the product name in lower case without spaces).
+3. the user's application data folder: macOS `~/Library/Application Support/<product folder>/models`,
+   Windows `%LOCALAPPDATA%\<product folder>\models` (else `%APPDATA%\<product folder>\models`),
+   elsewhere `$XDG_DATA_HOME/<xdg folder>/models` or `~/.local/share/<xdg folder>/models`.
 
-The crate does not know the product's name; the caller passes it to `ModelSearch::from_environment`
-(the engine passes the brand's name).
+The crate does not know the product's names; the caller passes both folder names to
+`ModelSearch::from_environment(product_folder, xdg_folder)` (the engine passes the brand's
+`CONFIG_DIR_NAME` and `CONFIG_DIR_XDG`, so the models sit beside the settings).
+
+Nothing in the app downloads a model yet: put the model's folder (`whisper-base`, with its four
+files) in one of those places. A running program refuses a folder whose files are damaged or
+implausible (`load` validates the configuration, the tokenizer and every token id before it reads
+the weights).
 
 ## Audio
 Transcribers take **mono 16 kHz** `&[f32]`. The caller resamples/downmixes first (`downmix` helps).

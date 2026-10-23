@@ -8,7 +8,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use soundcraft_pa_speech::discover::folder_slug;
 use soundcraft_pa_speech::{ModelSearch, Platform, SpeechError, models, resolve_models_dir};
 
 const MODEL: &str = "whisper-base";
@@ -126,47 +125,68 @@ fn env_of(pairs: &[(&'static str, String)]) -> impl Fn(&str) -> Option<OsString>
 fn locations_follow_each_platforms_conventions() {
     let none: Option<&Path> = None;
 
-    let mac = ModelSearch::from_parts(Platform::Mac, "Pa Tools", env_of(&[("HOME", "/Users/gil".into())]), none);
+    let mac = ModelSearch::from_parts(Platform::Mac, "Pa Tools", "patools", env_of(&[("HOME", "/Users/gil".into())]), none);
     assert_eq!(mac.app_support, Some(PathBuf::from("/Users/gil/Library/Application Support/Pa Tools/models")));
     assert_eq!((mac.env, mac.bundle_resources), (None, None));
 
-    let win = ModelSearch::from_parts(Platform::Windows, "Pa Tools", env_of(&[("APPDATA", "C:\\Users\\gil\\AppData\\Roaming".into())]), none);
-    assert_eq!(win.app_support, Some(PathBuf::from("C:\\Users\\gil\\AppData\\Roaming").join("Pa Tools").join("models")));
+    // Windows: the local (non-roaming) folder first, the roaming one only as the fallback.
+    let both = [("LOCALAPPDATA", "C:\\Users\\gil\\AppData\\Local".to_string()), ("APPDATA", "C:\\Users\\gil\\AppData\\Roaming".to_string())];
+    let win = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both), none);
+    assert_eq!(win.app_support, Some(PathBuf::from("C:\\Users\\gil\\AppData\\Local").join("Pa Tools").join("models")));
+    let roaming_only = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both[1..]), none);
+    assert_eq!(roaming_only.app_support, Some(PathBuf::from("C:\\Users\\gil\\AppData\\Roaming").join("Pa Tools").join("models")));
+    let empty_local = [("LOCALAPPDATA", String::new()), both[1].clone()];
+    let ignores_empty = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&empty_local), none);
+    assert_eq!(ignores_empty.app_support, roaming_only.app_support, "an empty LOCALAPPDATA counts as unset");
 
-    let xdg = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[("XDG_DATA_HOME", "/data".into()), ("HOME", "/home/gil".into())]), none);
+    let xdg = ModelSearch::from_parts(
+        Platform::Other,
+        "Pa Tools",
+        "patools",
+        env_of(&[("XDG_DATA_HOME", "/data".into()), ("HOME", "/home/gil".into())]),
+        none,
+    );
     assert_eq!(xdg.app_support, Some(PathBuf::from("/data/patools/models")));
-    let home = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[("HOME", "/home/gil".into())]), none);
+    let home = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("HOME", "/home/gil".into())]), none);
     assert_eq!(home.app_support, Some(PathBuf::from("/home/gil/.local/share/patools/models")));
     // A relative or empty XDG_DATA_HOME is ignored (as the XDG rules say).
     for bad in ["relative/dir", ""] {
-        let s = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[("XDG_DATA_HOME", bad.into()), ("HOME", "/home/gil".into())]), none);
+        let s = ModelSearch::from_parts(
+            Platform::Other,
+            "Pa Tools",
+            "patools",
+            env_of(&[("XDG_DATA_HOME", bad.into()), ("HOME", "/home/gil".into())]),
+            none,
+        );
         assert_eq!(s.app_support, Some(PathBuf::from("/home/gil/.local/share/patools/models")), "XDG_DATA_HOME={bad:?}");
     }
 
     // No home folder, no location: the tier is absent, not a guess.
     for platform in [Platform::Mac, Platform::Windows, Platform::Other] {
-        assert_eq!(ModelSearch::from_parts(platform, "Pa Tools", env_of(&[]), none), ModelSearch::default(), "{platform:?}");
+        assert_eq!(ModelSearch::from_parts(platform, "Pa Tools", "patools", env_of(&[]), none), ModelSearch::default(), "{platform:?}");
     }
-    assert_eq!(folder_slug("Pa Tools"), "patools");
+    // The Linux folder is the name the caller passes, not something derived from the product name.
+    let named = ModelSearch::from_parts(Platform::Other, "Pa Tools", "some-other-name", env_of(&[("HOME", "/home/gil".into())]), none);
+    assert_eq!(named.app_support, Some(PathBuf::from("/home/gil/.local/share/some-other-name/models")));
 }
 
 #[test]
 fn environment_tier_comes_from_pa_speech_models_dir_and_ignores_empty() {
-    let set = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[("PA_SPEECH_MODELS_DIR", "/models".into())]), None);
+    let set = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("PA_SPEECH_MODELS_DIR", "/models".into())]), None);
     assert_eq!(set.env, Some(PathBuf::from("/models")));
-    let empty = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[("PA_SPEECH_MODELS_DIR", String::new())]), None);
+    let empty = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("PA_SPEECH_MODELS_DIR", String::new())]), None);
     assert_eq!(empty.env, None);
 }
 
 #[test]
 fn bundle_resources_are_found_from_the_executable_inside_a_bundle() {
     let exe = Path::new("/Applications/Pa Tools.app/Contents/MacOS/pa-tools");
-    let s = ModelSearch::from_parts(Platform::Mac, "Pa Tools", env_of(&[]), Some(exe));
+    let s = ModelSearch::from_parts(Platform::Mac, "Pa Tools", "patools", env_of(&[]), Some(exe));
     assert_eq!(s.bundle_resources, Some(PathBuf::from("/Applications/Pa Tools.app/Contents/Resources/models")));
 
     // Not in a bundle (a development build, a Linux install, a bare path): no bundle tier.
     for outside in ["/usr/local/bin/pa-tools", "target/debug/pa-tools", "/opt/pa-tools/MacOS/pa-tools", "pa-tools", "/"] {
-        let s = ModelSearch::from_parts(Platform::Other, "Pa Tools", env_of(&[]), Some(Path::new(outside)));
+        let s = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[]), Some(Path::new(outside)));
         assert_eq!(s.bundle_resources, None, "{outside}");
     }
 }
@@ -176,8 +196,13 @@ fn a_macos_style_install_resolves_end_to_end() {
     // Executable in a bundle, model shipped in its Resources: found without any environment.
     let tmp = Scratch::new("bundle");
     let exe = tmp.path().join("Pa Tools.app").join("Contents").join("MacOS").join("pa-tools");
-    let search =
-        ModelSearch::from_parts(Platform::Mac, "Pa Tools", env_of(&[("HOME", tmp.path().join("home").to_string_lossy().into_owned())]), Some(&exe));
+    let search = ModelSearch::from_parts(
+        Platform::Mac,
+        "Pa Tools",
+        "patools",
+        env_of(&[("HOME", tmp.path().join("home").to_string_lossy().into_owned())]),
+        Some(&exe),
+    );
     let resources = tmp.path().join("Pa Tools.app").join("Contents").join("Resources").join("models");
     assert_eq!(search.bundle_resources.as_deref(), Some(resources.as_path()));
     assert!(matches!(resolve_models_dir(&search, MODEL), Err(SpeechError::ModelUnavailable(_))), "nothing installed yet");

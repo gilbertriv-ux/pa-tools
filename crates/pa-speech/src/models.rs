@@ -63,7 +63,7 @@ const TOKENIZER_MULTI: &str = "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec
 static CATALOGUE: &[ModelInfo] = &[
     ModelInfo {
         id: "whisper-tiny",
-        name: "Whisper tiny (multilingual)",
+        name: "Speech model, tiny (multilingual)",
         multilingual: true,
         description: "39 M parameters. Fastest; fine for clear speech, rough on noisy audio.",
         license: LICENSE,
@@ -103,7 +103,7 @@ static CATALOGUE: &[ModelInfo] = &[
     },
     ModelInfo {
         id: "whisper-base",
-        name: "Whisper base (multilingual)",
+        name: "Speech model, base (multilingual)",
         multilingual: true,
         description: "74 M parameters. The default: a good balance of speed and accuracy.",
         license: LICENSE,
@@ -143,7 +143,7 @@ static CATALOGUE: &[ModelInfo] = &[
     },
     ModelInfo {
         id: "whisper-small",
-        name: "Whisper small (multilingual)",
+        name: "Speech model, small (multilingual)",
         multilingual: true,
         description: "244 M parameters. Most accurate here; about 4× slower than base.",
         license: LICENSE,
@@ -280,7 +280,7 @@ fn download_one(
     use crate::SpeechError;
     use sha2::Digest;
     use std::io::{Read, Write};
-    let resp = agent.get(f.url).call().map_err(|e| SpeechError::Download(format!("{}: {e}", f.url)))?;
+    let resp = agent.get(f.url).call().map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
     if resp.body().content_length().is_some_and(|n| n > f.size) {
         return Err(SpeechError::Download(format!("{}: the server announces more than the {} bytes expected", f.name, f.size)));
     }
@@ -539,6 +539,22 @@ mod tests {
             // 30 s to connect and 30 s without data: pinned so they are not quietly removed.
             assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
             assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn display_text_names_no_third_party_product() {
+        // The author, licence and source fields carry the (required) attribution; what a person is
+        // shown to pick a model does not name a product or company.
+        for m in catalogue() {
+            for text in [m.name, m.description] {
+                let lower = text.to_lowercase();
+                assert!(!["whisper", "openai", "hugging"].iter().any(|n| lower.contains(n)), "{}: {text:?}", m.id);
+            }
+            assert!(m.id.starts_with("whisper-"), "the id is a file-system name and stays");
+            assert_eq!(m.author, "OpenAI");
+            assert!(m.license.contains("MIT") && m.license_url.starts_with("https://"));
+            assert!(m.source.starts_with("https://"));
         }
     }
 

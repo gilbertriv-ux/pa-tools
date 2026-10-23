@@ -121,7 +121,7 @@ fn read_fixture(path: &std::path::Path) -> Vec<f32> {
 
 #[test]
 fn transcribes_a_fixture_when_a_model_is_present() {
-    let model = resolve_models_dir(&ModelSearch::from_environment("Pa Tools"), models::DEFAULT_MODEL);
+    let model = resolve_models_dir(&ModelSearch::from_environment("Pa Tools", "patools"), models::DEFAULT_MODEL);
     let fixture = env_nonempty("PA_SPEECH_FIXTURE").map(PathBuf::from);
     let keyword = env_nonempty("PA_SPEECH_FIXTURE_KEYWORD").map(|k| k.to_string_lossy().into_owned());
     let (models_dir, fixture, keyword) = match gate(model, fixture, keyword) {
