@@ -17,6 +17,7 @@ These apply to every agent and every session, on top of everything below.
 - **Announce every folder and file at the moment you create it**, with its exact name and full path.
 - **Deliverables ship in an editable form** as well as the finished one (source project, plain `.wav`/`.mp4`, plain HTML), so that the work can be reproduced and changed.
 - **FilmCraft** (storytold/filmcraft, same licence as SoundCraft) is an allowed code donor. Nothing else is, unless it is MIT, Apache-2.0, BSD or similarly permissive and recorded in `ATTRIBUTION.md`.
+- Unmodified MPL-2.0 dependencies are allowed (decision 2026-10-23); modifying MPL-2.0 files needs a new decision.
 - **No Avid code, and no reverse-engineering of Pro Tools.** See Clean-room below.
 - **Third-party product and company names are never shown in the UI** (menus, dialogs, About window, window titles, plugin names). Describe the feature instead.
 - **No upstream marks.** The upstream project's logos, wordmarks and brand files must not appear anywhere in this repository (licence requirement, see `UPSTREAM.md`). Credit upstream in plain text only.

@@ -2,7 +2,10 @@
 <!--
   Pa Tools MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
 
-    wix build patools.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
+    wix build patools.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -d LegalDir=... -o out.msi
+
+  BinDir holds pa-tools.exe and pa-tools-cli.exe; LegalDir is the repository root, which holds
+  NOTICE, LICENSE-MIT, LICENSE-APACHE and ATTRIBUTION.md.
 
   Per-machine install into Program Files, a Start Menu shortcut, `.scraft` sessions owned by
   Pa Tools, and Pa Tools offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
@@ -89,6 +92,17 @@
 
       <Component Id="PaToolsCli" Guid="2F54EF9E-F070-4066-BAEF-88D40768AD82">
         <File Id="PaToolsCliExe" Source="$(var.BinDir)\pa-tools-cli.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- The notice and the licence texts ship with the executables. Pa Tools links Symphonia
+           (MPL-2.0), and section 3.2 of the MPL asks that a recipient of the executable form is told
+           that the source is available and where to get it: NOTICE says so. A missing file fails the
+           build (wix build cannot find its source), so an MSI never ships without them. -->
+      <Component Id="PaToolsNotices" Guid="58C86FF9-E95A-4E4C-8208-35954F8787E6">
+        <File Id="NoticeFile" Source="$(var.LegalDir)\NOTICE" KeyPath="yes" />
+        <File Id="LicenseMitFile" Source="$(var.LegalDir)\LICENSE-MIT" />
+        <File Id="LicenseApacheFile" Source="$(var.LegalDir)\LICENSE-APACHE" />
+        <File Id="AttributionFile" Source="$(var.LegalDir)\ATTRIBUTION.md" />
       </Component>
     </ComponentGroup>
   </Fragment>

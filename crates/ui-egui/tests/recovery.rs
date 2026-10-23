@@ -52,8 +52,9 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     let path = dir.join("Song.scraft");
     let mut first = launch(&root);
     first.run("session.save_as", json!({"path": path})).unwrap();
-    // An autosave is a leftover only when it is newer than the file it came from; file times have
-    // a coarse tick, so give the clock one (a fast build otherwise writes both in the same tick).
+    // An autosave counts as unsaved work when it is not older than the session file it came from;
+    // equal times are kept (`leftovers`), so the pause is no longer needed for that. It stays so the
+    // edit is strictly newer than the Save, as it is for a user.
     std::thread::sleep(std::time::Duration::from_millis(50));
     first.run("track.new", json!({"name": "Vocal"})).unwrap();
     first.close_autosave();
@@ -133,7 +134,9 @@ fn closing_the_session_or_quitting_drops_its_autosave() {
         let mut next = launch(&root);
         let left = next.leftovers[0].clone();
         next.recover(&left);
-        // recover() hands the recovered session to the background writer, which makes its folder.
+        // recover() writes the recovered session's autosave folder before it returns (it flushes the
+        // background writer), so the folder is already there. The wait is defensive: it keeps this
+        // test from depending on that.
         assert!(eventually(|| std::fs::read_dir(&root).is_ok_and(|d| d.count() == 1)), "{end}");
         next.run(end, json!({})).unwrap();
         next.close_autosave();

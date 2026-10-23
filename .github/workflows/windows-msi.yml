@@ -1,0 +1,140 @@
+# Pa Tools Windows MSI: builds the unsigned x64 and arm64 installers with the repository's own
+# packaging/windows/package.ps1 and uploads them as artifacts.
+#
+# Provenance: written for Pa Tools from public documentation (GitHub Actions, WiX v5, Microsoft
+# Learn on msiexec and Windows Installer) and from package.ps1 and patools.wxs. An earlier draft
+# contained a smoke-test step derived from storytold/craft-common-actions, which has no licence; it
+# was removed in commit ab50b38 and the step was rewritten without looking at it (see
+# docs/ci-notes-patools.md and ATTRIBUTION.md).
+#
+# * x64 is built and then smoke-tested on the same runner: packaging/windows/smoke-test.ps1 checks
+#   the MSI's ProductVersion, installs it, runs `pa-tools.exe --version` and `pa-tools-cli.exe
+#   --version`, uninstalls it and checks nothing is left. The expected version is read from
+#   `[workspace.package] version` in Cargo.toml, the one place it is set.
+# * arm64 is cross-compiled on this x64 runner (needs the MSVC ARM64 build tools, which the
+#   windows-latest image has). It cannot run here; the existing windows-arm64.yml installs and
+#   runs it on a Windows 11 ARM64 runner.
+# * Unsigned: no signing secret is passed to this workflow, so sign.ps1 prints a warning and leaves
+#   the files alone. Signed installers come from the release workflow, not from this one.
+name: Pa Tools Windows MSI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pa-tools]
+  pull_request:
+    paths:
+      - .github/workflows/windows-msi.yml
+      - packaging/windows/**
+
+permissions:
+  contents: read
+
+# A newer push to a branch or pull request cancels its older run. On `pa-tools` the group is the
+# commit, so no run is cancelled, and none is replaced: GitHub replaces a *pending* run when another
+# arrives in the same group (the same rule as ci.yml).
+concurrency:
+  group: msi-${{ github.ref == 'refs/heads/pa-tools' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
+
+env:
+  # The Rust release to build with; the same pin as ci.yml (see the note there before changing it).
+  RUST_TOOLCHAIN: "1.97.0"
+  CARGO_INCREMENTAL: "0"
+  # A missing resource compiler must fail the build, not ship an icon-less exe. (package.ps1 sets it
+  # too; stating it here keeps the requirement visible.)
+  SOUNDCRAFT_REQUIRE_WINRES: "1"
+  WIX_VERSION: "5.0.2"
+
+jobs:
+  msi:
+    name: MSI (${{ matrix.arch }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    env:
+      ARCH: ${{ matrix.arch }}
+      DIST: ${{ github.workspace }}\dist\${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (pinned, with the MSVC target)
+        shell: pwsh
+        run: |
+          $target = if ($env:ARCH -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $target
+          rustup default $env:RUST_TOOLCHAIN
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-msi-${{ matrix.arch }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/pa-tools' }}
+
+      # WiX v5 is distributed as a .NET tool (https://www.nuget.org/packages/wix/5.0.2). patools.wxs
+      # uses core WiX elements only (no UI, Util or other extension namespace), so the tool alone
+      # builds it and no extension is installed. The tool goes into a folder of its own under the
+      # runner's temp directory; a path written to GITHUB_PATH takes effect from the next step on.
+      - name: Install WiX (the tool, no extensions)
+        shell: pwsh
+        run: |
+          $wixDir = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install wix --version $env:WIX_VERSION --tool-path $wixDir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install exited with $LASTEXITCODE" }
+          Add-Content -Path $env:GITHUB_PATH -Value $wixDir
+          & (Join-Path $wixDir 'wix.exe') --version
+
+      - name: Build and package (unsigned)
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch $env:ARCH
+
+      - name: List the packages
+        shell: pwsh
+        run: Get-ChildItem $env:DIST | Format-Table Name, Length
+
+      - name: Upload the MSI
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patools-windows-${{ matrix.arch }}-msi
+          path: dist/${{ matrix.arch }}/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+      # Install the x64 MSI on this runner, run what it installed and uninstall it again
+      # (packaging/windows/smoke-test.ps1). The version it expects comes from Cargo, not from this
+      # file: `cargo metadata --no-deps` lists the workspace packages, which all inherit
+      # `[workspace.package] version`, and the step fails if they ever disagree. The MSI is uploaded
+      # first, so a failing smoke test still leaves the installer to download. The runner is a
+      # throwaway VM (administrator, no Pa Tools installed), so installing is safe.
+      - name: Smoke test the MSI (install, run, uninstall)
+        id: smoke
+        if: matrix.arch == 'x64'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $json = cargo metadata --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata exited with $LASTEXITCODE" }
+          $versions = @(($json | ConvertFrom-Json).packages.version | Sort-Object -Unique)
+          if ($versions.Count -ne 1) { throw "the workspace packages disagree on the version: $($versions -join ', ')" }
+          $msi = @(Get-ChildItem -LiteralPath $env:DIST -Filter '*.msi')
+          if ($msi.Count -ne 1) { throw "expected one MSI in $env:DIST, found $($msi.Count)" }
+          ./packaging/windows/smoke-test.ps1 -Msi $msi[0].FullName -ExpectedVersion $versions[0] `
+            -LogDir (Join-Path $env:RUNNER_TEMP 'msi-smoke')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The msiexec logs and the captured program output, only when the smoke test failed.
+      - name: Upload the smoke-test logs (on failure)
+        if: ${{ !cancelled() && steps.smoke.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patools-windows-x64-msi-smoke-logs
+          path: ${{ runner.temp }}\msi-smoke
+          if-no-files-found: warn
+          retention-days: 14
