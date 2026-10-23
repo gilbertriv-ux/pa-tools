@@ -449,8 +449,8 @@ pub(crate) fn relative_dist(seq: &SequenceHeader, a: u32, b: u32) -> i32 {
     if !seq.enable_order_hint {
         return 0;
     }
-    let diff = a as i32 - b as i32;
-    let m = 1i32 << (seq.order_hint_bits - 1);
+    let diff = (a as i32).wrapping_sub(b as i32);
+    let m = 1i32 << seq.order_hint_bits.clamp(1, 8).wrapping_sub(1);
     (diff & (m - 1)) - (diff & m)
 }
 
@@ -925,6 +925,10 @@ impl FrameHeader {
             t.mi_row_starts.push(self.mi_rows);
             t.rows_log2 = tile_log2(1, t.rows as u32);
         }
+        // 6.8.14: at most MAX_TILE_COLS x MAX_TILE_ROWS tiles (explicit spacing could otherwise name thousands).
+        if t.cols > MAX_TILE_COLS || t.rows > MAX_TILE_ROWS {
+            return Err(Error::Invalid("too many tiles"));
+        }
         if t.cols_log2 > 0 || t.rows_log2 > 0 {
             t.context_update_tile_id = r.f(t.rows_log2 + t.cols_log2)?;
             t.tile_size_bytes = r.f(2)? + 1;
@@ -1256,6 +1260,7 @@ impl FrameHeader {
             g.point_y_value[i] = r.f(8)? as u8;
             g.point_y_scaling[i] = r.f(8)? as u8;
         }
+        check_increasing(&g.point_y_value[..g.num_y_points])?;
         g.chroma_scaling_from_luma = if seq.color.mono_chrome { false } else { r.flag()? };
         if seq.color.mono_chrome
             || g.chroma_scaling_from_luma
@@ -1272,6 +1277,7 @@ impl FrameHeader {
                 g.point_cb_value[i] = r.f(8)? as u8;
                 g.point_cb_scaling[i] = r.f(8)? as u8;
             }
+            check_increasing(&g.point_cb_value[..g.num_cb_points])?;
             g.num_cr_points = r.f(4)? as usize;
             if g.num_cr_points > 10 {
                 return Err(Error::Invalid("num_cr_points"));
@@ -1280,6 +1286,7 @@ impl FrameHeader {
                 g.point_cr_value[i] = r.f(8)? as u8;
                 g.point_cr_scaling[i] = r.f(8)? as u8;
             }
+            check_increasing(&g.point_cr_value[..g.num_cr_points])?;
         }
         g.grain_scaling_minus_8 = r.f(2)?;
         g.ar_coeff_lag = r.f(2)?;
@@ -1319,6 +1326,12 @@ impl FrameHeader {
         self.film_grain = g;
         Ok(())
     }
+}
+
+/// 6.8.20: the x coordinates of a film grain scaling function strictly increase (the interpolation
+/// divides by their differences).
+fn check_increasing(points: &[u8]) -> Result<()> {
+    if points.windows(2).all(|w| w[0] < w[1]) { Ok(()) } else { Err(Error::Invalid("film grain scaling points do not increase")) }
 }
 
 pub(crate) fn default_gm_params() -> [[i32; 6]; 8] {
@@ -1365,5 +1378,38 @@ fn decode_subexp(r: &mut BitReader, num_syms: i32) -> Result<i32> {
         } else {
             return Ok(r.f(b2 as u32)? as i32 + mk);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_distance_wraps_within_the_order_hint_bits_and_never_overflows() {
+        let seq = SequenceHeader { enable_order_hint: true, order_hint_bits: 7, ..Default::default() };
+        assert_eq!(relative_dist(&seq, 5, 3), 2);
+        assert_eq!(relative_dist(&seq, 3, 5), -2);
+        assert_eq!(relative_dist(&seq, 1, 127), 2); // wraps around the 7-bit counter
+        // Hostile values: far outside the counter's range, and bit counts a damaged header could claim.
+        for bits in [0, 1, 8, 9, 31, 32, u32::MAX] {
+            let seq = SequenceHeader { enable_order_hint: true, order_hint_bits: bits, ..Default::default() };
+            for (a, b) in [(u32::MAX, 0), (0, u32::MAX), (i32::MIN as u32, i32::MAX as u32), (u32::MAX, u32::MAX)] {
+                let d = relative_dist(&seq, a, b);
+                assert!((-128..128).contains(&d), "{bits} bits, {a} vs {b}: {d}");
+            }
+        }
+        let off = SequenceHeader::default();
+        assert_eq!(relative_dist(&off, 9, 1), 0);
+    }
+
+    #[test]
+    fn film_grain_scaling_points_must_strictly_increase() {
+        assert!(check_increasing(&[]).is_ok());
+        assert!(check_increasing(&[7]).is_ok());
+        assert!(check_increasing(&[0, 1, 200, 255]).is_ok());
+        assert!(check_increasing(&[0, 0]).is_err());
+        assert!(check_increasing(&[3, 2]).is_err());
+        assert!(check_increasing(&[1, 5, 5, 9]).is_err());
     }
 }

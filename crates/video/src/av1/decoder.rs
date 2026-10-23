@@ -36,6 +36,39 @@ const MAX_FRAME_AREA: u64 = 35_651_584;
 fn frame_size_allowed(width: u32, height: u32) -> bool {
     width <= MAX_FRAME_WIDTH && height <= MAX_FRAME_HEIGHT && u64::from(width) * u64::from(height) <= MAX_FRAME_AREA
 }
+
+/// Default cap, in bytes, on what a decoder holds for frames: eight reference slots plus the frames
+/// being decoded (see [`Decoder::set_memory_budget`]). A level 6.3 frame is allowed by the spec but
+/// needs several GB for its references; a hostile sequence header must not be able to ask for that.
+pub const DEFAULT_MEMORY_BUDGET: u64 = 1 << 30;
+
+/// Pictures larger than this many luma samples are refused whatever the budget (the same limit as
+/// the rest of the video crate: 8192 x 8192).
+const MAX_PICTURE_SAMPLES: u64 = 8192 * 8192;
+
+/// Estimated bytes (reference, working) for frames of `width` x `height` luma samples. A reference
+/// slot holds the sample planes with their allocation margins plus the saved motion vectors,
+/// reference frames and segment ids; a frame being decoded holds its planes, the loop filter / CDEF /
+/// super-resolution / restoration copies, mode info, the motion field and, with film grain, the
+/// noise stripes. Deliberately pessimistic.
+fn frame_costs(seq: &SequenceHeader, width: u32, height: u32) -> (u64, u64) {
+    let (w, h) = (u64::from(width), u64::from(height));
+    let (aw, ah) = (w.div_ceil(128) * 128 + 160, h.div_ceil(128) * 128 + 160);
+    let (ssx, ssy) = (u32::from(seq.color.subsampling_x.min(1)), u32::from(seq.color.subsampling_y.min(1)));
+    let chroma = if seq.color.num_planes > 1 { 2 * (aw >> ssx) * (ah >> ssy) } else { 0 };
+    let planes = (aw * ah + chroma) * 2;
+    let mi_units = (2 * w.div_ceil(8)) * (2 * h.div_ceil(8));
+    // Film grain synthesis (on the output picture) keeps three planes of i32 noise stripes.
+    let grain = if seq.film_grain_params_present { 13 * w * h } else { 0 };
+    (planes + 10 * mi_units, 5 * planes + 80 * mi_units + grain)
+}
+
+/// What identifies a coded video sequence's picture format: references from before a change of any
+/// of these cannot be used (their planes have other depths and sizes), so they are dropped.
+fn picture_format(seq: &SequenceHeader) -> (u8, usize, u8, u8, bool, u32) {
+    let c = &seq.color;
+    (c.bit_depth, c.num_planes, c.subsampling_x, c.subsampling_y, seq.enable_order_hint, seq.order_hint_bits)
+}
 const OBU_SEQUENCE_HEADER_T: u32 = 1;
 const OBU_TEMPORAL_DELIMITER_T: u32 = 2;
 const OBU_FRAME_HEADER_T: u32 = 3;
@@ -213,12 +246,17 @@ pub struct Decoder {
     draft: bool,
     stats: Arc<Mutex<DecodeStats>>,
     threads: usize,
+    /// Frames that can be decoded at the same time (1 without frame worker threads).
+    frame_workers: usize,
+    memory_budget: u64,
+    /// Frames submitted and unfinished that submitting waits for (at most the memory budget's share of
+    /// workers, plus a few queued behind them).
+    in_flight_cap: usize,
     pool: Pool,
     #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
     workers: Option<Workers>,
     /// Frames submitted to the workers and not known to be finished (oldest first).
     in_flight: VecDeque<Arc<FrameSlot>>,
-    max_in_flight: usize,
     /// Shown pictures not yet returned, in output order.
     out: VecDeque<Output>,
     /// pts of the temporal unit being decoded.
@@ -276,17 +314,26 @@ impl Decoder {
             draft: false,
             stats,
             threads,
+            frame_workers: fthreads,
+            memory_budget: DEFAULT_MEMORY_BUDGET,
+            in_flight_cap: fthreads + 2,
             pool,
             #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
             workers,
             in_flight: VecDeque::new(),
-            max_in_flight: fthreads + 2,
             out: VecDeque::new(),
             pts: 0,
         }
     }
 
-    /// Frame / tile counts and per-stage busy time of the frames finished so far.
+    /// Cap, in bytes, on the memory the decoder may need for its frames (default
+    /// [`DEFAULT_MEMORY_BUDGET`], 1 GiB). A frame whose size would need more than this for the eight
+    /// reference slots plus the frames in flight is refused with [`Error::Unsupported`] before anything
+    /// is allocated. Pictures above 8192 x 8192 samples are refused whatever the budget.
+    pub fn set_memory_budget(&mut self, bytes: u64) {
+        self.memory_budget = bytes;
+    }
+
     /// Draft mode for reduced-resolution playback (off by default): shown frames that refresh
     /// no reference slot (nothing can predict from them, read their motion vectors or CDFs)
     /// skip deblocking, CDEF and loop restoration and come out flagged [`Picture::draft`];
@@ -295,6 +342,7 @@ impl Decoder {
         self.draft = on;
     }
 
+    /// Frame / tile counts and per-stage busy time of the frames finished so far.
     pub fn stats(&self) -> DecodeStats {
         self.stats.lock().map(|s| *s).unwrap_or_default()
     }
@@ -304,8 +352,9 @@ impl Decoder {
         self.seq.as_ref()
     }
 
-    /// Decode a chunk of OBUs; returns the frames that are ready for output, in order (with
-    /// frame threads, pictures shown by this chunk may come from a later call or [`flush`]).
+    /// Decode a chunk of OBUs holding whole frames (a temporal unit, one MP4 / Matroska sample, one
+    /// IVF frame); returns the frames that are ready for output, in order (with frame threads,
+    /// pictures shown by this chunk may come from a later call or [`flush`]).
     ///
     /// [`flush`]: Decoder::flush
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<Picture>> {
@@ -315,10 +364,15 @@ impl Decoder {
     /// [`Decoder::decode`] with a timestamp that the pictures shown by this chunk carry.
     pub fn decode_pts(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
         self.pts = pts;
+        // A temporal unit holds whole frames, so whatever a damaged earlier unit left half collected
+        // (container samples carry no temporal delimiter to say so) is dropped, not completed with
+        // this unit's tile groups.
+        self.pending = None;
+        self.seen_frame_header = false;
         let parsed = self.parse(data);
         // Hand out what is finished, then report a parse error.
         let mut pics = Vec::new();
-        let max_queue = 2 * self.max_in_flight;
+        let max_queue = 2 * (self.frame_workers + 2);
         while let Some(o) = self.out.front() {
             if !o.is_ready() && self.out.len() <= max_queue {
                 break;
@@ -411,13 +465,13 @@ impl Decoder {
             }
             let size = if has_size {
                 let (v, n) = leb128(data.get(p..).ok_or(Error::Truncated)?)?;
-                p += n;
-                v as usize
+                p = p.checked_add(n).ok_or(Error::Truncated)?;
+                usize::try_from(v).map_err(|_| Error::Truncated)?
             } else {
                 data.len().checked_sub(p).ok_or(Error::Truncated)?
             };
             let end = p.checked_add(size).filter(|&e| e <= data.len()).ok_or(Error::Truncated)?;
-            let payload = &data[p..end];
+            let payload = data.get(p..end).ok_or(Error::Truncated)?;
             pos = end;
             if obu_type != OBU_SEQUENCE_HEADER_T
                 && obu_type != OBU_TEMPORAL_DELIMITER_T
@@ -435,6 +489,9 @@ impl Decoder {
             match obu_type {
                 OBU_SEQUENCE_HEADER_T => {
                     let s = SequenceHeader::parse(payload)?;
+                    if self.seq.as_ref().is_some_and(|old| picture_format(old) != picture_format(&s)) {
+                        self.reset_references();
+                    }
                     self.seq = Some(s);
                 }
                 OBU_TEMPORAL_DELIMITER_T => {
@@ -474,6 +531,19 @@ impl Decoder {
         Ok(())
     }
 
+    /// A new picture format starts a new coded video sequence (7.5): forget every reference frame and
+    /// the state that is carried from frame to frame, and any frame being collected. Pictures already
+    /// waiting for output stay.
+    fn reset_references(&mut self) {
+        self.refs = Default::default();
+        self.ref_frames = Default::default();
+        self.lf_deltas = LoopFilterDeltas::defaults();
+        self.seg_features = SegmentationFeatures::default();
+        self.prev_gm_params = default_gm_params();
+        self.pending = None;
+        self.seen_frame_header = false;
+    }
+
     /// frame_header_obu( ): returns the output for show_existing_frame.
     fn frame_header(&mut self, r: &mut BitReader, temporal_id: u32, spatial_id: u32) -> Result<Option<Output>> {
         let seq = self.seq.clone().ok_or(Error::Invalid("frame before sequence header"))?;
@@ -494,8 +564,8 @@ impl Decoder {
         if fh.show_existing_frame {
             self.seen_frame_header = false;
             let idx = fh.frame_to_show_map_idx;
-            let slot = self.ref_frames[idx].clone().ok_or(Error::Invalid("show_existing_frame of an empty slot"))?;
-            let info = self.refs[idx].clone();
+            let slot = self.ref_frames.get(idx).and_then(Clone::clone).ok_or(Error::Invalid("show_existing_frame of an empty slot"))?;
+            let info = self.refs.get(idx).cloned().ok_or(Error::Invalid("show_existing_frame of an empty slot"))?;
             let o = Output::Existing {
                 slot: slot.clone(),
                 seq: seq.clone(),
@@ -521,15 +591,26 @@ impl Decoder {
         if !frame_size_allowed(fh.upscaled_width, fh.frame_height) {
             return Err(Error::Invalid("frame size"));
         }
+        // Memory: eight reference slots of this size plus as many frames in flight as the budget has room for.
+        let (reference, working) = frame_costs(&seq, fh.upscaled_width, fh.frame_height);
+        let room = self.memory_budget.saturating_sub(NUM_REF_FRAMES as u64 * reference) / working.max(1);
+        if u64::from(fh.upscaled_width) * u64::from(fh.frame_height) > MAX_PICTURE_SAMPLES || room == 0 {
+            return Err(Error::Unsupported("frame size is beyond the decoder's memory budget"));
+        }
+        let workers = usize::try_from(room).unwrap_or(usize::MAX).min(self.frame_workers);
+        self.in_flight_cap = if workers >= self.frame_workers { self.frame_workers + 2 } else { workers };
         if !fh.frame_is_intra {
-            for i in 0..REFS_PER_FRAME {
-                if self.ref_frames[fh.ref_frame_idx[i]].is_none() {
+            for &idx in &fh.ref_frame_idx {
+                if self.ref_frames.get(idx).is_none_or(Option::is_none) {
                     return Err(Error::Invalid("missing reference frame"));
                 }
             }
         }
-        if fh.primary_ref_frame != PRIMARY_REF_NONE && self.ref_frames[fh.ref_frame_idx[fh.primary_ref_frame]].is_none() {
-            return Err(Error::Invalid("primary reference frame missing"));
+        if fh.primary_ref_frame != PRIMARY_REF_NONE {
+            let primary = fh.ref_frame_idx.get(fh.primary_ref_frame).and_then(|&i| self.ref_frames.get(i));
+            if primary.is_none_or(Option::is_none) {
+                return Err(Error::Invalid("primary reference frame missing"));
+            }
         }
         let picture = fh.show_frame.then(Slot::new);
         let draft = self.draft && fh.show_frame && fh.refresh_frame_flags == 0;
@@ -555,7 +636,7 @@ impl Decoder {
             let t = &job.fh.tile_info;
             (t.cols, t.rows, t.cols_log2, t.rows_log2, t.tile_size_bytes)
         };
-        let num_tiles = cols * rows;
+        let num_tiles = cols.checked_mul(rows).filter(|&n| n > 0).ok_or(Error::Invalid("tile count"))?;
         let mut r = BitReader::new(data);
         let mut tg_start = 0;
         let mut tg_end = num_tiles - 1;
@@ -565,7 +646,8 @@ impl Decoder {
             tg_end = r.f(bits)? as usize;
         }
         r.byte_align();
-        if tg_end >= num_tiles || tg_start > tg_end {
+        // Tile groups must arrive in order and without gaps: the next one starts where the last ended.
+        if tg_end >= num_tiles || tg_start > tg_end || tg_start != job.tiles.len() {
             return Err(Error::Invalid("tile group range"));
         }
         let mut pos = r.byte_pos();
@@ -574,14 +656,15 @@ impl Decoder {
                 data.len().checked_sub(pos).ok_or(Error::Truncated)?
             } else {
                 let mut v = 0usize;
-                for i in 0..tsb as usize {
-                    v |= (*data.get(pos + i).ok_or(Error::Truncated)? as usize) << (8 * i);
+                for i in 0..tsb.min(4) as usize {
+                    let byte = *data.get(pos.checked_add(i).ok_or(Error::Truncated)?).ok_or(Error::Truncated)?;
+                    v |= usize::from(byte) << (8 * i);
                 }
-                pos += tsb as usize;
-                v + 1
+                pos = pos.checked_add(tsb as usize).ok_or(Error::Truncated)?;
+                v.checked_add(1).ok_or(Error::Truncated)?
             };
             let end = pos.checked_add(size).filter(|&e| e <= data.len()).ok_or(Error::Truncated)?;
-            job.tiles.push((tile_num, data[pos..end].to_vec()));
+            job.tiles.push((tile_num, data.get(pos..end).ok_or(Error::Truncated)?.to_vec()));
             pos = end;
         }
         if tg_end != num_tiles - 1 {
@@ -628,7 +711,7 @@ impl Decoder {
                 Ok(()) => {
                     self.in_flight.push_back(slot);
                     // Bound the frames in flight (memory): wait for the oldest.
-                    while self.in_flight.len() > self.max_in_flight {
+                    while self.in_flight.len() > self.in_flight_cap {
                         let Some(s) = self.in_flight.pop_front() else { break };
                         let _ = s.wait();
                     }
@@ -646,7 +729,11 @@ impl Decoder {
 /// Decode a frame job and publish its results.
 fn run_job(job: FrameJob, pool: &Pool, stats: &Mutex<DecodeStats>) {
     let mut st = DecodeStats::default();
-    match decode_frame(&job, pool, &mut st) {
+    // A frame worker that dies would leave its slots unset and every waiter blocked for ever, so a bug
+    // that panics is reported as a decoding error for that frame instead (it must never happen).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_frame(&job, pool, &mut st)))
+        .unwrap_or(Err(Error::Invalid("internal decoder error")));
+    match result {
         Ok((rf, pic)) => {
             if let Some(ps) = &job.picture {
                 ps.set(pic.map(Arc::new).ok_or(Error::Invalid("shown frame without picture")));
@@ -693,13 +780,14 @@ fn decode_frame(job: &FrameJob, pool: &Pool, stats: &mut DecodeStats) -> Result<
     fs.ref_info = job.ref_info.clone();
     if fh.primary_ref_frame != PRIMARY_REF_NONE {
         // load_previous_segment_ids( )
-        if let Some(rf) = &fs.refs[fh.ref_frame_idx[fh.primary_ref_frame]]
+        let primary = fh.ref_frame_idx.get(fh.primary_ref_frame).and_then(|&i| fs.refs.get(i)).and_then(Clone::clone);
+        if let Some(rf) = primary
             && fh.seg.enabled
             && rf.mi_cols == fs.mi.cols
             && rf.mi_rows == fs.mi.rows
+            && rf.segment_ids.len() == fs.prev_segment_ids.len()
         {
-            let ids = rf.segment_ids.clone();
-            fs.prev_segment_ids.copy_from_slice(&ids);
+            fs.prev_segment_ids.copy_from_slice(&rf.segment_ids);
         }
     }
     if fh.use_ref_frame_mvs {
@@ -729,7 +817,9 @@ fn decode_frame(job: &FrameJob, pool: &Pool, stats: &mut DecodeStats) -> Result<
     stats.frames += 1;
     if fh.seg.enabled && !fh.seg.update_map {
         let prev = std::mem::take(&mut fs.prev_segment_ids);
-        fs.mi.segment_id.copy_from_slice(&prev);
+        if prev.len() == fs.mi.segment_id.len() {
+            fs.mi.segment_id.copy_from_slice(&prev);
+        }
     }
     let (mf_refs, mf_mvs) = motion_vector_storage(&fs);
     let rf = Arc::new(RefFrame {

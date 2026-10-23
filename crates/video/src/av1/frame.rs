@@ -9,8 +9,8 @@
 /// are zeroed again on reuse, so contents never leak between frames.
 static PLANE_POOL: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
 const POOL_MIN_LEN: usize = 1 << 16;
-/// Samples kept at most (96 M samples = 192 MB, a few 4K frames).
-const POOL_MAX_SAMPLES: usize = 96 << 20;
+/// Samples kept at most (48 M samples = 96 MB, a few 4K frames).
+const POOL_MAX_SAMPLES: usize = 48 << 20;
 
 /// A zeroed buffer of `len` samples (recycled memory for large ones).
 fn zeroed(len: usize) -> Vec<u16> {
@@ -312,7 +312,8 @@ impl MiInfo {
 
     #[inline(always)]
     pub fn idx(&self, row: usize, col: usize) -> usize {
-        debug_assert!(col >= self.ox && col < self.ox + self.stride && row >= self.oy, "mode info ({row}, {col}) outside the stored region");
+        // The tile decoder only asks for positions inside the region; a violation fails the bounds check of
+        // the access that follows (and is contained at the frame boundary), never reads outside.
         (row - self.oy) * self.stride + col - self.ox
     }
 

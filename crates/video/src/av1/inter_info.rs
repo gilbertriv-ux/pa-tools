@@ -1,10 +1,10 @@
 //! Inter frame mode info syntax (5.11.7 / 5.11.18 – 5.11.33) with its CDF selection (8.3.2).
 
-use crate::av1::Result;
 use crate::av1::header::{EIGHTTAP, SWITCHABLE};
 use crate::av1::mvpred::MvP;
 use crate::av1::spec_tables::*;
 use crate::av1::tile::TileDecoder;
+use crate::av1::{Error, Result};
 
 fn block_width(bs: usize) -> usize {
     4 * NUM_4X4_BLOCKS_WIDE[bs] as usize
@@ -400,6 +400,8 @@ impl TileDecoder<'_, '_> {
         self.b.palette_size_y = 0;
         self.b.palette_size_uv = 0;
         self.read_ref_frames();
+        self.check_ref_scale(self.b.ref_frame[0])?;
+        self.check_ref_scale(self.b.ref_frame[1])?;
         let is_compound = self.b.ref_frame[1] > INTRA_FRAME as i8;
         self.find_mv_stack(is_compound);
         if self.b.skip_mode {
@@ -472,6 +474,25 @@ impl TileDecoder<'_, '_> {
             self.b.interp_filter = [self.fs.fh.interpolation_filter; 2];
         }
         Ok(())
+    }
+
+    /// 7.11.3.3: a block may only predict from a reference at most twice as large as the frame and at
+    /// most sixteen times smaller. (A frame header may list references that break this as long as no
+    /// block uses them, so the check is per block; the prediction filters assume it.)
+    fn check_ref_scale(&self, rf: i8) -> Result<()> {
+        let Ok(rf) = usize::try_from(rf) else { return Ok(()) };
+        if rf < LAST_FRAME {
+            return Ok(());
+        }
+        let fh = &self.fs.fh;
+        let ri = fh.ref_frame_idx.get(rf - LAST_FRAME).and_then(|&i| self.fs.ref_info.get(i)).ok_or(Error::Invalid("reference frame index"))?;
+        let (fw, fhh) = (u64::from(fh.frame_width), u64::from(fh.frame_height));
+        let (rw, rh) = (u64::from(ri.upscaled_width), u64::from(ri.frame_height));
+        if 2 * fw >= rw && 2 * fhh >= rh && fw <= 16 * rw && fhh <= 16 * rh {
+            Ok(())
+        } else {
+            Err(Error::Invalid("reference frame has a size this frame cannot predict from"))
+        }
     }
 
     fn needs_interp_filter(&self) -> bool {
