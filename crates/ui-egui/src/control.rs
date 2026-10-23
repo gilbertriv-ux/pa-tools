@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 const SCREENSHOT_POLL: Duration = Duration::from_millis(16);
+const SCREENSHOT_RETRY: Duration = Duration::from_millis(250);
+const SCREENSHOT_ATTEMPTS: u8 = 4;
 
 pub struct ControlRequest {
     pub method: String,
@@ -40,7 +42,8 @@ pub struct PendingShot {
     started: Instant,
     frames: u8,
     last_frame: Option<u64>,
-    sent: bool,
+    attempts: u8,
+    last_request: Option<Instant>,
 }
 
 fn ok(v: Value) -> Value {
@@ -246,7 +249,8 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
                 started: Instant::now(),
                 frames: 0,
                 last_frame: None,
-                sent: false,
+                attempts: 0,
+                last_request: None,
             });
             // eframe deliberately skips painting covered/minimized windows. Ask this
             // viewport to present again; activating the app alone may leave it minimized.
@@ -291,10 +295,10 @@ pub fn collect_screenshots(app: &mut SoundApp, ctx: &egui::Context) {
         }
         if s.started.elapsed() >= SCREENSHOT_TIMEOUT {
             log::debug!(
-                "Screenshot {} timed out: UI frames={}, readback requested={}, visibility={:?}",
+                "Screenshot {} timed out: UI frames={}, readback attempts={}, visibility={:?}",
                 s.token,
                 s.frames,
-                s.sent,
+                s.attempts,
                 ctx.input(|i| (i.viewport().visible(), i.viewport().focused, i.viewport().minimized, i.viewport().occluded))
             );
             let _ = s.reply.send(err("screenshot timed out after 15 seconds waiting for the app window to render"));
@@ -313,19 +317,28 @@ pub fn collect_screenshots(app: &mut SoundApp, ctx: &egui::Context) {
 /// Advance capture only from the root UI, once per rendered frame, not logic ticks
 /// or additional layout passes. Give layout/synthetic input three frames to settle.
 pub fn request_screenshots(app: &mut SoundApp, ctx: &egui::Context) {
+    request_screenshots_at(app, ctx, Instant::now());
+}
+
+fn request_screenshots_at(app: &mut SoundApp, ctx: &egui::Context, now: Instant) {
     if ctx.viewport_id() != egui::ViewportId::ROOT {
         return;
     }
     let frame = ctx.cumulative_frame_nr();
     for s in &mut app.pending_shots {
-        if s.sent || s.last_frame == Some(frame) {
+        if s.last_frame == Some(frame) {
             continue;
         }
         s.last_frame = Some(frame);
         s.frames = s.frames.saturating_add(1);
-        if s.frames >= 3 {
+        // A first GPU readback can be dropped while a newly shown/resized surface
+        // settles. Retry only on UI frames, with a fixed interval and small cap;
+        // all attempts share a token so a late/duplicate image replies only once.
+        let retry_ready = s.last_request.is_none_or(|last| now.saturating_duration_since(last) >= SCREENSHOT_RETRY);
+        if s.frames >= 3 && s.attempts < SCREENSHOT_ATTEMPTS && retry_ready {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(s.token)));
-            s.sent = true;
+            s.attempts = s.attempts.saturating_add(1);
+            s.last_request = Some(now);
         }
     }
 }
@@ -377,110 +390,4 @@ pub fn base64(data: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn app() -> SoundApp {
-        SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default())
-    }
-
-    fn enqueue(app: &mut SoundApp, ctx: &egui::Context) -> Receiver<Value> {
-        let (request, reply) = ControlRequest::new("ui.screenshot", json!({}));
-        assert!(handle(app, ctx, &request).is_none());
-        reply
-    }
-
-    #[test]
-    fn screenshot_restores_and_focuses_its_window() {
-        let ctx = egui::Context::default();
-        let mut app = app();
-        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| {
-            let _reply = enqueue(&mut app, ctx);
-        });
-        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
-        assert_eq!(
-            commands.as_slice(),
-            &[egui::ViewportCommand::Minimized(false), egui::ViewportCommand::Focus, egui::ViewportCommand::Visible(true)]
-        );
-    }
-
-    #[test]
-    fn hidden_logic_ticks_do_not_advance_or_expire_a_screenshot() {
-        let ctx = egui::Context::default();
-        let mut app = app();
-        let reply = enqueue(&mut app, &ctx);
-        // More than the old 600-logic-call deadline; no frame has been rendered.
-        for _ in 0..650 {
-            let output = ctx.run_logic(&egui::RawInput::default(), |ctx| collect_screenshots(&mut app, ctx));
-            assert!(!output.viewport_commands.values().flatten().any(|c| matches!(c, egui::ViewportCommand::Screenshot(_))));
-        }
-        assert!(matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
-        assert_eq!(app.pending_shots.len(), 1);
-        assert_eq!(app.pending_shots[0].frames, 0);
-    }
-
-    #[test]
-    fn screenshot_waits_for_three_ui_frames_and_requests_readback_once() {
-        let ctx = egui::Context::default();
-        let mut app = app();
-        let _reply = enqueue(&mut app, &ctx);
-        let mut readbacks = 0;
-        for frame in 1..=5 {
-            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                request_screenshots(&mut app, ui.ctx());
-                // A discarded/repeated layout pass must not advance the request twice.
-                request_screenshots(&mut app, ui.ctx());
-            });
-            output.textures_delta.clear();
-            readbacks +=
-                output.viewport_output.values().flat_map(|v| &v.commands).filter(|c| matches!(c, egui::ViewportCommand::Screenshot(_))).count();
-            assert_eq!(readbacks, usize::from(frame >= 3));
-        }
-    }
-
-    #[test]
-    fn screenshot_readback_matches_the_request_token_and_replies_once() {
-        let ctx = egui::Context::default();
-        let mut app = app();
-        let first = enqueue(&mut app, &ctx);
-        let second = enqueue(&mut app, &ctx);
-        let token = app.pending_shots[1].token;
-        let image = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::RED));
-        let input = egui::RawInput {
-            events: vec![egui::Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: egui::UserData::new(token), image }],
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(input, |ui| collect_screenshots(&mut app, ui.ctx()));
-        output.textures_delta.clear();
-        let result = second.try_recv().unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["result"]["width"], 2);
-        assert_eq!(result["result"]["height"], 3);
-        assert!(result["result"]["png_base64"].as_str().unwrap().starts_with("iVBOR"));
-        assert!(matches!(first.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
-        assert!(second.try_recv().is_err());
-        assert_eq!(app.pending_shots.len(), 1);
-    }
-
-    #[test]
-    fn screenshot_timeout_uses_elapsed_time_and_drops_the_request() {
-        let ctx = egui::Context::default();
-        let mut app = app();
-        let reply = enqueue(&mut app, &ctx);
-        app.pending_shots[0].started = Instant::now().checked_sub(SCREENSHOT_TIMEOUT).unwrap();
-        collect_screenshots(&mut app, &ctx);
-        let result = reply.try_recv().unwrap();
-        assert_eq!(result["ok"], false);
-        assert!(result["error"].as_str().unwrap().contains("15 seconds"));
-        assert!(app.pending_shots.is_empty());
-        collect_screenshots(&mut app, &ctx);
-        assert!(reply.try_recv().is_err());
-    }
-
-    #[test]
-    fn base64_known() {
-        assert_eq!(super::base64(b"Man"), "TWFu");
-        assert_eq!(super::base64(b"Ma"), "TWE=");
-        assert_eq!(super::base64(b"M"), "TQ==");
-    }
-}
+mod tests;

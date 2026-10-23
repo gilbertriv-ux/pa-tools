@@ -1,6 +1,6 @@
 # Pa Tools roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-22 · **Change:** trivial (M8 screenshot recovery) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-22 · **Change:** trivial (M8 bounded screenshot retries) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
@@ -60,6 +60,10 @@ M8 follow-up (2026-10-22, V3): live screenshot requests restore/focus the viewpo
 for UI frames with a 15-second wall-clock deadline. Hidden-window logic ticks and repeated
 layout passes no longer consume the capture budget. Stage/readiness are unchanged.
 
+M8 follow-up (2026-10-22, V4): lost renderer readbacks are retried every 250 ms,
+capped at four attempts under one token. Success and the existing timeout release
+pending state. Stage/readiness are unchanged.
+
 ## To beta (~350–570 h, about 60–70 % parallelizable)
 
 Beta needs ~75 % ready for real work and no blocking gap in session interchange.
@@ -93,6 +97,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | trivial | M8: V4 bounded screenshot retry timing and token tests |
 | 2026-10-22 | trivial | M8: V3 live screenshot lifecycle recovery and regression tests |
 | 2026-10-22 | minor | Native desktop workspace V2 lands the navigation/onboarding/transcript portion of G-19; other beta UI work remains |
 | 2026-10-22 | minor | G-18 local recognition and searchable transcript implemented; remaining quality and editing work retained |

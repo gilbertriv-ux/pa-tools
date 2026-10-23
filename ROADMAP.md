@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-22 · **Change:** trivial (V3 live screenshot recovery) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-22 · **Change:** trivial (V4 bounded screenshot retries) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pa Tools is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -122,6 +122,11 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
+- **2026-10-22:** V4 retries a lost renderer readback at 250 ms intervals, capped at four
+  attempts with one request token. Successful capture or the existing deadline releases
+  the pending request. Regression coverage verifies spacing, token identity and the cap.
+  Stage and readiness estimates are unchanged.
+
 - **2026-10-22:** V3 restores and focuses the viewport for live CLI/MCP screenshots,
   waits for UI frames instead of hidden-window logic ticks, and uses a bounded wall-clock
   timeout. Regression tests cover hidden ticks, layout passes, tokens and timeout cleanup.
@@ -176,6 +181,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | trivial | V4 bounded readback retries and deterministic lifecycle tests; readiness unchanged |
 | 2026-10-22 | trivial | V3 live screenshot recovery; stage/readiness unchanged |
 | 2026-10-22 | minor | Desktop workspace V2, native onboarding/navigation and docked transcript cards; readiness estimates unchanged |
 | 2026-10-22 | minor | G-18 local recognition, model discovery and searchable Transcript window; spoken-fixture proof, readiness estimates unchanged |

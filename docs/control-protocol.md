@@ -1,6 +1,6 @@
 # Control protocol
 
-Last updated: 2026-10-22 (V3 screenshot recovery).
+Last updated: 2026-10-22 (V4 bounded screenshot retries).
 
 Pa Tools can be driven completely by other programs: scripts, test harnesses and AI agents.
 Every menu item, button, mouse gesture and keystroke maps to a **command** (or to synthetic
@@ -65,7 +65,9 @@ Screenshot requests make the app window visible and unminimized so the native re
 produce a current frame. Capture waits for three UI frames, counting repeated layout passes
 only once. Covered-window logic ticks do not advance capture or exhaust its timeout. The
 15-second wall-clock deadline returns an explicit error if the renderer cannot supply a
-frame. Capturing does not change the session or start playback/recording.
+frame. A lost renderer readback is retried at 250 ms intervals, capped at four attempts
+with the same token. The first matching result removes the pending request; late duplicate
+results are ignored. Capturing does not change the session or start playback/recording.
 
 - Tracks: id (number) or name (`"Kick"`).
 - Clips: id (from `session.inspect`).
@@ -124,4 +126,5 @@ rules apply equally to both forms.
 
 | Date | Change |
 |---|---|
+| 2026-10-22 | V4: retry lost renderer readbacks at bounded intervals under one token; release pending state after completion. |
 | 2026-10-22 | V3: screenshot restores/focuses the viewport, waits for rendered UI frames and uses a wall-clock timeout. |

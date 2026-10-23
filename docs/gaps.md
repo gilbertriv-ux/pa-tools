@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-22 · **Change:** trivial (G-04 live screenshot recovery) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-22 · **Change:** trivial (G-04 bounded screenshot retries) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -79,6 +79,10 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
   black-box format study is in the clean-room rules; not included in the estimate.
 
 ### G-04. Correctness bugs in "done" features
+
+- **Fixed (2026-10-22, V4):** a lost first renderer readback is retried at 250 ms
+  intervals, at most four times with one token. Regression tests check timing and the cap;
+  pending state is released on success or timeout.
 
 - **Fixed (2026-10-22, V3):** live CLI/MCP screenshots restore/focus the native window,
   advance only on UI frames and use a 15-second wall-clock deadline. Hidden-window logic
@@ -231,6 +235,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | trivial | G-04: V4 bounded renderer retries, token identity and cleanup |
 | 2026-10-22 | trivial | G-04: V3 screenshot lifecycle recovery and regression coverage |
 | 2026-10-22 | minor | G-19 records workspace/onboarding/transcript layout work; remaining professional UI depth retained |
 | 2026-10-22 | minor | G-18 shrunk to accuracy, correction/editing and platform validation after real spoken-fixture recognition |
