@@ -126,7 +126,7 @@ impl Rng {
 }
 
 /// Decode `d` every way there is, failing the test on a panic. Errors are fine.
-fn survives(d: &[u8], label: &str) {
+pub(super) fn survives(d: &[u8], label: &str) {
     let res = catch_unwind(AssertUnwindSafe(|| {
         let _ = probe(d);
         let _ = header::parse_prefix(d);

@@ -259,3 +259,12 @@ impl Frame {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod movie_tests;
+
+#[cfg(test)]
+mod fixture_tests;
+
+#[cfg(test)]
+mod oracle;

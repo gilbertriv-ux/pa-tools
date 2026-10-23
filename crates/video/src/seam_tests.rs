@@ -378,11 +378,7 @@ fn av1_phrase() -> &'static str {
 #[test]
 fn codecs_without_a_decoder_open_but_say_so() {
     let av1 = SampleEntry::video(FourCc(*b"av01"), CodecConfig::Av1(Av1Config::default()), 64, 48);
-    let cases = [
-        (SampleEntry::hevc(HevcConfig::default(), 64, 48), "hevc", "HEVC", hevc_phrase()),
-        (av1, "av1", "AV1", av1_phrase()),
-        (SampleEntry::dnx(FourCc(*b"AVdn"), 64, 48), "dnxhd", "VC-3", "not supported yet"),
-    ];
+    let cases = [(SampleEntry::hevc(HevcConfig::default(), 64, 48), "hevc", "HEVC", hevc_phrase()), (av1, "av1", "AV1", av1_phrase())];
     for (entry, id, label, phrase) in cases {
         let mut m = one_sample_movie(entry);
         let info = m.info().clone();
@@ -400,13 +396,6 @@ fn the_codec_stubs_return_clean_errors() {
     assert!(matches!(crate::adapt_av1::open(&[0x0a, 0x0b]), Err(VideoError::Unsupported(why)) if why.contains(av1_phrase())));
     assert!(crate::adapt_hevc::describe(&HevcConfig::default()).unsupported.is_some_and(|w| w.contains(hevc_phrase())));
     assert!(crate::adapt_av1::describe(&Av1Config::default()).unsupported.is_some_and(|w| w.contains(av1_phrase())));
-    assert!(crate::adapt_dnx::describe(*b"AVdn", Some(&[0u8; 8])).unsupported.is_some());
-    assert!(crate::adapt_dnx::describe(*b"AVdh", None).unsupported.is_some());
-    let m = one_sample_movie(SampleEntry::dnx(FourCc(*b"AVdh"), 64, 48));
-    assert!(matches!(crate::adapt_dnx::decode(&[0u8; 16], m.info()), Err(VideoError::Unsupported(_))));
-    // The intra path of the movie reaches the adapter and passes its error on.
-    let mut m = m.with_dnx_adapter();
-    assert!(matches!(m.frame(0), Err(VideoError::Unsupported(why)) if why.contains("VC-3")));
 }
 
 /// Words that must never appear in anything the app shows about a codec.
