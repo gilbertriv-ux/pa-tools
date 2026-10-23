@@ -34,11 +34,6 @@ name: Pa Tools macOS release
 on:
   workflow_dispatch:
   push:
-    # TEMP (remove before merge): verify this lane on a branch push. workflow_dispatch is only
-    # available once the file is on the default branch, and tag pushes are blocked for the build
-    # session, so a branch push is the only way to exercise the workflow from this lane. A branch
-    # push runs the build job only; the draft-release job is gated on refs/tags/v* and is skipped.
-    branches: ["ci/release-macos"]
     tags: ["v*"]
 
 # Read-only by default; only the draft-release job asks for contents: write.
