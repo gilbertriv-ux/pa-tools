@@ -9,16 +9,25 @@
 //! folder). Nothing downloads the model yet: it has to be put in one of those places.
 //!
 //! Two ways in, one code path:
-//! - `track.transcribe` does everything on the calling thread (CLI, MCP, scripts).
+//! - `track.transcribe` does everything on the calling thread (CLI, MCP, control channel, scripts):
+//!   the call returns when the transcript is stored, and may take minutes for a long track.
 //! - [`transcribe_job`] gathers the audio on the calling thread and [`TranscribeJob::run`] does the
 //!   recognition on any thread, so a UI stays responsive (like [`super::bounce_job`]); the UI then
 //!   stores the result with `track.set_transcript`, which agents can also call with a transcript
-//!   they bring themselves.
+//!   they bring themselves. The app's own menu entry and command palette take this way (the
+//!   Transcript window's background job), never the synchronous command.
+//!
+//! The audio: the track's clips are rendered in ranges of [`RENDER_CHUNK_SECS`] and downmixed to
+//! one mono buffer at the session rate, then resampled once. Rendering a long track in one call
+//! would run into `soundcraft_mix::MAX_RENDER_SAMPLES` (2^29 samples summed over channels, which
+//! `render_clips` answers by silently cutting the render short); ranges that small never do. The
+//! mono buffer itself is capped at [`MAX_MONO_SAMPLES`], and a track that does not fit is refused
+//! before anything is rendered. A transcription never reports `ok` for less than the whole track.
 
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{TrackKind, Transcript, TranscriptWord};
+use soundcraft_model::{Session, TrackKind, Transcript, TranscriptWord};
 use soundcraft_pa_speech::{ModelSearch, resolve_models_dir};
 use soundcraft_time::{Range, SampleRate, Samples};
 use std::path::PathBuf;
@@ -30,6 +39,15 @@ const SET_TRANSCRIPT: &str = "track.set_transcript";
 /// limit ([`soundcraft_pa_speech::MAX_AUDIO_SECS`], 4 hours). Checked before any audio is rendered
 /// or allocated, so a very long session is refused at once with a clear error.
 pub const MAX_TRANSCRIBE_SECS: usize = soundcraft_pa_speech::MAX_AUDIO_SECS;
+
+/// Most samples the mono, session-rate buffer of one transcription may hold: 2^29 samples, 2 GiB of
+/// `f32`, about 3.1 hours at 48 kHz (the resampled 16 kHz audio is a third of that again). A track
+/// that is longer at its session rate is refused before it is rendered, with an error that says
+/// how long a track may be at that rate.
+pub const MAX_MONO_SAMPLES: usize = 1 << 29;
+
+/// Seconds of a track rendered in one call while its audio is gathered.
+pub const RENDER_CHUNK_SECS: usize = 60;
 
 /// Most words one stored transcript may hold (about 100 hours of speech); more is refused.
 pub const MAX_TRANSCRIPT_WORDS: usize = 2_000_000;
@@ -46,7 +64,11 @@ pub fn specs() -> Vec<CommandSpec> {
             "{track?: id|name, model?: 'whisper-base', models_dir?: path, language?: 'en', diarize?: bool} — \
              speech-to-text for a track (undoable); needs a build with the speech feature and the speech model on \
              disk: it is looked for in $PA_SPEECH_MODELS_DIR, then the app bundle's resources, then the application \
-             data folder (`models_dir` overrides the search); nothing downloads it yet; sessions over 4 hours are refused",
+             data folder (`models_dir` overrides the search); nothing downloads it yet; a track longer than 4 hours, \
+             or too long to hold in memory at its sample rate (2^29 samples, about 3.1 hours at 48 kHz), is refused, \
+             never cut short. Called here (control channel, MCP, CLI) it runs on the calling thread and returns when \
+             the transcript is stored; the app's own menu and command palette run it as a background job in the \
+             Transcript window instead",
             always,
             transcribe
         ),
@@ -96,6 +118,26 @@ pub fn transcribe_job(e: &Engine, p: &Value) -> Result<TranscribeJob> {
 /// [`transcribe_job`] with the places to look for the model given (tests pass their own, so no
 /// process environment is touched).
 fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<TranscribeJob> {
+    transcribe_job_limits(e, p, search, &Limits::DEFAULT)
+}
+
+/// How much audio one transcription may gather, and how it is rendered. The fixed values are the
+/// constants above; tests lower them so the edges can be reached without gigabytes of audio.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    /// Longest track, in seconds.
+    max_secs: usize,
+    /// Most samples in the mono, session-rate buffer.
+    max_samples: usize,
+    /// Seconds of the track rendered per call.
+    chunk_secs: usize,
+}
+
+impl Limits {
+    const DEFAULT: Limits = Limits { max_secs: MAX_TRANSCRIBE_SECS, max_samples: MAX_MONO_SAMPLES, chunk_secs: RENDER_CHUNK_SECS };
+}
+
+fn transcribe_job_limits(e: &Engine, p: &Value, search: &ModelSearch, limits: &Limits) -> Result<TranscribeJob> {
     // The track: explicit `track`, else the first audio track.
     let track = match track_param(e, TRANSCRIBE, p, "track")? {
         Some(t) => t,
@@ -116,12 +158,13 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
         None => resolve_models_dir(search, &model),
     };
 
-    // Render the track's clips and downmix to mono at the session rate, then resample to 16 kHz.
+    // Gather the track's clips as mono at the session rate (refusing a track that is too long
+    // before rendering any of it), then resample to 16 kHz.
     let sr = e.session().sample_rate;
-    let end = e.session().content_end();
-    check_length(end, sr)?;
-    let channels = soundcraft_mix::render_clips(e.session(), track, Range::new(0, end));
-    let mono = soundcraft_pa_speech::downmix(&channels);
+    let end = track_end(e.session(), track);
+    check_length_with(end, sr, limits)?;
+    let channels = e.session().track(track).map_or(1, |t| t.channels());
+    let mono = render_mono(e.session(), track, end, chunk_samples(sr, channels, limits.chunk_secs))?;
     // High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's 16 kHz.
     let audio = soundcraft_dsp::offline::resample(&[mono], sr.hz(), soundcraft_pa_speech::SAMPLE_RATE).into_iter().next().unwrap_or_default();
 
@@ -131,6 +174,66 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
         max_speakers: 6,
     };
     Ok(TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts })
+}
+
+/// Where `track`'s audio ends, in samples from the session start (0 for a track with no clips).
+/// This track's own end, not the session's: a short track in a long session is not "too long".
+fn track_end(s: &Session, track: TrackId) -> Samples {
+    s.track(track).and_then(|t| t.playlist()).map_or(0, |p| p.end()).max(0)
+}
+
+/// Samples per render call for a track of `channels` channels: [`Limits::chunk_secs`] seconds, but
+/// never so many that `soundcraft_mix::render_clips` would cut the render short (it caps one
+/// render at `MAX_RENDER_SAMPLES` summed over the track's channels). At least one.
+fn chunk_samples(sr: SampleRate, channels: usize, chunk_secs: usize) -> usize {
+    let wanted = usize::try_from(sr.hz()).unwrap_or(usize::MAX).saturating_mul(chunk_secs.max(1));
+    wanted.min(soundcraft_mix::MAX_RENDER_SAMPLES / channels.max(1)).max(1)
+}
+
+/// `track`'s clips over `0..end` as one mono buffer at the session rate: the track is rendered
+/// `chunk` samples at a time ([`chunk_samples`]) and each range is averaged over its channels
+/// straight into the buffer, so neither the render cap across channels nor a full-length
+/// multichannel copy is ever in play. Each range is rendered on its own, so a stateful clip effect
+/// (clip EQ or compressor) starts afresh at each range boundary; for speech recognition that is
+/// inaudible where it matters. The caller has checked `end` against the limits (the buffer is
+/// sized from it). Errors rather than return fewer than `end` samples.
+fn render_mono(s: &Session, track: TrackId, end: Samples, chunk: usize) -> Result<Vec<f32>> {
+    let total = usize::try_from(end.max(0)).unwrap_or(usize::MAX);
+    let chunk = chunk.max(1);
+    let mut mono: Vec<f32> = Vec::with_capacity(total);
+    let mut start = 0usize;
+    while start < total {
+        let len = chunk.min(total - start);
+        let range = Range::new(i64::try_from(start).unwrap_or(i64::MAX), i64::try_from(start + len).unwrap_or(i64::MAX));
+        let part = soundcraft_pa_speech::downmix(&soundcraft_mix::render_clips(s, track, range));
+        if part.len() != len {
+            return Err(bad(TRANSCRIBE, format!("rendering stopped early ({} of {len} samples at {start}); nothing was transcribed", part.len())));
+        }
+        mono.extend_from_slice(&part);
+        start += len;
+    }
+    Ok(mono)
+}
+
+/// Why a `model_unavailable` outcome happened, as a code a UI can act on: `not_found` (put the
+/// model where it is looked for), `unsupported_build` (this build cannot recognise speech whatever
+/// is on disk), `unknown_model` (the id is not in the catalogue) or `invalid_model` (the files are
+/// there but cannot be used).
+fn unavailable_reason(err: &soundcraft_pa_speech::SpeechError) -> &'static str {
+    use soundcraft_pa_speech::SpeechError as E;
+    match err {
+        E::ModelUnavailable { .. } | E::NotInstalled(_) => "not_found",
+        E::Unavailable(_) => "unsupported_build",
+        E::UnknownModel(_) => "unknown_model",
+        _ => "invalid_model",
+    }
+}
+
+/// What to call a transcript's `source` when showing it to people: for a model of the catalogue
+/// (`"whisper-base"`) its neutral display name, never the id; anything else (a source an agent
+/// stored with `track.set_transcript`) as it was given.
+pub fn source_label(source: &str) -> String {
+    soundcraft_pa_speech::models::find(source).map_or_else(|| source.to_string(), |m| m.name.to_string())
 }
 
 /// What to do about a `model_unavailable` outcome: where the app looks for the model, and what the
@@ -146,16 +249,26 @@ fn model_hint() -> String {
     }
 }
 
-/// Refuse a session longer than [`MAX_TRANSCRIBE_SECS`] (`end` samples at `sr`) before rendering it.
-fn check_length(end: Samples, sr: SampleRate) -> Result<()> {
-    let secs = end.max(0) as f64 / sr.as_f64().max(1.0);
-    if secs > MAX_TRANSCRIBE_SECS as f64 {
+/// Refuse a track that is longer than the limits allow before any of it is rendered: more than
+/// [`MAX_TRANSCRIBE_SECS`] (the recogniser's own limit), or more samples at its rate than the mono
+/// buffer may hold ([`MAX_MONO_SAMPLES`]). `end` is the track's length in samples at `sr`.
+fn check_length_with(end: Samples, sr: SampleRate, limits: &Limits) -> Result<()> {
+    let samples = u64::try_from(end.max(0)).unwrap_or(0);
+    let rate = sr.as_f64().max(1.0);
+    let secs = samples as f64 / rate;
+    // How long a track may be at this rate: the time limit, or what fits in the buffer.
+    let fits_secs = limits.max_samples as f64 / rate;
+    let (max_secs, memory_bound) = if fits_secs < limits.max_secs as f64 { (fits_secs, true) } else { (limits.max_secs as f64, false) };
+    // Exact in samples (not in seconds) at the edge: a track of exactly the limit is allowed.
+    let over = secs > limits.max_secs as f64 || samples > limits.max_samples as u64;
+    if over {
+        let because = if memory_bound { format!(" at {} Hz (the audio has to fit in memory)", sr.hz()) } else { String::new() };
         return Err(bad(
             TRANSCRIBE,
             format!(
-                "the session is {:.1} hours long; transcription is limited to {} hours (shorten the track or the session first)",
+                "the track is {:.1} hours long; transcription is limited to {:.1} hours{because} (shorten the track first)",
                 secs / 3600.0,
-                MAX_TRANSCRIBE_SECS / 3600
+                max_secs / 3600.0
             ),
         ));
     }
@@ -179,8 +292,12 @@ impl TranscribeJob {
         let transcriber = match models_dir.and_then(|dir| soundcraft_pa_speech::load(&dir, &model)) {
             Ok(t) => t,
             Err(err) => {
+                // `model` is the id agents pass back; `model_name`, `reason` and `why` are for
+                // showing people (no folder paths, no model id); `error` is the full text for
+                // agents and logs, with every place searched.
                 let result = json!({
-                    "status": "model_unavailable", "track": track.0, "model": model, "error": err.to_string(),
+                    "status": "model_unavailable", "track": track.0, "model": model, "model_name": soundcraft_pa_speech::models::label(&model),
+                    "reason": unavailable_reason(&err), "why": err.summary(), "error": err.to_string(),
                     "samples_16k": audio.len(), "hint": model_hint()
                 });
                 return Ok(TranscribeOutcome { result, transcript: None });
@@ -289,6 +406,11 @@ mod tests {
 
     fn first_audio(e: &Engine) -> TrackId {
         e.session().tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap()
+    }
+
+    /// The default limits.
+    fn check_length(end: Samples, sr: SampleRate) -> Result<()> {
+        check_length_with(end, sr, &Limits::DEFAULT)
     }
 
     /// Whatever the recogniser returns, the job's words must be accepted by `track.set_transcript`
@@ -469,13 +591,24 @@ mod tests {
         let out = job.run(&mut |_, _| true).unwrap();
         assert_eq!(out.result["status"], "model_unavailable");
         let error = out.result["error"].as_str().unwrap();
-        assert!(error.contains("not found (searched:") && error.contains("whisper-base"), "{error}");
+        assert!(error.starts_with("Speech model, base (multilingual) not found (searched:"), "{error}");
+        assert!(!error.to_lowercase().contains("whisper"), "{error}");
         assert!(
             error.contains(&*scratch.0.join("env").to_string_lossy()) && error.contains(&*scratch.0.join("support").to_string_lossy()),
             "{error}"
         );
         assert!(out.result["samples_16k"].as_u64().unwrap() > 0);
         assert!(out.transcript.is_none());
+        // Agents get the id (`model`) and the full text (`error`); the fields meant for people name
+        // the model by its display name and leave out the model id and the folders searched.
+        assert_eq!(out.result["model"], "whisper-base");
+        assert_eq!(out.result["model_name"], "Speech model, base (multilingual)");
+        assert_eq!(out.result["reason"], "not_found");
+        assert_eq!(out.result["why"], "Speech model, base (multilingual) was not found");
+        for shown in ["model_name", "why"] {
+            let text = out.result[shown].as_str().unwrap();
+            assert!(!text.to_lowercase().contains("whisper") && !text.contains(&*scratch.0.to_string_lossy()), "{shown}: {text}");
+        }
         // The hint says where the model is looked for and promises no download.
         let hint = out.result["hint"].as_str().unwrap();
         assert!(hint.contains("PA_SPEECH_MODELS_DIR") && hint.contains("app bundle") && hint.contains("application data folder"), "{hint}");
@@ -517,7 +650,8 @@ mod tests {
         let out =
             transcribe_job_with(&e, &json!({"track": t.0, "models_dir": empty.to_string_lossy()}), &search).unwrap().run(&mut |_, _| true).unwrap();
         assert_eq!(out.result["status"], "model_unavailable");
-        assert_eq!(out.result["error"], "the speech model `whisper-base` is not installed");
+        assert_eq!(out.result["error"], "Speech model, base (multilingual) is not installed");
+        assert_eq!((out.result["reason"].as_str(), out.result["model"].as_str()), (Some("not_found"), Some("whisper-base")));
     }
 
     #[test]
@@ -534,13 +668,14 @@ mod tests {
     }
 
     #[test]
-    fn a_session_longer_than_the_cap_is_refused_before_anything_is_rendered() {
-        let sr = SampleRate::HZ_48000;
-        let cap = MAX_TRANSCRIBE_SECS as i64 * 48_000;
+    fn a_track_longer_than_the_cap_is_refused_before_anything_is_rendered() {
+        // The 4-hour limit, at a rate where it is the tighter one (32 kHz: 4 h is under 2^29 samples).
+        let sr = SampleRate::new(32_000).unwrap();
+        let cap = MAX_TRANSCRIBE_SECS as i64 * 32_000;
         assert!(check_length(0, sr).is_ok());
         assert!(check_length(cap, sr).is_ok(), "exactly the cap is allowed");
-        let msg = check_length(cap + 48_000, sr).unwrap_err().to_string();
-        assert!(msg.contains("4.0 hours") && msg.contains("limited to 4 hours"), "{msg}");
+        let msg = check_length(cap + 32_000, sr).unwrap_err().to_string();
+        assert!(msg.contains("4.0 hours long") && msg.contains("limited to 4.0 hours") && !msg.contains("memory"), "{msg}");
         assert!(check_length(i64::MAX, sr).is_err(), "no overflow");
         assert!(check_length(-5, sr).is_ok());
 
@@ -557,6 +692,137 @@ mod tests {
         let steps = e.undo_history().len();
         assert!(e.execute(TRANSCRIBE, &json!({"track": t.0})).is_err());
         assert_eq!(e.undo_history().len(), steps);
+    }
+
+    /// The mono buffer has a memory cap of its own, which is the tighter limit at common rates:
+    /// 2^29 samples is 3.1 hours at 48 kHz. A longer track is refused, saying how long one may be.
+    #[test]
+    fn a_track_too_long_to_hold_in_memory_is_refused_with_the_limit_for_its_rate() {
+        assert_eq!(MAX_MONO_SAMPLES, 1 << 29);
+        let sr = SampleRate::HZ_48000;
+        let cap = MAX_MONO_SAMPLES as i64;
+        assert!(check_length(cap, sr).is_ok(), "exactly the cap is allowed");
+        let msg = check_length(cap + 1, sr).unwrap_err().to_string();
+        assert!(msg.contains("3.1 hours long") && msg.contains("limited to 3.1 hours at 48000 Hz") && msg.contains("fit in memory"), "{msg}");
+        // The 4-hour session of the old limit is refused at 48 kHz and fine at 24 kHz.
+        let four_hours = MAX_TRANSCRIBE_SECS as i64 * 48_000;
+        assert!(check_length(four_hours, sr).is_err());
+        assert!(check_length(MAX_TRANSCRIBE_SECS as i64 * 24_000, SampleRate::new(24_000).unwrap()).is_ok());
+    }
+
+    /// The reported case: a stereo clip at 25:00 on a 192 kHz session. One 2^29-sample render across
+    /// both channels stops at 23.3 minutes, and the command answered `ok` for the part it had.
+    #[test]
+    fn a_clip_beyond_the_old_render_cap_is_covered_by_ranges_not_cut() {
+        let sr = SampleRate::new(192_000).unwrap();
+        let end = (25 * 60 + 10) * 192_000;
+        assert!(end > soundcraft_mix::MAX_RENDER_SAMPLES as i64 / 2, "past what a one-shot stereo render holds");
+        assert!(check_length(end, sr).is_ok(), "it fits the mono buffer, so it is transcribed in full");
+        let chunk = chunk_samples(sr, 2, RENDER_CHUNK_SECS);
+        assert_eq!(chunk, 60 * 192_000);
+        assert!(chunk * 2 <= soundcraft_mix::MAX_RENDER_SAMPLES, "every range is under the render cap");
+        // Ranges of this size cover the track exactly, with no gap at the old cap.
+        let mut covered = 0usize;
+        while (covered as i64) < end {
+            covered += chunk.min(end as usize - covered);
+        }
+        assert_eq!(covered as i64, end);
+        // 50 minutes at 192 kHz would not fit the mono buffer: refused, never `ok` and short.
+        let refused = check_length(50 * 60 * 192_000, sr).unwrap_err().to_string();
+        assert!(refused.contains("limited to") && refused.contains("192000 Hz") && refused.contains("fit in memory"), "{refused}");
+    }
+
+    #[test]
+    fn a_range_is_never_longer_than_the_render_cap_allows() {
+        let hz192 = SampleRate::new(192_000).unwrap();
+        for channels in [0usize, 1, 2, 6, 16, 64, 1000, usize::MAX] {
+            for sr in [SampleRate::HZ_48000, hz192] {
+                for secs in [0usize, 1, 60, 3600, usize::MAX] {
+                    let n = chunk_samples(sr, channels, secs);
+                    assert!(n >= 1, "{channels} {secs}");
+                    if channels <= soundcraft_mix::MAX_RENDER_SAMPLES {
+                        assert!(n.saturating_mul(channels.max(1)) <= soundcraft_mix::MAX_RENDER_SAMPLES, "{channels} channels x {n}");
+                    }
+                }
+            }
+        }
+        assert_eq!(chunk_samples(SampleRate::HZ_48000, 2, 60), 2_880_000);
+        // 64 channels at 192 kHz: a minute would be 737 million samples, so the range shrinks.
+        assert_eq!(chunk_samples(hz192, 64, 60), soundcraft_mix::MAX_RENDER_SAMPLES / 64);
+    }
+
+    /// What the job rendered before it rendered in ranges: one call over the whole track.
+    fn one_shot_mono(e: &Engine, t: TrackId) -> Vec<f32> {
+        let end = track_end(e.session(), t);
+        soundcraft_pa_speech::downmix(&soundcraft_mix::render_clips(e.session(), t, Range::new(0, end)))
+    }
+
+    #[test]
+    fn rendering_in_ranges_equals_one_render() {
+        let e = demo_engine();
+        let t = first_audio(&e);
+        let end = track_end(e.session(), t);
+        let reference = one_shot_mono(&e, t);
+        assert_eq!(reference.len() as i64, end);
+        assert!(reference.iter().any(|x| x.abs() > 0.01), "the demo track has audio");
+        // Aligned and unaligned range sizes, one range, and ranges of a single sample's worth.
+        for chunk in [32usize, 4_096, 10_001, 48_000, 100_003, reference.len(), reference.len() + 5, usize::MAX] {
+            let ranged = render_mono(e.session(), t, end, chunk).unwrap();
+            assert_eq!(ranged.len(), reference.len(), "chunk {chunk}");
+            let worst = ranged.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst <= 1e-4, "chunk {chunk}: the largest difference from one render is {worst}");
+        }
+        // An empty track is an empty buffer, not an error.
+        assert!(render_mono(e.session(), t, 0, 4_096).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_render_that_comes_back_short_is_an_error_not_an_ok() {
+        let e = demo_engine();
+        // A track that does not exist renders nothing; asking for 1000 samples must not give 0 back.
+        let err = render_mono(e.session(), TrackId(987_654), 1_000, 400).unwrap_err().to_string();
+        assert!(err.contains("rendering stopped early"), "{err}");
+    }
+
+    #[test]
+    fn a_track_is_gathered_in_full_or_refused_never_cut_short() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let hz = i64::from(e.session().sample_rate.hz());
+        // Shift the track's clips 3 s later (so the front is silence) and take the new end as the
+        // limit, with ranges of 1 s: the same arithmetic as a clip at 25:00 with 60 s ranges.
+        let ids: Vec<_> = e.session().track(t).unwrap().clips().iter().map(|c| c.id).collect();
+        for id in ids {
+            e.session_mut().find_clip_mut(id).unwrap().start += 3 * hz;
+        }
+        let end = track_end(e.session(), t);
+        assert!(end > 4 * hz, "the demo track is longer than a second");
+        let limits = Limits { max_secs: MAX_TRANSCRIBE_SECS, max_samples: end as usize, chunk_secs: 1 };
+        let search = ModelSearch::default();
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), &search, &limits).unwrap();
+        // Exactly at the limit is allowed, and all of it is there: to the last sample, resampled.
+        assert!((job.duration_secs() - end as f64 / hz as f64).abs() < 0.01, "{} s of {} s", job.duration_secs(), end as f64 / hz as f64);
+        let mono = render_mono(e.session(), t, end, chunk_samples(e.session().sample_rate, 2, 1)).unwrap();
+        assert_eq!(mono.len() as i64, end);
+        assert!(mono[..(3 * hz) as usize].iter().all(|x| *x == 0.0), "the 3 s moved in front of the clips are silence");
+        assert!(mono[(end - 2 * hz) as usize..].iter().any(|x| x.abs() > 1e-3), "the last two ranges hold the end of the track");
+        let reference = one_shot_mono(&e, t);
+        let worst = mono.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(mono.len() == reference.len() && worst <= 1e-4, "ranges and one render agree ({worst})");
+
+        // One sample over the limit: refused, with the limit in the message, and nothing rendered.
+        let tight = Limits { max_samples: end as usize - 1, ..limits };
+        let refused = transcribe_job_limits(&e, &json!({"track": t.0}), &search, &tight).err().expect("one sample too long");
+        assert!(refused.to_string().contains("limited to"), "{refused}");
+    }
+
+    #[test]
+    fn a_transcripts_source_is_shown_by_its_display_name() {
+        assert_eq!(source_label("whisper-base"), "Speech model, base (multilingual)");
+        assert_eq!(source_label("whisper-tiny"), "Speech model, tiny (multilingual)");
+        // Anything else is what an agent stored, as it was given.
+        assert_eq!(source_label("manual"), "manual");
+        assert_eq!(source_label(""), "");
     }
 
     #[test]

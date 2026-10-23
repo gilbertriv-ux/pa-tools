@@ -41,7 +41,7 @@ mod vst3;
 mod zoom_toggle;
 
 pub use file::bounce_job;
-pub use transcribe::{MAX_TRANSCRIPT_WORDS, TranscribeJob, TranscribeOutcome, transcribe_job};
+pub use transcribe::{MAX_MONO_SAMPLES, MAX_TRANSCRIPT_WORDS, TranscribeJob, TranscribeOutcome, source_label, transcribe_job};
 
 pub(crate) use edit::remember_selection;
 
