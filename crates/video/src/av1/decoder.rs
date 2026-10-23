@@ -38,12 +38,15 @@ fn frame_size_allowed(width: u32, height: u32) -> bool {
 }
 
 /// Cap, in bytes, on what a decoder holds for frames: eight reference slots plus the frames being
-/// decoded (see [`Decoder::set_memory_budget`]). 1 GiB per decoder is Gil's decision 5 (2026-10-23);
-/// the app's `Movie` uses it as it is. A level 6.3 frame is allowed by the spec but needs several GB
-/// for its references; a hostile sequence header must not be able to ask for that. The consequence is
-/// that 8K UHD AV1 is refused: about 6000 x 3375 (4:2:0) is the largest 16:9 picture that fits,
-/// about 4096 x 2304 for 4:4:4 with film grain (`docs/video-codecs.md`).
-pub const DEFAULT_MEMORY_BUDGET: u64 = 1 << 30;
+/// decoded (see [`Decoder::set_memory_budget`]). 1.5 GiB per AV1 decoder is Gil's decision 5 as
+/// amended on 2026-10-23 (HEVC and VC-3 keep 1 GiB); the app's `Movie` uses it as it is. A level 6.3
+/// frame is allowed by the spec but needs several GB for its references; a hostile sequence header
+/// must not be able to ask for that.
+///
+/// 1.5 GiB does not reach 8K UHD: by this module's own estimate ([`memory_needed`]) a 7680 x 4320
+/// 4:2:0 picture needs about 1.59 GiB, so it is refused up front. The largest 16:9 pictures that fit
+/// are listed in `docs/video-codecs.md` ("Limits") and pinned by a test in this module.
+pub const DEFAULT_MEMORY_BUDGET: u64 = 3 << 29;
 
 /// Pictures larger than this many luma samples are refused whatever the budget (the same limit as
 /// the rest of the video crate: 8192 x 8192, Gil's decision 5).
@@ -71,6 +74,16 @@ fn frame_costs(seq: &SequenceHeader, width: u32, height: u32) -> (u64, u64) {
 fn frames_in_flight_room(seq: &SequenceHeader, width: u32, height: u32, budget: u64) -> u64 {
     let (reference, working) = frame_costs(seq, width, height);
     budget.saturating_sub(NUM_REF_FRAMES as u64 * reference) / working.max(1)
+}
+
+/// Bytes the decoder estimates it needs to decode frames of `width` x `height` luma samples in a
+/// sequence like `seq`: the eight reference slots plus one frame being decoded. This is the smallest
+/// [`Decoder::set_memory_budget`] that admits the size (a bigger budget also lets frames decode in
+/// parallel with the `threads` feature). The estimate is deliberately pessimistic and counts
+/// `u16` samples whatever the bit depth, so 8-bit and 10-bit pictures cost the same.
+pub fn memory_needed(seq: &SequenceHeader, width: u32, height: u32) -> u64 {
+    let (reference, working) = frame_costs(seq, width, height);
+    (NUM_REF_FRAMES as u64).saturating_mul(reference).saturating_add(working)
 }
 
 /// Whether the decoder accepts frames of `width` x `height` luma samples in a sequence like `seq`
@@ -349,7 +362,7 @@ impl Decoder {
     }
 
     /// Cap, in bytes, on the memory the decoder may need for its frames (default
-    /// [`DEFAULT_MEMORY_BUDGET`], 1 GiB). A frame whose size would need more than this for the eight
+    /// [`DEFAULT_MEMORY_BUDGET`], 1.5 GiB). A frame whose size would need more than this for the eight
     /// reference slots plus the frames in flight is refused with [`Error::Unsupported`] before anything
     /// is allocated. Pictures above 8192 x 8192 samples are refused whatever the budget.
     pub fn set_memory_budget(&mut self, bytes: u64) {
@@ -378,12 +391,19 @@ impl Decoder {
     /// IVF frame); returns the frames that are ready for output, in order (with frame threads,
     /// pictures shown by this chunk may come from a later call or [`flush`]).
     ///
+    /// Each call must hold complete temporal units: the decoder does not carry a partly received
+    /// frame from one call to the next. A frame header whose tile groups are cut off at the end of
+    /// `data` is dropped (with an error if the data is damaged), and tile groups at the start of the
+    /// next call are not joined to it. Feed it a container sample or an IVF frame at a time, not
+    /// arbitrary slices of a byte stream.
+    ///
     /// [`flush`]: Decoder::flush
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<Picture>> {
         self.decode_pts(data, 0)
     }
 
-    /// [`Decoder::decode`] with a timestamp that the pictures shown by this chunk carry.
+    /// [`Decoder::decode`] with a timestamp that the pictures shown by this chunk carry. Like
+    /// `decode`, it takes whole temporal units and drops a partial one.
     pub fn decode_pts(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
         self.pts = pts;
         // A temporal unit holds whole frames, so whatever a damaged earlier unit left half collected
@@ -752,6 +772,10 @@ fn run_job(job: FrameJob, pool: &Pool, stats: &Mutex<DecodeStats>) {
     let mut st = DecodeStats::default();
     // A frame worker that dies would leave its slots unset and every waiter blocked for ever, so a bug
     // that panics is reported as a decoding error for that frame instead (it must never happen).
+    // This is a last-resort net, not the defence, and it works only where panics unwind: under
+    // `panic = "abort"` (a consumer's profile setting) and on wasm32 `catch_unwind` does nothing and a
+    // panic ends the process, so a panic reachable from a file is a crash there. See the "Limits"
+    // section of `docs/video-codecs.md`.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_frame(&job, pool, &mut st)))
         .unwrap_or(Err(Error::Invalid("internal decoder error")));
     match result {
@@ -1074,7 +1098,7 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MEMORY_BUDGET, SequenceHeader, frame_size_allowed, picture_fits_budget};
+    use super::{DEFAULT_MEMORY_BUDGET, SequenceHeader, frame_size_allowed, memory_needed, picture_fits_budget};
 
     #[test]
     fn frames_up_to_the_level_6_3_limits_are_allowed() {
@@ -1119,28 +1143,34 @@ mod tests {
         best
     }
 
-    /// The limits Gil's decision 5 (a 1 GiB decoder budget) puts on AV1, as the docs state them.
+    /// The limits Gil's decision 5 (amended: a 1.5 GiB AV1 decoder budget) puts on AV1, as
+    /// `docs/video-codecs.md` states them. The numbers come from [`frame_costs`], which does not
+    /// look at bit depth (samples are `u16` whatever it is), so 8-bit, 10-bit and 12-bit pictures of
+    /// one layout all have one limit.
     #[test]
-    fn the_one_gibibyte_budget_sets_the_av1_picture_limits() {
+    fn the_one_and_a_half_gibibyte_budget_sets_the_av1_picture_limits() {
         let b = DEFAULT_MEMORY_BUDGET;
-        assert_eq!(b, 1 << 30);
+        assert_eq!(b, 3 << 29, "1.5 GiB");
         let s420 = seq_of(1, 1, false, false);
-        for (w, h) in [(1920, 1080), (3840, 2160), (4096, 2160), (5120, 2880)] {
+        for (w, h) in [(1920, 1080), (3840, 2160), (4096, 2160), (5120, 2880), (7424, 4176)] {
             assert!(picture_fits_budget(&s420, w, h, b), "{w}x{h} 4:2:0 fits");
         }
-        // 8K UHD and DCI 8K are refused up front, whatever the chroma layout
+        // 8K UHD does not fit, in any layout, though it is 96 MiB short in 4:2:0
         for (w, h) in [(7680, 4320), (8192, 4320), (8192, 4096), (8192, 8192)] {
             assert!(!picture_fits_budget(&s420, w, h, b), "{w}x{h} 4:2:0 is beyond the budget");
         }
-        // the edges, widest 16:9 picture in steps of 16 columns (docs/video-codecs.md quotes these)
-        let (w, h) = widest_16_9(&s420, b);
-        assert!((5950..=6050).contains(&w), "4:2:0 limit {w}x{h}: about 6000 x 3375");
-        let limit = |ssx, ssy, mono, grain| widest_16_9(&seq_of(ssx, ssy, mono, grain), b).0;
-        assert!((5300..=5450).contains(&limit(1, 1, false, true)), "4:2:0 with film grain");
-        assert!((5200..=5300).contains(&limit(1, 0, false, false)), "4:2:2");
-        assert!((4300..=4400).contains(&limit(0, 0, false, false)), "4:4:4");
-        assert!((4050..=4150).contains(&limit(0, 0, false, true)), "4:4:4 with film grain: about 4096 x 2304");
-        assert!(limit(1, 1, true, false) < 7680, "even monochrome cannot hold 8K UHD");
+        assert_eq!(memory_needed(&s420, 7680, 4320), 1_711_365_120, "1.594 GiB for 8K UHD 4:2:0");
+        assert!(memory_needed(&s420, 7680, 4320) > b);
+        assert!(!picture_fits_budget(&s420, 7680, 4320, 1_711_365_119));
+        assert!(picture_fits_budget(&s420, 7680, 4320, 1_711_365_120), "the smallest budget that admits 8K UHD");
+        // the edges: the widest 16:9 picture in steps of 16 columns (the docs quote these)
+        let limit = |ssx, ssy, mono, grain| widest_16_9(&seq_of(ssx, ssy, mono, grain), b);
+        assert_eq!(limit(1, 1, false, false), (7424, 4176), "4:2:0, 8 or 10 bits");
+        assert_eq!(limit(1, 1, false, true), (6592, 3708), "4:2:0 with film grain");
+        assert_eq!(limit(1, 0, false, false), (6528, 3672), "4:2:2");
+        assert_eq!(limit(0, 0, false, false), (5456, 3069), "4:4:4");
+        assert_eq!(limit(0, 0, false, true), (5056, 2844), "4:4:4 with film grain, 12 bits or any");
+        assert_eq!(limit(1, 1, true, false), (7952, 4473), "monochrome");
         // a bigger budget accepts what the default refuses; level 6.3 and 8192 x 8192 still cap it
         assert!(picture_fits_budget(&s420, 7680, 4320, 2 << 30));
         assert!(picture_fits_budget(&s420, 16384, 2176, u64::MAX), "exactly MaxPicSize with no budget limit");

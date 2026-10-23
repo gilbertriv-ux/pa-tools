@@ -29,7 +29,7 @@ mod symbol;
 mod tile;
 mod transform;
 
-pub use decoder::{DEFAULT_MEMORY_BUDGET, Decoder, picture_fits_budget};
+pub use decoder::{DEFAULT_MEMORY_BUDGET, Decoder, memory_needed, picture_fits_budget};
 pub use header::{ColorConfig, FrameHeader, SequenceHeader};
 pub use stats::{DecodeStats, Stage};
 

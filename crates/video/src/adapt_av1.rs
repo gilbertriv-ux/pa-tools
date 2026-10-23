@@ -52,12 +52,16 @@ pub(crate) fn describe(cfg: &Av1Config) -> Described {
         }
     };
     // The sequence header the record carries says how large frames get. A picture whose references and
-    // working copies cannot fit the decoder's memory budget (1 GiB, Gil's decision 5) would open as
+    // working copies cannot fit the decoder's memory budget (1.5 GiB, Gil's decision 5 as amended) would open as
     // decodable and then fail on every frame, so it is refused here, up front, the way HEVC is.
     let unsupported = crate::av1::find_sequence_header(&cfg.config_obus).and_then(|seq| {
         let (w, h) = (seq.max_frame_width, seq.max_frame_height);
-        (!crate::av1::picture_fits_budget(&seq, w, h, crate::av1::DEFAULT_MEMORY_BUDGET))
-            .then(|| format!("AV1 {w}x{h} pictures are unsupported in this build: picture too large for the memory budget"))
+        let fits = |budget| crate::av1::picture_fits_budget(&seq, w, h, budget);
+        (!fits(crate::av1::DEFAULT_MEMORY_BUDGET)).then(|| {
+            // beyond the format's own limits (level 6.3, 8192 x 8192) whatever the memory, or only the budget?
+            let why = if fits(u64::MAX) { "picture too large for the memory budget" } else { "picture size beyond the decoder's limits" };
+            format!("AV1 {w}x{h} pictures are unsupported in this build: {why}")
+        })
     });
     Described { detail: format!("AV1 {profile} {depth}-bit {chroma}"), unsupported }
 }
@@ -248,19 +252,21 @@ mod tests {
         obu
     }
 
-    /// Gil's decision 5: a 1 GiB decoder budget. An AV1 picture the decoder would refuse on every frame
+    /// Gil's decision 5 (amended): a 1.5 GiB decoder budget. An AV1 picture the decoder would refuse on every frame
     /// is refused when the file opens, with the reason, rather than shown as decodable.
     #[test]
     fn a_picture_beyond_the_memory_budget_is_refused_when_the_file_opens() {
         let base = config(0, false, false, false, true, true);
-        for (w, h, fits) in [
-            (64, 64, true),
-            (1920, 1080, true),
-            (3840, 2160, true),
-            (5120, 2880, true),
-            (7680, 4320, false),
-            (8192, 4320, false),
-            (8192, 8192, false),
+        for (w, h, fits, reason) in [
+            (64, 64, true, ""),
+            (1920, 1080, true, ""),
+            (3840, 2160, true, ""),
+            (5120, 2880, true, ""),
+            (7424, 4176, true, ""),
+            (7680, 4320, false, "too large for the memory budget"),
+            (8192, 4320, false, "too large for the memory budget"),
+            (8192, 4352, false, "too large for the memory budget"), // the level 6.3 maximum: only the budget stops it
+            (8192, 8192, false, "size beyond the decoder's limits"), // past level 6.3 and the 8192 x 8192 area: no budget would do
         ] {
             let d = describe(&Av1Config { config_obus: sequence_obu(w, h), ..base.clone() });
             assert_eq!(d.detail, "AV1 Main 8-bit 4:2:0");
@@ -268,10 +274,7 @@ mod tests {
                 assert_eq!(d.unsupported, None, "{w}x{h}");
             } else {
                 let why = d.unsupported.unwrap_or_default();
-                assert!(
-                    why.contains(&format!("{w}x{h}")) && why.contains("unsupported in this build") && why.contains("too large for the memory budget"),
-                    "{why}"
-                );
+                assert!(why.contains(&format!("{w}x{h}")) && why.contains("unsupported in this build") && why.contains(reason), "{why}");
             }
         }
         // a record with no sequence header (or a damaged one) says nothing about size: the stream decides
