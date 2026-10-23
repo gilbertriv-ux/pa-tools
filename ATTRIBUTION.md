@@ -23,6 +23,30 @@ The demo session's audio (drums, bass, pad) and its MIDI parts are synthesised i
 `crates/engine/src/demo.rs` by the SoundCraft contributors (MIT OR Apache-2.0). No sample files
 are bundled.
 
+## Audio codecs (ported, clean-room donor)
+
+The compressed-audio export crates come from [FilmCraft](https://github.com/storytold/filmcraft)
+(`storytold/filmcraft`) and [EffectCraft](https://github.com/storytold/effectcraft) (`storytold/effectcraft`), the
+sibling apps of SoundCraft (MIT OR Apache-2.0, the same license as this repository). Each is pinned to a donor
+commit, and the donor READMEs describe the code as clean-room, written from the public specifications, with
+ffmpeg used only as an external test oracle. The first commit of each import is verbatim apart from package names; where a crate
+differs from the donor, the last column says how. Background: `docs/audio-codecs.md`.
+
+| Path | Donor | Written from (per the donor) | License | Local changes |
+|---|---|---|---|---|
+| `crates/bitstream/` | FilmCraft `crates/bitstream` @ d3801e2df8aaf9ce3c4b8b1a92d248b973dd4507 | the public specifications (bit syntax of ISO/IEC 14496) | MIT OR Apache-2.0 | package name; bit counts clamped instead of asserted |
+| `crates/isobmff/` | FilmCraft `crates/isobmff` @ d3801e2df8aaf9ce3c4b8b1a92d248b973dd4507 | ISO/IEC 14496-12 (ISO base media file format) | MIT OR Apache-2.0 | package name; `Brand::M4a` and `Mp4Writer::set_edits` added; donor test kit not imported |
+| `crates/aac/` | FilmCraft `crates/aac` @ d3801e2df8aaf9ce3c4b8b1a92d248b973dd4507 (the `.m4a` / ADTS design of `export/aac_out.rs` re-implemented, not copied) | ISO/IEC 14496-3 (AAC-LC); Huffman codebooks: see below | MIT OR Apache-2.0 | package name; everything behind the Cargo feature `aac-encode` (off by default, off in shipped builds); validated export API (`src/export/`); no-panic hardening |
+| `crates/ogg/` | FilmCraft `crates/ogg` @ d3801e2df8aaf9ce3c4b8b1a92d248b973dd4507 | RFC 3533, RFC 7845 | MIT OR Apache-2.0 | package name; used only as a test tool (independent parser of the Opus files) |
+| `crates/opus-decode/` | FilmCraft `crates/opus` @ d3801e2df8aaf9ce3c4b8b1a92d248b973dd4507 | RFC 6716 | MIT OR Apache-2.0 | package name; no-panic hardening; used only as a test tool (round-trip decoder) |
+| `crates/opus/` (`src/lib.rs`, `celt`, `silk` and friends) | EffectCraft `crates/opusenc` @ 9581b53c3f8945683252af0eb5fac79e0e43aed4 | RFC 6716 | MIT OR Apache-2.0 | package name; fallible constructors and `Result` API, SILK rate-control fallback, no-panic hardening |
+| `crates/opus/src/{ogg,rate_convert,stream,error}.rs` | Pa Tools (GR8 ID YUZ.AI), new | RFC 3533 (Ogg pages, CRC-32), RFC 7845 (Opus in Ogg), a Kaiser-windowed sinc resampler | MIT OR Apache-2.0 | n/a (not donor code) |
+
+**AAC Huffman codebooks.** `crates/aac/src/huffman_tables.rs` holds the normative values of ISO/IEC 14496-3
+Annex 4.A. The donor authors recovered them by probing an ffmpeg binary's decoder output as a black-box oracle
+(the scripts are kept in `crates/aac/tools/`); no ffmpeg source code was read or copied, and every table is
+checked to be a complete prefix code. Flagged for the owner to confirm; it does not change the licence column.
+
 ## Fonts
 
 Pa Tools bundles no font files. It uses the default fonts shipped inside the `egui` crate
