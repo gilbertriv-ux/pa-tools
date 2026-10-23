@@ -113,6 +113,34 @@ jobs:
           } | tee ci-all.log || true
           bash .github/scripts/ci-digest.sh ci-all.log "all failing tests and remaining gates"
 
+      # TEMP (to be removed before merge): probe which recovery tests flake on Linux and why.
+      - name: TEMP recovery flake probe
+        if: failure()
+        run: |
+          set +e
+          sed -i 's|next.recover(&left\[0\]);|next.recover(\&left[0]); eprintln!("PROBE status={}", next.ui.status);|' crates/ui-egui/tests/recovery.rs
+          sed -i 's|        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "{end}");|        eprintln!("PROBE dirs {end}: {:?}", std::fs::read_dir(\&root).unwrap().flatten().map(\|d\| d.file_name()).collect::<Vec<_>>()); assert_eq!(std::fs::read_dir(\&root).unwrap().count(), 1, "{end}");|' crates/ui-egui/tests/recovery.rs
+          git diff --stat -- crates/ui-egui/tests/recovery.rs | tail -1
+          BIN=$(cargo test -p soundcraft-ui-egui --test recovery --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "recovery") | .executable' | tail -1)
+          echo "binary: $BIN"
+          {
+            for mode in parallel one-cpu; do
+              for i in $(seq 1 12); do
+                rm -rf /tmp/soundcraft-recovery-*
+                if [ "$mode" = one-cpu ]; then out=$(taskset -c 0 "$BIN" --nocapture 2>&1); else out=$("$BIN" --nocapture 2>&1); fi
+                rc=$?
+                if [ $rc -eq 0 ]; then echo "$mode $i: ok"; else
+                  echo "$mode $i: FAIL"
+                  printf '%s\n' "$out" | grep -E 'PROBE|panicked at|^test .* FAILED|left:|right:|assertion' | head -8
+                  find /tmp -maxdepth 3 -path '*soundcraft-recovery-*' -printf '   %p %TT %s\n' 2>/dev/null | head -12
+                fi
+              done
+            done
+          } > probe.log 2>&1
+          msg=$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' probe.log | head -c 30000)
+          echo "::error title=TEMP recovery probe::${msg}"
+
   build-test:
     name: build and test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
