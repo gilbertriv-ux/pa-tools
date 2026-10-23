@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (G-03 shrunk: AAF and OMF read and write exist as a library) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -17,7 +17,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 |---|---|---|---|---:|
 | G-01 | **Alpha blocker.** No channel routing or duplex low-latency path (device, rate and buffer choice done; ASIO opt-in) | Hardware | [hardware-parity.md](hardware-parity.md) | 15–25 |
 | G-02 | **Alpha blocker.** No MIDI device input or output | Hardware / MIDI | [hardware-parity.md](hardware-parity.md) | 20–35 |
-| G-03 | **Alpha blocker.** Cannot exchange sessions with Pro Tools (no AAF/OMF, no `.ptx`) | File formats | [file-format-parity.md](file-format-parity.md) | 50–90 |
+| G-03 | **Alpha blocker.** Cannot exchange sessions with Pro Tools (AAF/OMF library done but not reachable from the app; no `.ptx`) | File formats | [file-format-parity.md](file-format-parity.md) | 12–22 |
 | G-04 | Open correctness bugs in features counted as done (~25 issues) | Stability | this file | 25–40 |
 | G-05 | (Entitlement part: alpha blocker for the mix row) Third-party VST3s blocked in the signed macOS build; AU editors missing | Ecosystem | [plugin-parity.md](plugin-parity.md) | 15–25 |
 | G-06 | (Record-to-disk part: alpha blocker for the tracking row) Sources decoded whole into RAM; recording into RAM | Performance | [hardware-parity.md](hardware-parity.md) | 15–25 |
@@ -70,13 +70,27 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 
 ### G-03. Session interchange with Pro Tools
 
-- **Missing:** opening or saving `.ptx`/`.ptf`, AAF and OMF import and export (#40), Media
-  Composer–compatible sessions. Our session format is `.scraft` JSON.
-- **Impact:** the standard's main-format bar for beta. A Pro Tools user cannot bring a project in
-  or hand one back; post-production (picture editors deliver AAF) is blocked.
-- **Estimate:** AAF/OMF import + export ≈ 50–90 h (FilmCraft already writes AAF/OMF; we can learn
-  from it but not share code). `.ptx` is proprietary and undocumented: owner decision on whether
-  black-box format study is in the clean-room rules; not included in the estimate.
+- **Done (2026-10-23, library only):** `crates/cfb` (the compound file container) and
+  `crates/interchange` read and write AAF (Edit Protocol over structured storage, 512- or
+  4096-byte sectors) and OMF 2.0 sound. A session's audio tracks, clips with source offsets,
+  clip gain and gain envelopes, fades and crossfades, memory locations, start timecode and video
+  tracks (AAF) map to and from the files; embedded audio comes back as WAV for the engine to
+  write. Both crates are code shared with FilmCraft (MIT OR Apache-2.0, see `ATTRIBUTION.md`),
+  hardened for hostile files and covered by round-trip, whole-file damage and property tests.
+  Nothing calls the library yet: the engine commands are the open part below.
+- **Missing:** the engine commands `file.import_session_data`/`file.export_aaf_omf` and their menu
+  leaves (the contract is [`g03-interchange-seam.md`](g03-interchange-seam.md); deferred behind the
+  engine lock), a check against files written by real editing software (none are in the repo),
+  Media Composer–compatible sessions, OMF markers and picture, nested sequences (read, then left
+  as gaps), `.ptx`/`.ptf`.
+- **Impact:** the standard's main-format bar for beta. Until the commands land, a Pro Tools user
+  still cannot bring a project in or hand one back; post-production (picture editors deliver AAF)
+  is blocked.
+- **Estimate:** engine commands, undo, relinking and the MCP tools ≈ 6–10 h; the two menu leaves
+  and an import dialog ≈ 2–4 h; verifying against real editor files ≈ 4–8 h (needs sample files).
+  `.ptx` is proprietary and undocumented: owner decision on whether black-box format study is in
+  the clean-room rules; not included. The roll-ups in `roadmap.md` and `target-app-parity.md`
+  still carry the earlier 50–90 h.
 
 ### G-04. Correctness bugs in "done" features
 
@@ -214,6 +228,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | G-03 shrunk: AAF and OMF read and write landed as `crates/cfb` and `crates/interchange` (library, tested); the stale "cannot share code" claim removed; engine commands remain; estimate 50–90 → 12–22 h |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |

@@ -31,6 +31,24 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is text from Inter
 (SIL OFL 1.1) converted to outlines; no font file is shipped.
 
+## Code: AAF and OMF interchange (ported from FilmCraft)
+
+`crates/cfb` (compound file container) and `crates/interchange` (AAF and OMF import and export) are
+ported from [FilmCraft](https://github.com/storytold/filmcraft)'s `crates/cfb` and
+`crates/interchange` (`aaf/`, `omf/` and their time, WAV and path helpers) at commit `f47a1f6`.
+Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors, MIT OR Apache-2.0, the same
+licence as this repository. The verbatim import is commit `1d63357` (cfb) and `c0c762a`
+(interchange); everything after it is Pa Tools' own change: the donor's project model replaced by
+`soundcraft-model` sessions, its EDL / FCP7 / FCPXML / OTIO / ALE importers left out, the readers
+and writers hardened for hostile files, tag names routed through `crates/brand`. The donor's
+older private tag prefix is still read (never written) so files it wrote import with their tags
+understood. The donor's READMEs state that both crates were written from the public specifications
+they list, without the AAF SDK, the OMF Toolkit or another implementation; nothing from those or
+from any Avid code or asset was added here.
+
+No fixture files are bundled for these crates: the donor ships no AAF or OMF files, and every file
+the tests read is generated in memory from synthetic sessions.
+
 ## Files
 
 | Path | Author | Source | License |

@@ -1,7 +1,7 @@
 //! AAF (Advanced Authoring Format) import and export, following the AAF Edit Protocol.
 //!
 //! Written from the public AMWA specifications: *AAF Object Specification v1.1*, *AAF Low-Level
-//! Container Specification v1.0.1* (structured storage mapping, see [`store`]) and *AAF Edit
+//! Container Specification v1.0.1* (structured storage mapping, see `store`) and *AAF Edit
 //! Protocol v1.0*; the container is Microsoft's Compound File Binary format ([`soundcraft_cfb`]).
 //!
 //! The exported file holds one top-level **CompositionMob** (Edit Protocol usage code
@@ -16,10 +16,10 @@
 //!   `Amplitude` **ConstantValue** or **VaryingValue** (keyframes as control points),
 //! - sequence markers as **CommentMarker**s in an event slot;
 //!
-//! a **CompositionMob** without a usage code for every nested sequence, built the same way (a
-//! clip of the nested sequence is a **SourceClip** that points at that mob, at its first slot of
-//! the clip's kind, with its start in that slot's edit units; Premiere Pro writes nested sequences
-//! this way);
+//! (the document model can also hold a **CompositionMob** without a usage code for a nested
+//! sequence, whose clips are **SourceClip**s that point at that mob, as picture editors write
+//! them; a session has no nested sequences, so exports from a session never contain one, and an
+//! import reads them but the session mapping leaves their clips as gaps with a report entry);
 //!
 //! and for every media item a **MasterMob**, a file **SourceMob** per essence (a CDCI or PCM
 //! descriptor with a network locator to the file, or `EssenceData` holding embedded PCM) and a
@@ -29,7 +29,7 @@
 //! Import reads the same structures (and the common variations: sequences inside sequences,
 //! selectors, operation groups around clips, legacy data definitions, essence groups, and Premiere
 //! Pro's one video slot holding a nested scope with a segment per video track) into the
-//! composition model of [`crate::comp`], which [`crate::session`] maps to tracks, clips and markers
+//! composition model (`comp`), which the session mapping (`session`) maps to tracks, clips and markers
 //! of a session (embedded audio is returned as WAV files for the caller to write).
 
 mod ids;

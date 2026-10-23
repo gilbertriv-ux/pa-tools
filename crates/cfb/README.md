@@ -22,8 +22,9 @@ let props = cf.read_path("Header-2/properties")?;       // a stream
 for &child in &cf.entries[header].children { /* sorted siblings */ }
 ```
 
-- Accepts version 3 (512-byte sectors) and version 4 (4096-byte sectors) files; other sector
-  shifts between 7 and 16 are tolerated.
+- Accepts version 3 (512-byte sectors) and version 4 (4096-byte sectors) files. Any other major
+  version, or a sector shift that does not go with the version (9 for 3, 12 for 4), is an error:
+  the version decides how a directory entry's size is read, so it is not guessed.
 - The file is treated as hostile. Every chain (DIFAT, FAT, mini FAT, directory, streams) is
   bounds-checked and cycle-checked: the structural chains are claimed in one bitmap (a loop, or two
   chains sharing a sector, fails at `open`), and stream chains are walked with Brent's cycle

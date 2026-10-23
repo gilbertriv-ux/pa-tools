@@ -1,7 +1,7 @@
 //! OMF Interchange 2.0 export (and import of the same structures) for audio post.
 //!
 //! Written from the public *OMF Interchange Specification Version 2.0* (Avid Technology, 1995/97)
-//! and Apple's *Bento Specification* revision 1.0d5 for the container ([`bento`]).
+//! and Apple's *Bento Specification* revision 1.0d5 for the container (`bento`).
 //!
 //! The file holds a composition mob (`CMOB`) with a timecode slot and one sound slot per audio
 //! track (one per channel when broken out to mono): sequences (`SEQU`) of fillers (`FILL`), source

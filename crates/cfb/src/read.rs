@@ -73,7 +73,7 @@ pub struct Entry {
     /// First sector (regular or mini) of a stream; the mini stream's for the root.
     pub start: u32,
     pub size: u64,
-    /// Child entries of a storage, in sibling-tree order (sorted by [`compare_names`]).
+    /// Child entries of a storage, in sibling-tree order (sorted by [`crate::compare_names`]).
     pub children: Vec<usize>,
     left: u32,
     right: u32,

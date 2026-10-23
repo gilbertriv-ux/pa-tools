@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** trivial (WAV: empty data chunk with trailing metadata (#466); previously minor: continuous fade curvature in Pa Tools sessions) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (AAF and OMF read and write exist as a library, not yet reachable from the app; previously trivial: WAV empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -9,7 +9,7 @@ documented import/bounce options. Ours comes from `crates/audio-io` (`detect_for
 `crates/engine/src/clip_group_file.rs` and `crates/video`.
 
 **File formats: ~40 % ready** (estimated: weighted by how often a Pro Tools user hits each row;
-session interchange carries a third of the weight and is at 0 %). Remaining ≈ 70–120 h.
+session interchange carries a third of the weight and is still counted at 0 % until the engine commands make the AAF and OMF code reachable). Remaining ≈ 70–120 h.
 
 Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not applicable.
 
@@ -19,9 +19,9 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 |---|---|---|---|---|
 | Pro Tools session `.ptx` (and `.ptf` from 7–9) | native | ❌ | ❌ | Proprietary, undocumented. Owner decision needed on black-box format study (G-03) |
 | Session templates `.ptxt` | read/write | ❌ | ❌ | We have no templates at all (G-16) |
-| AAF (Advanced Authoring Format) | import/export | ❌ | ❌ | #40. The post-production handoff from picture editors (G-03) |
-| OMF | import/export | ❌ | ❌ | Legacy, still delivered by some editors |
-| Media Composer–compatible session | export | ❌ | ❌ | AAF variant |
+| AAF (Advanced Authoring Format) | import/export | 🟡 | 🟡 | #40. `crates/interchange` (`soundcraft-interchange`) over `crates/cfb`: tracks, clips, offsets, gain and envelopes, fades, crossfades, markers, timecode, video tracks, embedded or linked audio; round-trip, cut-at-every-byte, bit-flip, looping-chain and property tests. Library only: no engine command or menu leaf yet, no file from real editing software tried (G-03) |
+| OMF | import/export | 🟡 | 🟡 | Legacy, still delivered by some editors. OMF 2.0 sound in the same crate: no markers, no picture, nests left as gaps. Library only, as AAF (G-03) |
+| Media Composer–compatible session | export | ❌ | ❌ | AAF variant; the AAF writer's output is not tuned for it |
 | ADM BWF (Dolby Atmos master) | import/export | ❌ | ❌ | G-12 |
 | Pa Tools session `.scraft` + `Audio Files/` | — | ✅ | ✅ | JSON (serde); mutated-file property test loads or fails cleanly; plugin state embedded. Fades save optional `curvature` (-1..1); missing values default to 0 and preserve legacy envelopes |
 | Import Session Data (from another session) | Pro Tools sessions | 🟡 | — | From `.scraft` only |
@@ -45,7 +45,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | CAF | — | ✅ | ❌ | |
 | Sound Designer / SD II | import (legacy) | ❌ | — | Rare today |
 | ReCycle / REX | import | ❌ | — | Loops |
-| MXF audio (OP-Atom, OP1a) | import | ❌ | ❌ | Avid media; FilmCraft has an MXF reader to learn from |
+| MXF audio (OP-Atom, OP1a) | import | ❌ | ❌ | Avid media; FilmCraft has an MXF reader to port from |
 | iXML / polyphonic field-recorder metadata | read | ❌ | ❌ | G-17 |
 | Peak overviews | `.wfm` cache | ✅ (own, in memory) | — | `audio-io::peaks`; not cached on disk |
 
@@ -80,6 +80,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | AAF and OMF rows ❌ → 🟡: the `cfb` and `interchange` crates read and write them (library only; the engine commands are G-03's open part). Readiness estimate unchanged |
 | 2026-10-13 | trivial | WAV: empty data chunk with trailing metadata (#466) |
 | 2026-10-13 | minor | Fade curvature round-trips in sessions with a zero default for older files. Format version and readiness estimate unchanged |
 | 2026-10-10 | major | Created: format inventory against Pro Tools 2026.4.1's declared document types and import/bounce options |

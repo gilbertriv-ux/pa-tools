@@ -17,7 +17,7 @@
 //! untrusted input: every size, count and depth read from one is checked against limits derived from
 //! the file's length before anything is allocated, and nothing here panics.
 //!
-//! All time inside the crate is exact on [`ticks::Tick`]s (254 016 000 000 per second), which divide
+//! All time inside the crate is exact on ticks (254 016 000 000 per second), which divide
 //! every common frame and sample duration, so conversions between frames, samples and edit units
 //! do not drift.
 
