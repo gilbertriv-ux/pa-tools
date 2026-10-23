@@ -22,8 +22,15 @@ pub enum FilterType {
 
 impl FilterType {
     /// Order used by the parametric EQ's `type` choice parameter.
-    pub const ALL: [FilterType; 7] =
-        [FilterType::Peaking, FilterType::LowShelf, FilterType::HighShelf, FilterType::LowPass, FilterType::HighPass, FilterType::Notch, FilterType::BandPass];
+    pub const ALL: [FilterType; 7] = [
+        FilterType::Peaking,
+        FilterType::LowShelf,
+        FilterType::HighShelf,
+        FilterType::LowPass,
+        FilterType::HighPass,
+        FilterType::Notch,
+        FilterType::BandPass,
+    ];
     pub fn from_index(i: usize) -> FilterType {
         Self::ALL[i.min(Self::ALL.len() - 1)]
     }

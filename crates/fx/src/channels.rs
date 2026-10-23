@@ -325,7 +325,10 @@ mod tests {
 
     #[test]
     fn upmix_places_on_front_speakers() {
-        assert_eq!(matrix(Layout::Mono, Layout::Surround51, Mixdown::FrontRear), vec![vec![0.0], vec![0.0], vec![1.0], vec![0.0], vec![0.0], vec![0.0]]);
+        assert_eq!(
+            matrix(Layout::Mono, Layout::Surround51, Mixdown::FrontRear),
+            vec![vec![0.0], vec![0.0], vec![1.0], vec![0.0], vec![0.0], vec![0.0]]
+        );
         let s = matrix(Layout::Stereo, Layout::Surround51, Mixdown::FrontRear);
         assert_eq!(s[L], vec![1.0, 0.0]);
         assert_eq!(s[R], vec![0.0, 1.0]);

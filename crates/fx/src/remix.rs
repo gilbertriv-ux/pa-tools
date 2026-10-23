@@ -340,7 +340,8 @@ fn beat_features(x: &[f32], sr: u32, beats: &[i64]) -> (Vec<[f32; 12]>, Vec<[f32
         let mut cep = [0f32; 12];
         for (q, c) in cep.iter_mut().enumerate() {
             let q = q + 1;
-            *c = lb.iter().enumerate().map(|(b, v)| v * (std::f64::consts::PI * q as f64 * (b as f64 + 0.5) / BANDS as f64).cos()).sum::<f64>() as f32;
+            *c =
+                lb.iter().enumerate().map(|(b, v)| v * (std::f64::consts::PI * q as f64 * (b as f64 + 0.5) / BANDS as f64).cos()).sum::<f64>() as f32;
         }
         frame_cep.push(cep);
     }
@@ -722,7 +723,12 @@ mod tests {
             }
             assert!(worst <= tol, "worst beat error {} samples ({bpm} BPM)", worst);
             assert!(a.beats.len() + 2 >= truth.len(), "{} beats of {}", a.beats.len(), truth.len());
-            eprintln!("{bpm} BPM at {sr} Hz: detected {:.2}, {} beats, worst error {:.1} ms", a.bpm, a.beats.len(), worst as f64 * 1000.0 / sr as f64);
+            eprintln!(
+                "{bpm} BPM at {sr} Hz: detected {:.2}, {} beats, worst error {:.1} ms",
+                a.bpm,
+                a.beats.len(),
+                worst as f64 * 1000.0 / sr as f64
+            );
         }
     }
 

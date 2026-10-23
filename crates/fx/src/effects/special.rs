@@ -35,8 +35,10 @@ impl ChannelMixer {
     ];
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
-        let mut s =
-            ChannelMixer { pv: ParamValues::new(Self::PARAMS), g: [sm(1.0, sample_rate), sm(0.0, sample_rate), sm(0.0, sample_rate), sm(1.0, sample_rate)] };
+        let mut s = ChannelMixer {
+            pv: ParamValues::new(Self::PARAMS),
+            g: [sm(1.0, sample_rate), sm(0.0, sample_rate), sm(0.0, sample_rate), sm(1.0, sample_rate)],
+        };
         s.apply_params(true);
         s
     }
@@ -44,8 +46,12 @@ impl ChannelMixer {
     fn apply_params(&mut self, snap: bool) {
         let il = if self.pv.on("invert_l") { -1.0 } else { 1.0 };
         let ir = if self.pv.on("invert_r") { -1.0 } else { 1.0 };
-        let v =
-            [il * self.pv.v("l_from_l") / 100.0, il * self.pv.v("l_from_r") / 100.0, ir * self.pv.v("r_from_l") / 100.0, ir * self.pv.v("r_from_r") / 100.0];
+        let v = [
+            il * self.pv.v("l_from_l") / 100.0,
+            il * self.pv.v("l_from_r") / 100.0,
+            ir * self.pv.v("r_from_l") / 100.0,
+            ir * self.pv.v("r_from_r") / 100.0,
+        ];
         for (s, v) in self.g.iter_mut().zip(v) {
             s.set(v);
             if snap {
@@ -607,7 +613,8 @@ impl StereoExpander {
     ];
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
-        let mut s = StereoExpander { pv: ParamValues::new(Self::PARAMS), gl: sm(1.0, sample_rate), gr: sm(1.0, sample_rate), side: sm(1.0, sample_rate) };
+        let mut s =
+            StereoExpander { pv: ParamValues::new(Self::PARAMS), gl: sm(1.0, sample_rate), gr: sm(1.0, sample_rate), side: sm(1.0, sample_rate) };
         s.apply_params(true);
         s
     }

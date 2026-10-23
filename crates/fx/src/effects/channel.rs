@@ -121,8 +121,10 @@ pub struct Balance {
 }
 
 impl Balance {
-    pub const PARAMS: &'static [ParamSpec] =
-        &[ParamSpec::new("balance", "Balance", -100.0, 100.0, 0.0, Unit::Pan), ParamSpec::choice("mode", "Mode", &["Balance", "Pan (constant power)"], 0)];
+    pub const PARAMS: &'static [ParamSpec] = &[
+        ParamSpec::new("balance", "Balance", -100.0, 100.0, 0.0, Unit::Pan),
+        ParamSpec::choice("mode", "Mode", &["Balance", "Pan (constant power)"], 0),
+    ];
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
         let mut s = Balance {

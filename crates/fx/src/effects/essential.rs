@@ -579,13 +579,17 @@ mod tests {
             d.reset();
             let mut y = x.clone();
             d.process(&mut [&mut y]);
-            let pick = |v: &[f32], on: bool| -> Vec<f32> { v.iter().enumerate().skip(SR as usize).filter(|(i, _)| burst(*i) == on).map(|(_, s)| *s).collect() };
+            let pick = |v: &[f32], on: bool| -> Vec<f32> {
+                v.iter().enumerate().skip(SR as usize).filter(|(i, _)| burst(*i) == on).map(|(_, s)| *s).collect()
+            };
             let (xb, yb) = (pick(&x, true), pick(&y, true));
             let sib_drop = 10.0 * (band_energy(&yb, 5000.0, 10000.0) / band_energy(&xb, 5000.0, 10000.0)).log10();
             let low_change = 10.0 * (band_energy(&y, 150.0, 1500.0) / band_energy(&x, 150.0, 1500.0)).log10();
             let (xq, yq) = (pick(&x, false), pick(&y, false));
             let quiet_change = 10.0 * (energy(&yq) / energy(&xq)).log10();
-            println!("deesser reduction {reduction} dB: sibilance {sib_drop:.2} dB, voice band {low_change:.3} dB, non-sibilant passages {quiet_change:.3} dB");
+            println!(
+                "deesser reduction {reduction} dB: sibilance {sib_drop:.2} dB, voice band {low_change:.3} dB, non-sibilant passages {quiet_change:.3} dB"
+            );
             assert!(sib_drop < -need, "sibilance only {sib_drop} dB");
             assert!(low_change.abs() < 1.0, "voice band changed {low_change} dB");
             assert!(quiet_change.abs() < 0.5, "non-sibilant passages changed {quiet_change} dB");

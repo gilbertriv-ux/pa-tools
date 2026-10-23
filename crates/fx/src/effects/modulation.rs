@@ -418,7 +418,8 @@ impl AudioEffect for AnalogDelay {
         let cutoff = [6500.0, 5000.0, 3200.0][mode.min(2)];
         let a = OnePole::alpha(cutoff, self.sr);
         for i in 0..n {
-            let (t, dry, wet, fb, drive, spread) = (self.time.tick(), self.dry.tick(), self.wet.tick(), self.fb.tick(), self.drive.tick(), self.spread.tick());
+            let (t, dry, wet, fb, drive, spread) =
+                (self.time.tick(), self.dry.tick(), self.wet.tick(), self.fb.tick(), self.drive.tick(), self.spread.tick());
             for ch in 0..nch {
                 let x = channels[ch][i];
                 let side = match (nch, ch) {

@@ -314,8 +314,11 @@ impl SimpleEq {
     ];
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
-        let mut s =
-            SimpleEq { pv: ParamValues::new(Self::PARAMS), bank: BandBank::new(sample_rate, channels, 3), out: Smoothed::with_ms(1.0, sample_rate, SMOOTH_MS) };
+        let mut s = SimpleEq {
+            pv: ParamValues::new(Self::PARAMS),
+            bank: BandBank::new(sample_rate, channels, 3),
+            out: Smoothed::with_ms(1.0, sample_rate, SMOOTH_MS),
+        };
         s.apply_params(true);
         s
     }
@@ -481,9 +484,11 @@ mod throughput_tests {
         let mut reference = fast.clone();
         let mut gain = Smoothed::new(1.0, 0);
         let mut ref_gain = gain;
-        for input in
-            [vec![-0.0, 0.0, f32::MIN_POSITIVE, f32::from_bits(1), f32::MAX, -f32::MAX, 0.7], vec![0.0; 100], vec![f32::INFINITY, f32::NEG_INFINITY, f32::NAN]]
-        {
+        for input in [
+            vec![-0.0, 0.0, f32::MIN_POSITIVE, f32::from_bits(1), f32::MAX, -f32::MAX, 0.7],
+            vec![0.0; 100],
+            vec![f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+        ] {
             let mut a = [input.clone(), input];
             let mut b = a.clone();
             let [al, ar] = &mut a;

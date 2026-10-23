@@ -434,7 +434,8 @@ impl AudioEffect for SurroundReverb {
             let len = (n - start).min(CHUNK);
             // Reverb input: side signal plus the centre-weighted mid.
             for i in 0..len {
-                let (l, r) = if nch == 2 { (channels[0][start + i], channels[1][start + i]) } else { (channels[0][start + i], channels[0][start + i]) };
+                let (l, r) =
+                    if nch == 2 { (channels[0][start + i], channels[1][start + i]) } else { (channels[0][start + i], channels[0][start + i]) };
                 let c = self.centre.tick();
                 let (mid, side) = (0.5 * (l + r), 0.5 * (l - r));
                 self.scratch[0][i] = c * mid + side;

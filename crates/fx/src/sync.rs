@@ -402,7 +402,8 @@ mod tests {
         let s = speechy(sr as f64, 12.0, 1);
         for delay in [0i64, 1, 7, 12_345, 96_001, -4_321, -50_000] {
             // b = s shifted: b[n] = s[n + delay]
-            let b: Vec<f32> = (0..400_000i64).map(|n| if n + delay >= 0 && ((n + delay) as usize) < s.len() { s[(n + delay) as usize] } else { 0.0 }).collect();
+            let b: Vec<f32> =
+                (0..400_000i64).map(|n| if n + delay >= 0 && ((n + delay) as usize) < s.len() { s[(n + delay) as usize] } else { 0.0 }).collect();
             let r = find_offset(&s, &b, sr, &SyncOptions::default()).unwrap();
             assert_eq!(r.lag, delay, "{r:?}");
             assert!(r.reliable(), "{r:?}");

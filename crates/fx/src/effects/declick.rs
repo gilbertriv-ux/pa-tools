@@ -88,8 +88,10 @@ pub struct ClickRemover {
 }
 
 impl ClickRemover {
-    pub const PARAMS: &'static [ParamSpec] =
-        &[ParamSpec::new("threshold", "Threshold", 1.0, 100.0, 30.0, Unit::None), ParamSpec::new("complexity", "Complexity", 1.0, 100.0, 16.0, Unit::None)];
+    pub const PARAMS: &'static [ParamSpec] = &[
+        ParamSpec::new("threshold", "Threshold", 1.0, 100.0, 30.0, Unit::None),
+        ParamSpec::new("complexity", "Complexity", 1.0, 100.0, 16.0, Unit::None),
+    ];
 
     pub fn new(_sample_rate: f32, channels: usize) -> Self {
         let win = (0..SPAN).map(|i| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * (i as f64 + 0.5) / SPAN as f64).cos()) as f32).collect();

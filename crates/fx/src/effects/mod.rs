@@ -28,7 +28,9 @@ pub use multiband::{DynamicsRack, MultibandCompressor, TubeCompressor};
 pub use pitch::PitchShifter;
 pub use restoration::{DeHum, DeNoise};
 pub use reverbs::{ConvolutionReverb, SurroundReverb};
-pub use special::{AmbisonicsPanner, Binauralizer, ChannelMixer, Distortion, GuitarSuite, LoudnessMeterFx, Mastering, Mute, StereoExpander, VocalEnhancer};
+pub use special::{
+    AmbisonicsPanner, Binauralizer, ChannelMixer, Distortion, GuitarSuite, LoudnessMeterFx, Mastering, Mute, StereoExpander, VocalEnhancer,
+};
 pub use time::{Delay, Reverb};
 
 use crate::{AudioEffect, ParamSpec, sane_channels, sane_sample_rate};
