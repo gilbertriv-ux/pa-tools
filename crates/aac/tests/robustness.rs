@@ -1,6 +1,8 @@
 //! Fuzz-style robustness: mutated access units, configs and ADTS streams must never panic, and the
 //! encoder must accept hostile input (NaN, ±inf, > full scale, silence, odd chunk sizes).
 
+#![cfg(feature = "aac-encode")]
+
 mod common;
 
 use common::*;
