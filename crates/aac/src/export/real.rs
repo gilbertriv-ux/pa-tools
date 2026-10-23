@@ -62,8 +62,11 @@ fn size_estimate(samples: usize, channels: u16, sample_rate: u32, bitrate_bps: u
 
 /// Streams interleaved audio into an `.m4a` file.
 ///
-/// The media data is written as it is encoded, so memory stays flat however long the audio is, and the
-/// `moov` box is written by [`finish`](Self::finish) (or [`finish_faststart`](Self::finish_faststart)).
+/// The media data is written as it is encoded and never held, but the `moov` box is written by
+/// [`finish`](Self::finish) (or [`finish_faststart`](Self::finish_faststart)) from sample tables that are kept
+/// until then: about 8 bytes per access unit (`stsz` and `stss`), so roughly 32 MB per 24 hours at 48 kHz.
+/// Memory therefore grows slowly with the length of the audio; see `Mp4Writer`'s documentation in
+/// `soundcraft-isobmff`.
 /// A writer that is dropped without `finish` leaves a file no player can open.
 pub struct M4aWriter<W: Write + Seek> {
     mux: Mp4Writer<W>,

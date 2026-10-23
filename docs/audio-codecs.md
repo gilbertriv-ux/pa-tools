@@ -32,9 +32,12 @@ let file: Vec<u8> = soundcraft_aac::encode_m4a(&samples, 2, 44_100, 128_000)?;  
 
 The `_with` variants take options (tags, and for Opus the application and vendor) and also return what the
 encode did (`Stats`: frames in, frames played, packets or access units, and how many samples were NaN or
-beyond full scale). The streaming writers (`write_interleaved` any number of times, then `finish`) keep
-memory flat however long the audio is; they are what a bounce with progress and cancel needs, and their
-output is byte-identical to the one-shot call whatever the chunk size.
+beyond full scale). The streaming writers (`write_interleaved` any number of times, then `finish`) write the
+audio out as it is encoded, so they hold no more than a packet or a second of it; they are what a bounce with
+progress and cancel needs, and their output is byte-identical to the one-shot call whatever the chunk size.
+Memory is flat for Opus (about one second of packets) and for AAC in ADTS, but **not quite flat for `.m4a`**: the
+`stsz` and `stss` sample tables for the `moov` box are kept until `finish`, about 8 bytes per access unit, which is
+roughly 32 MB per 24 hours of 48 kHz audio (1024 samples per access unit).
 
 ### Validation
 
