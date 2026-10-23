@@ -347,7 +347,11 @@ mod tests {
         let mut core = Core::new(2, 48_000, 128_000, false).unwrap();
         core.max_frames = 3000;
         let mut units = 0;
-        assert!(core.push(&[0.1; 2 * 3000], |_| Ok(units += 1)).is_ok());
+        let pushed = core.push(&[0.1; 2 * 3000], |_| {
+            units += 1;
+            Ok(())
+        });
+        assert!(pushed.is_ok() && units >= 1);
         let before = core.stats;
         assert_eq!(core.push(&[0.1; 2], |_| Ok(())), Err(Error::TooLong));
         assert_eq!(core.stats, before, "a refused call changes nothing");
