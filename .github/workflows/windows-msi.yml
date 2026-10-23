@@ -26,8 +26,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a branch or pull request cancels its older run. On `pa-tools` the group is the
+# commit, so no run is cancelled, and none is replaced: GitHub replaces a *pending* run when another
+# arrives in the same group (the same rule as ci.yml).
 concurrency:
-  group: windows-msi-${{ github.ref }}
+  group: msi-${{ github.ref == 'refs/heads/pa-tools' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
 
 env:
