@@ -117,12 +117,22 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_wraps_every_catalogued_string() {
+        // Every one of the 40 catalogued strings comes back pseudo-localised, so a string drawn
+        // without the brackets is one that bypassed translation. (The pseudo locale is debug-only;
+        // tests run in debug.)
+        let (i18n, _) = pa_tools();
+        for key in keys() {
+            let got = i18n.t(Lang::PSEUDO, key);
+            assert!(got.starts_with("[!! ") && got.ends_with(" !!]"), "{key:?} -> {got:?}");
+            assert_ne!(got, key, "{key:?} was not transformed by the pseudo locale");
+        }
+    }
+
+    #[test]
     fn malformed_input_is_reported_not_panicked() {
         // Errors are values: a broken catalog yields problems and still builds a usable runtime.
-        let bad: &Embedded = &[
-            ("fr", "only two\tcolumns\n@bogus\tx\ty\n\tFoo\t\n", ""),
-            ("de", "\u{feff}\tBar\tBaz\n", ""),
-        ];
+        let bad: &Embedded = &[("fr", "only two\tcolumns\n@bogus\tx\ty\n\tFoo\t\n", ""), ("de", "\u{feff}\tBar\tBaz\n", "")];
         let (i18n, problems) = I18n::new(bad, &["fr", "de"]);
         assert!(!problems.is_empty(), "expected problems from the malformed catalog");
         assert_eq!(i18n.t(Lang::EN, "Save"), "Save");

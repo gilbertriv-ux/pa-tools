@@ -380,9 +380,72 @@ fn posix_env_tags(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     tags
 }
 
-/// `⟦text⟧`, each line marked on its own, since multi-line labels are often drawn a line at a time.
+/// `text` pseudo-localised: each line's ASCII letters become accented look-alikes
+/// (`Settings` → `[!! Ŝèţţîñĝš !!]`) and the line is wrapped in `[!! … !!]`. Text drawn without the
+/// brackets never went through translation, and the accents and the few extra bytes per letter
+/// flush out code that assumes ASCII or a layout with no room to grow. Line by line, since
+/// multi-line labels are often drawn one line at a time.
 fn marked(text: &str) -> String {
-    format!("⟦{}⟧", text.replace('\n', "⟧\n⟦"))
+    text.split('\n').map(|line| format!("[!! {} !!]", line.chars().map(accent).collect::<String>())).collect::<Vec<_>>().join("\n")
+}
+
+/// An ASCII letter's accented pseudo-locale look-alike; every other character is left as it is.
+fn accent(c: char) -> char {
+    match c {
+        'a' => 'à',
+        'b' => 'ƀ',
+        'c' => 'ç',
+        'd' => 'ð',
+        'e' => 'è',
+        'f' => 'ƒ',
+        'g' => 'ĝ',
+        'h' => 'ĥ',
+        'i' => 'î',
+        'j' => 'ĵ',
+        'k' => 'ķ',
+        'l' => 'ļ',
+        'm' => 'ɱ',
+        'n' => 'ñ',
+        'o' => 'ò',
+        'p' => 'þ',
+        'q' => 'ɋ',
+        'r' => 'ŕ',
+        's' => 'š',
+        't' => 'ţ',
+        'u' => 'û',
+        'v' => 'ṽ',
+        'w' => 'ŵ',
+        'x' => 'ẋ',
+        'y' => 'ý',
+        'z' => 'ž',
+        'A' => 'À',
+        'B' => 'Ɓ',
+        'C' => 'Ç',
+        'D' => 'Ð',
+        'E' => 'È',
+        'F' => 'Ƒ',
+        'G' => 'Ĝ',
+        'H' => 'Ĥ',
+        'I' => 'Î',
+        'J' => 'Ĵ',
+        'K' => 'Ķ',
+        'L' => 'Ļ',
+        'M' => 'Ṁ',
+        'N' => 'Ñ',
+        'O' => 'Ò',
+        'P' => 'Þ',
+        'Q' => 'Ɋ',
+        'R' => 'Ŕ',
+        'S' => 'Ŝ',
+        'T' => 'Ţ',
+        'U' => 'Û',
+        'V' => 'Ṽ',
+        'W' => 'Ŵ',
+        'X' => 'Ẋ',
+        'Y' => 'Ý',
+        'Z' => 'Ž',
+        other => other,
+    }
 }
 
 /// The script a code without one means, for languages written in more than one (CLDR likely
@@ -629,17 +692,34 @@ mod tests {
         assert_eq!(i.match_tags([]), Lang::EN);
     }
 
+    /// The pseudo locale wraps every lookup in `[!! … !!]` with accented letters; asserted by
+    /// property so the accent map (`accent`) can change without touching this test.
+    fn is_marked(s: &str) -> bool {
+        s.starts_with("[!! ") && s.ends_with(" !!]")
+    }
+
     #[test]
     fn pseudo_marks_every_lookup() {
         let i = i18n();
-        assert_eq!(i.t(Lang::PSEUDO, "Save"), "⟦Save⟧");
-        assert_eq!(i.t(Lang::PSEUDO, "A\nB"), "⟦A⟧\n⟦B⟧");
-        assert_eq!(i.tc(Lang::PSEUDO, "menu", "Open"), "⟦Open⟧");
-        assert_eq!(i.tid(Lang::PSEUDO, "file.save", "Save"), "⟦Save⟧");
-        assert_eq!(i.trn(Lang::PSEUDO, 2, "{n} x", "{n} xs"), "⟦2 xs⟧");
+        // t, tc, tid all come back marked, and the letters really changed (≠ the source).
+        for (got, src) in
+            [(i.t(Lang::PSEUDO, "Save"), "Save"), (i.tc(Lang::PSEUDO, "menu", "Open"), "Open"), (i.tid(Lang::PSEUDO, "file.save", "Save"), "Save")]
+        {
+            assert!(is_marked(got), "{got:?}");
+            assert_ne!(got, src, "letters were not transformed");
+        }
+        assert_eq!(i.t(Lang::PSEUDO, "Save"), "[!! Ŝàṽè !!]"); // the exact look-alike, once
+        // Each line of a multi-line label is wrapped on its own.
+        let two = i.t(Lang::PSEUDO, "A\nB");
+        assert_eq!(two.split('\n').count(), 2);
+        assert!(two.split('\n').all(is_marked), "{two:?}");
+        // trn and get are marked too.
+        let p = i.trn(Lang::PSEUDO, 2, "{n} x", "{n} xs");
+        assert!(is_marked(&p) && p.contains('2'), "{p:?}");
+        assert!(i.get(Lang::PSEUDO, "key", "Esc").is_some_and(is_marked));
         assert!(!i.languages().contains(&Lang::PSEUDO));
         assert_eq!(i.from_code("pseudo"), cfg!(debug_assertions).then_some(Lang::PSEUDO));
-        assert_eq!(i.get(Lang::PSEUDO, "key", "Esc"), Some("⟦Esc⟧"));
+        // Plain sources are recorded for an audit (plurals are not).
         assert_eq!(i.looked_up().into_iter().collect::<Vec<_>>(), ["A\nB", "Esc", "Open", "Save"]);
     }
 
