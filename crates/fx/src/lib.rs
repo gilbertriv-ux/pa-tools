@@ -18,6 +18,8 @@
 //! portable to wasm).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+// Index loops walk several parallel buffers (state, coefficients, channels) in the DSP kernels.
+#![allow(clippy::needless_range_loop)]
 
 pub mod biquad;
 pub mod channels;
