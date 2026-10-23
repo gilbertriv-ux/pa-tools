@@ -2,7 +2,7 @@
 //! (corrupt, truncated and absurd headers) which must come back as errors, never panics or huge
 //! allocations. The oracle comparison against ffmpeg is `oracle.rs` (ignored by default).
 
-use super::decode::decode_bytes;
+use super::decode::{self, decode_bytes};
 use super::header::{self, FieldCode, FrameHeader};
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -424,6 +424,50 @@ fn damaged_scan_line_indices_are_refused() {
         d[o..o + 4 * h.mb_rows as usize].fill(0);
         survives(&d, &format!("seed {si} zero indices"));
     }
+}
+
+/// Rows that share an offset used to share a byte range, so each of them passed the length check on
+/// the whole sample: 8 KB with every scan line index 0 asked for the planes of a whole picture (537 MB)
+/// before the first row failed. The offsets must increase, and that is checked before any plane exists.
+#[test]
+fn scan_line_offsets_that_do_not_increase_are_refused_before_allocating() {
+    let not_increasing = Error::Invalid("macroblock scan line offsets are not increasing");
+    // The reviewer's case: a picture at the size limit, 8 KB of data, every index 0.
+    let mut h = header_for(1272, ChromaFormat::Yuv422, 8, 8192, false, true);
+    h.width = 8192;
+    let mut d = craft(&h, &vec![0x55u8; 8192]);
+    assert!(header::parse(&d).is_ok());
+    let rows = h.mb_rows as usize;
+    d[header::SCAN_INDEX_OFFSET..header::SCAN_INDEX_OFFSET + 4 * rows].fill(0);
+    let t = Instant::now();
+    assert_eq!(decode_frame_with(&d, &single_thread()).err(), Some(not_increasing.clone()), "the guard refuses it, not a later check");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // The same through the table reader, for each way a table can go wrong.
+    let h = header_for(1272, ChromaFormat::Yuv422, 8, 64, false, true); // 4 scan lines
+    let ns = h.mb_rows as usize;
+    assert_eq!(ns, 4);
+    let with_table = |idx: [u32; 4]| {
+        let mut d = craft(&h, &vec![0x55u8; 400]);
+        for (s, v) in idx.iter().enumerate() {
+            d[header::SCAN_INDEX_OFFSET + 4 * s..][..4].copy_from_slice(&v.to_be_bytes());
+        }
+        d
+    };
+    let ranges = |idx: [u32; 4]| decode::scan_line_ranges(&h, &with_table(idx), ns);
+    let hs = h.header_size as usize;
+    // strictly increasing: contiguous, disjoint ranges that end at the end of the data
+    let r = ranges([0, 100, 250, 399]).unwrap();
+    assert_eq!(r, vec![(hs, hs + 100), (hs + 100, hs + 250), (hs + 250, hs + 399), (hs + 399, hs + 400)]);
+    for idx in [[0, 0, 0, 0], [0, 100, 100, 200], [0, 100, 99, 200], [50, 20, 60, 80], [0, 100, 250, 250]] {
+        assert_eq!(ranges(idx), Err(not_increasing.clone()), "{idx:?}");
+    }
+    // an index past the data is still a truncated sample
+    assert_eq!(ranges([0, 100, 250, 400]), Err(Error::Truncated));
+    // what the encoder writes always increases
+    let mut enc = encoder(Profile::Sq, 8, 64, 64);
+    let frame = picture(64, 64, ChromaFormat::Yuv422, 8, 1);
+    let coded = enc.encode(&frame).expect("encode");
+    assert!(decode_frame(&coded).is_ok());
 }
 
 /// A header longer than 640 bytes (a raster above 1088 lines) can be read from the first 640 bytes

@@ -34,7 +34,9 @@ pub fn decode_frame(data: &[u8]) -> Result<Frame> {
 
 /// Most memory, in bytes, that decoding one frame may allocate (the coded planes of every coding
 /// unit plus the cropped frame). A header that asks for more is refused before anything is
-/// allocated.
+/// allocated. 1 GiB per decoder is Gil's decision 5 (2026-10-23). At the 8192 x 8192 size limit a
+/// 4:2:2 picture needs 537 MB, 4:4:4 needs 805 MB and 4:4:4 with alpha exactly 1 GiB, so every picture
+/// the size limit lets through fits.
 pub const MAX_DECODE_BYTES: u64 = 1 << 30;
 
 /// Bytes decoding `h` allocates: `u16` samples, the macroblock-aligned planes of each coding unit
@@ -228,20 +230,11 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
         mid: (1u32 << (h.bit_depth - 1)) as f32,
         max: ((1u32 << h.bit_depth) - 1) as f32,
     };
-    // scan line byte ranges
-    let hs = h.header_size as usize;
-    let mut starts = Vec::with_capacity(ns);
-    for s in 0..ns {
-        let o = SCAN_INDEX_OFFSET + 4 * s;
-        let idx = data.get(o..).and_then(|d| d.first_chunk::<4>()).map(|c| u32::from_be_bytes(*c)).ok_or(Error::Truncated)? as usize;
-        let st = hs.checked_add(idx).filter(|&v| v < data.len()).ok_or(Error::Truncated)?;
-        starts.push(st);
-    }
-    let ranges: Vec<(usize, usize)> =
-        starts.iter().enumerate().map(|(s, &st)| (st, starts.get(s + 1).copied().filter(|&e| e > st).unwrap_or(data.len()))).collect();
+    let ranges = scan_line_ranges(h, data, ns)?;
     // The planes are sized from the header, so refuse a scan line too short to hold its macroblocks
-    // before allocating them: a few header bytes cannot buy a large picture. (A row that short could
-    // only fail to decode anyway.)
+    // before allocating them: the scan lines are disjoint (above), so together they need as many bytes
+    // as the picture has macroblock rows, and a few header bytes cannot buy a large picture. (A row
+    // that short could only fail to decode anyway.)
     let min_bits = min_mb_bits(&ctx) * nw as u64;
     if ranges.iter().any(|&(st, end)| (end.saturating_sub(st) as u64) * 8 < min_bits) {
         return Err(Error::Truncated);
@@ -306,6 +299,27 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
         }
     }
     Ok(CodedPlanes { planes, strides, ycbcr })
+}
+
+/// The byte range of each of the `ns` macroblock scan lines of the coding unit in `data`, from the
+/// scan line index table in its header (8.1.2: offsets from the end of the header, one per line).
+/// The offsets must be strictly increasing, so the lines do not overlap and each one owns its own
+/// bytes. A table where rows share an offset (all zero, say) would otherwise make every row's range
+/// the whole sample, let every row pass the length check below, and so let an 8 KB sample ask for the
+/// planes of a whole picture (537 MB at the size limit) before the first row fails.
+pub(super) fn scan_line_ranges(h: &FrameHeader, data: &[u8], ns: usize) -> Result<Vec<(usize, usize)>> {
+    let hs = h.header_size as usize;
+    let mut starts = Vec::with_capacity(ns);
+    for s in 0..ns {
+        let o = SCAN_INDEX_OFFSET + 4 * s;
+        let idx = data.get(o..).and_then(|d| d.first_chunk::<4>()).map(|c| u32::from_be_bytes(*c)).ok_or(Error::Truncated)? as usize;
+        let st = hs.checked_add(idx).filter(|&v| v < data.len()).ok_or(Error::Truncated)?;
+        if starts.last().is_some_and(|&prev| st <= prev) {
+            return Err(Error::Invalid("macroblock scan line offsets are not increasing"));
+        }
+        starts.push(st);
+    }
+    Ok(starts.iter().enumerate().map(|(s, &st)| (st, starts.get(s + 1).copied().unwrap_or(data.len()))).collect())
 }
 
 /// Fewest bits one macroblock of a scan line occupies: the 12 bits of its header, then for each

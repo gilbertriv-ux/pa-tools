@@ -30,8 +30,9 @@
 //! ## Hardening against hostile files
 //!
 //! Headers are untrusted: sizes are capped at 8192 on a side and at the crate's picture limit
-//! (both fields of a field-coded frame counted) before any plane exists, every scan line must be
-//! long enough for its macroblocks before planes are allocated, decoding fits a 1 GiB budget,
+//! (both fields of a field-coded frame counted) before any plane exists, scan line offsets must
+//! strictly increase (so the lines cannot share bytes) and every scan line must be long enough for
+//! its macroblocks before planes are allocated, decoding fits a 1 GiB budget (Gil's decision 5),
 //! the HD profile refuses the 4:2:0 layout it has no macroblock structure for (the donor
 //! panicked on it), and offsets, indices and plane copies use `get()`. Pixel loops index fixed
 //! blocks bounded by that validated geometry. Tests: `tests.rs` (sweeps, fuzzing, absurd headers).
