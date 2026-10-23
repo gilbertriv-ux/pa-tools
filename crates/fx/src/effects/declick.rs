@@ -1,4 +1,4 @@
-//! Automatic Click Remover: clicks are found as outliers of the linear-prediction residual and
+//! Click remover: clicks are found as outliers of the linear-prediction residual and
 //! replaced by autoregressive interpolation.
 //!
 //! Textbook method (Vaseghi & Rayner style): per 512-sample block an order-`p` LPC model is fitted

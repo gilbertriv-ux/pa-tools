@@ -15,7 +15,7 @@
 //! render: pieces concatenated with an equal-power crossfade centred on every joint.
 //! ```
 //!
-//! **Parameters** (Premiere's Remix "Segments" and "Variations" sliders; our own semantics):
+//! **Parameters** (the "Segments" and "Variations" sliders; our own semantics):
 //!
 //! | parameter | range | default | meaning |
 //! |---|---|---|---|

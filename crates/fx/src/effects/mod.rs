@@ -21,15 +21,15 @@ pub use channel::{Amplify, Balance, ChannelVolume, Invert, Route, Routing};
 pub use declick::ClickRemover;
 pub use dynamics::{Compressor, Gate, Limiter};
 pub use eq::{ParametricEq, SimpleEq};
-pub use essential::{DeEsser, DeReverb, SpeechEnhance, StereoWidth};
-pub use filters::{FftFilter, FullParametricEq, GraphicEq, NotchFilter, ScientificFilter};
-pub use modulation::{AnalogDelay, ChorusFlanger, Flanger, MultitapDelay, Phaser};
+pub use essential::{ReverbReducer, SibilanceReducer, SpeechCleanup, StereoWidth};
+pub use filters::{ClassicFilter, FullParametricEq, GraphicEq, NotchFilter, SpectralCurveEq};
+pub use modulation::{ChorusFlanger, Flanger, MultitapDelay, Phaser, TapeDelay};
 pub use multiband::{DynamicsRack, MultibandCompressor, TubeCompressor};
 pub use pitch::PitchShifter;
-pub use restoration::{DeHum, DeNoise};
+pub use restoration::{HumRemover, NoiseReducer};
 pub use reverbs::{ConvolutionReverb, SurroundReverb};
 pub use special::{
-    AmbisonicsPanner, Binauralizer, ChannelMixer, Distortion, GuitarSuite, LoudnessMeterFx, Mastering, Mute, StereoExpander, VocalEnhancer,
+    AmbisonicRotator, BinauralPanner, ChannelMixer, Distortion, GuitarAmpSuite, LoudnessMeterFx, MasterChain, Mute, StereoSpread, VocalPolish,
 };
 pub use time::{Delay, Reverb};
 
@@ -91,17 +91,17 @@ macro_rules! entry {
 }
 
 static REGISTRY: &[EffectInfo] = &[
-    entry!("parametric_eq", "Parametric Equalizer", Filter, ParametricEq),
+    entry!("parametric_eq", "Parametric EQ (8 band)", Filter, ParametricEq),
     entry!("simple_eq", "Simple 3-Band EQ", Filter, SimpleEq),
     entry!("compressor", "Compressor", Dynamics, Compressor),
-    entry!("gate", "Expander / Gate", Dynamics, Gate),
-    entry!("limiter", "Hard Limiter", Dynamics, Limiter),
+    entry!("gate", "Expander and Gate", Dynamics, Gate),
+    entry!("limiter", "Brickwall Limiter", Dynamics, Limiter),
     entry!("delay", "Delay", Time, Delay),
     entry!("reverb", "Reverb", Time, Reverb),
-    entry!("amplify", "Amplify", Channel, Amplify),
-    entry!("channel_volume", "Channel Volume", Channel, ChannelVolume),
-    entry!("balance", "Balance / Pan", Channel, Balance),
-    entry!("invert", "Invert", Channel, Invert),
+    entry!("amplify", "Simple Gain", Channel, Amplify),
+    entry!("channel_volume", "Channel Levels", Channel, ChannelVolume),
+    entry!("balance", "Balance and Pan", Channel, Balance),
+    entry!("invert", "Polarity Invert", Channel, Invert),
     EffectInfo {
         id: "swap_channels",
         name: "Swap Channels",
@@ -112,7 +112,7 @@ static REGISTRY: &[EffectInfo] = &[
     },
     EffectInfo {
         id: "fill_left",
-        name: "Fill Left with Right",
+        name: "Copy Right to Left",
         category: Category::Channel,
         params: Route::PARAMS,
         create: |_, _| Box::new(Guarded::new(Route::new(Routing::FillLeft))),
@@ -120,46 +120,46 @@ static REGISTRY: &[EffectInfo] = &[
     },
     EffectInfo {
         id: "fill_right",
-        name: "Fill Right with Left",
+        name: "Copy Left to Right",
         category: Category::Channel,
         params: Route::PARAMS,
         create: |_, _| Box::new(Guarded::new(Route::new(Routing::FillRight))),
         create_raw: |_, _| Box::new(Route::new(Routing::FillRight)),
     },
-    entry!("dehum", "DeHum", Restoration, DeHum),
-    entry!("denoise", "DeNoise", Restoration, DeNoise),
+    entry!("hum_remover", "Hum Remover", Restoration, HumRemover),
+    entry!("noise_reducer", "Noise Reducer", Restoration, NoiseReducer),
     entry!("pitch_shifter", "Pitch Shifter", Pitch, PitchShifter),
-    entry!("deesser", "DeEsser", Restoration, DeEsser),
-    entry!("dereverb", "DeReverb", Restoration, DeReverb),
-    entry!("speech_enhance", "Enhance Speech", Filter, SpeechEnhance),
+    entry!("sibilance_reducer", "Sibilance Reducer", Restoration, SibilanceReducer),
+    entry!("reverb_reducer", "Reverb Reducer", Restoration, ReverbReducer),
+    entry!("speech_cleanup", "Speech Cleanup", Filter, SpeechCleanup),
     entry!("stereo_width", "Stereo Width", Channel, StereoWidth),
-    // Premiere audio-effect set (M7.7)
-    entry!("graphic_eq_10", "Graphic Equalizer (10 Bands)", Filter, GraphicEq<10>),
-    entry!("graphic_eq_20", "Graphic Equalizer (20 Bands)", Filter, GraphicEq<20>),
-    entry!("graphic_eq_30", "Graphic Equalizer (30 Bands)", Filter, GraphicEq<30>),
-    entry!("parametric_eq_full", "Parametric Equalizer (full)", Filter, FullParametricEq),
-    entry!("notch_filter", "Notch Filter", Filter, NotchFilter),
-    entry!("scientific_filter", "Scientific Filter", Filter, ScientificFilter),
-    entry!("fft_filter", "FFT Filter", Filter, FftFilter),
-    entry!("dynamics_rack", "Dynamics", Dynamics, DynamicsRack),
+    // The wider set: graphic and full parametric EQs, filters, rack and multiband dynamics, modulation, delays, reverbs, restoration and special effects.
+    entry!("graphic_eq_10", "Graphic EQ 10-Band", Filter, GraphicEq<10>),
+    entry!("graphic_eq_20", "Graphic EQ 20-Band", Filter, GraphicEq<20>),
+    entry!("graphic_eq_30", "Graphic EQ 30-Band", Filter, GraphicEq<30>),
+    entry!("parametric_eq_full", "Full Parametric EQ", Filter, FullParametricEq),
+    entry!("notch_filter", "Multi-Notch Filter", Filter, NotchFilter),
+    entry!("classic_filter", "Classic Filter", Filter, ClassicFilter),
+    entry!("spectral_curve_eq", "Spectral Curve EQ", Filter, SpectralCurveEq),
+    entry!("dynamics_rack", "Dynamics Rack", Dynamics, DynamicsRack),
     entry!("multiband_compressor", "Multiband Compressor", Dynamics, MultibandCompressor),
-    entry!("tube_compressor", "Tube-modeled Compressor", Dynamics, TubeCompressor),
-    entry!("chorus_flanger", "Chorus/Flanger", Modulation, ChorusFlanger),
-    entry!("flanger", "Flanger", Modulation, Flanger),
-    entry!("phaser", "Phaser", Modulation, Phaser),
-    entry!("analog_delay", "Analog Delay", Time, AnalogDelay),
-    entry!("multitap_delay", "Multitap Delay", Time, MultitapDelay),
+    entry!("tube_compressor", "Tube Compressor", Dynamics, TubeCompressor),
+    entry!("chorus_flanger", "Chorus and Flanger", Modulation, ChorusFlanger),
+    entry!("flanger", "Stereo Flanger", Modulation, Flanger),
+    entry!("phaser", "Stereo Phaser", Modulation, Phaser),
+    entry!("tape_delay", "Tape Delay", Time, TapeDelay),
+    entry!("multitap_delay", "Four-Tap Delay", Time, MultitapDelay),
     entry!("convolution_reverb", "Convolution Reverb", Reverb, ConvolutionReverb),
     entry!("surround_reverb", "Surround Reverb", Reverb, SurroundReverb),
-    entry!("click_remover", "Automatic Click Remover", Restoration, ClickRemover),
+    entry!("click_remover", "Click Remover", Restoration, ClickRemover),
     entry!("channel_mixer", "Channel Mixer", Channel, ChannelMixer),
     entry!("distortion", "Distortion", Special, Distortion),
-    entry!("guitar_suite", "GuitarSuite", Special, GuitarSuite),
-    entry!("mastering", "Mastering", Special, Mastering),
-    entry!("vocal_enhancer", "Vocal Enhancer", Special, VocalEnhancer),
-    entry!("stereo_expander", "Stereo Expander", Channel, StereoExpander),
-    entry!("binauralizer", "Binauralizer - Ambisonics", Special, Binauralizer),
-    entry!("ambisonics_panner", "Panner - Ambisonics", Special, AmbisonicsPanner),
+    entry!("guitar_amp_suite", "Guitar Amp Suite", Special, GuitarAmpSuite),
+    entry!("master_chain", "Master Chain", Special, MasterChain),
+    entry!("vocal_polish", "Vocal Polish", Special, VocalPolish),
+    entry!("stereo_spread", "Stereo Spread", Channel, StereoSpread),
+    entry!("binaural_panner", "Binaural Panner", Special, BinauralPanner),
+    entry!("ambisonic_rotator", "Ambisonic Rotator", Special, AmbisonicRotator),
     entry!("loudness_meter", "Loudness Meter", Special, LoudnessMeterFx),
     entry!("mute", "Mute", Channel, Mute),
 ];

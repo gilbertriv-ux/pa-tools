@@ -1,4 +1,4 @@
-//! Real-time audio DSP for FilmCraft (layer L1, dependency-free, `wasm32` clean).
+//! Pa Tools donor effects: real-time audio DSP (layer L1, dependency-free, `wasm32` clean).
 //!
 //! * [`loudness`] — ITU-R BS.1770-4 / EBU R128 loudness meter (momentary, short-term,
 //!   integrated, loudness range, sample peak, true peak) and the loudness-normalisation helper.
@@ -128,6 +128,94 @@ pub fn sane_sample_rate(sample_rate: f32) -> f32 {
 /// A usable channel count: 1..=[`MAX_CHANNELS`].
 pub fn sane_channels(channels: usize) -> usize {
     channels.clamp(1, MAX_CHANNELS)
+}
+
+/// Product, company and catalogue names that must never appear in an effect name, parameter
+/// label or choice label shown to the user. Lower case, words separated by single spaces;
+/// matched on whole words by [`brand_term_in`].
+pub const BRAND_TERMS: &[&str] = &[
+    // This product's own ancestry and the incumbent DAW.
+    "avid",
+    "pro tools",
+    "protools",
+    "aax",
+    "filmcraft",
+    "artcraft",
+    "soundcraft",
+    "storytold",
+    "storyteller",
+    // Editors and DAWs.
+    "adobe",
+    "premiere",
+    "audition",
+    "essential sound",
+    "cubase",
+    "nuendo",
+    "ableton",
+    "logic pro",
+    "reaper",
+    "sibelius",
+    "media composer",
+    "davinci",
+    "fairlight",
+    "garageband",
+    // Plug-in makers and products.
+    "izotope",
+    "ozone",
+    "waves",
+    "fabfilter",
+    "steinberg",
+    "melodyne",
+    "autotune",
+    "auto tune",
+    "antares",
+    "slate digital",
+    "universal audio",
+    "uad",
+    "lexicon",
+    "eventide",
+    "valhalla",
+    "soundtoys",
+    "native instruments",
+    "kontakt",
+    "bricasti",
+    "pultec",
+    "fairchild",
+    "teletronix",
+    "urei",
+    "neve",
+    "ssl",
+    "dolby",
+    "atmos",
+    "dts",
+    // Amplifier makers.
+    "fender",
+    "marshall",
+    "vox",
+    "mesa boogie",
+    "orange amps",
+    // The donor's catalogue-mirroring names, now renamed.
+    "dehum",
+    "denoise",
+    "deesser",
+    "dereverb",
+    "guitarsuite",
+    "guitar suite",
+    "enhance speech",
+    "vocal enhancer",
+    "binauralizer",
+    "tube modeled compressor",
+];
+
+/// The first entry of [`BRAND_TERMS`] that occurs in `text` as whole words (case and punctuation
+/// are ignored), if any. Allocates: for tests and tooling, not the audio thread.
+pub fn brand_term_in(text: &str) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    BRAND_TERMS.iter().copied().find(|term| {
+        let want: Vec<&str> = term.split(' ').collect();
+        words.windows(want.len()).any(|w| w == want.as_slice())
+    })
 }
 
 /// A real-time audio effect operating in place on planar channels.

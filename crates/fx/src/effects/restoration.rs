@@ -1,4 +1,4 @@
-//! Restoration: DeHum (harmonic notch comb) and DeNoise (STFT spectral gating).
+//! Restoration: HumRemover (harmonic notch comb) and NoiseReducer (STFT spectral gating).
 
 use super::stft::{Spectral, StftChannel, fft_size};
 use crate::biquad::{Biquad, Coeffs, FilterType};
@@ -7,7 +7,7 @@ use crate::{AudioEffect, ParamSpec, ParamValues, Smoothed, Unit, block_len, db_t
 const MAX_HARMONICS: usize = 10;
 
 /// Removes mains hum: a cascade of notches at the fundamental (50/60 Hz) and its harmonics.
-pub struct DeHum {
+pub struct HumRemover {
     pv: ParamValues,
     sr: f32,
     coeffs: [Coeffs; MAX_HARMONICS],
@@ -17,7 +17,7 @@ pub struct DeHum {
     amount: Smoothed,
 }
 
-impl DeHum {
+impl HumRemover {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::choice("frequency", "Frequency", &["50 Hz", "60 Hz"], 0),
         ParamSpec::new("harmonics", "Harmonics", 1.0, MAX_HARMONICS as f32, 5.0, Unit::None),
@@ -26,7 +26,7 @@ impl DeHum {
     ];
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
-        let mut s = DeHum {
+        let mut s = HumRemover {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             coeffs: [Coeffs::IDENTITY; MAX_HARMONICS],
@@ -58,8 +58,8 @@ impl DeHum {
     }
 }
 
-impl AudioEffect for DeHum {
-    param_plumbing!("dehum");
+impl AudioEffect for HumRemover {
+    param_plumbing!("hum_remover");
     fn reset(&mut self) {
         self.state.iter_mut().for_each(|s| s.iter_mut().for_each(Biquad::reset));
         self.stage_mix.iter_mut().for_each(Smoothed::snap);
@@ -140,7 +140,7 @@ impl NoiseState {
 /// continuously with minimum statistics (so no "learn" step is needed), and bins that do not
 /// rise above `floor × threshold` are attenuated by `reduction`, with per-bin attack/release
 /// and light frequency smoothing to avoid musical noise.
-pub struct DeNoise {
+pub struct NoiseReducer {
     pv: ParamValues,
     n: usize,
     hop: usize,
@@ -154,7 +154,7 @@ pub struct DeNoise {
     release: f32,
 }
 
-impl DeNoise {
+impl NoiseReducer {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("reduction", "Reduction", 0.0, 40.0, 12.0, Unit::Decibels),
         ParamSpec::new("threshold", "Threshold", 0.0, 20.0, 6.0, Unit::Decibels),
@@ -167,7 +167,7 @@ impl DeNoise {
         let bins = n / 2 + 1;
         let sub_frames = ((MS_WINDOW_S * sample_rate / hop as f32 / MS_SUBWINDOWS as f32).round() as usize).max(1);
         let ch = channels.max(1);
-        let mut s = DeNoise {
+        let mut s = NoiseReducer {
             pv: ParamValues::new(Self::PARAMS),
             n,
             hop,
@@ -192,8 +192,8 @@ impl DeNoise {
     }
 }
 
-impl AudioEffect for DeNoise {
-    param_plumbing!("denoise");
+impl AudioEffect for NoiseReducer {
+    param_plumbing!("noise_reducer");
     fn latency(&self) -> usize {
         self.n
     }
@@ -269,8 +269,8 @@ mod tests {
     const SR: f32 = 48000.0;
 
     #[test]
-    fn dehum_removes_hum_keeps_program() {
-        let mut d = DeHum::new(SR, 1);
+    fn hum_remover_removes_hum_keeps_program() {
+        let mut d = HumRemover::new(SR, 1);
         d.set_param("frequency", 0.0);
         d.set_param("harmonics", 4.0);
         let n = SR as usize * 2;
@@ -283,7 +283,7 @@ mod tests {
         assert!(db(tone_amplitude(tail, 150.0, SR as f64) / 0.2) < -30.0);
         assert!(db(tone_amplitude(tail, 1000.0, SR as f64) / 0.2).abs() < 0.2);
         // 60 Hz mode leaves 50 Hz mostly alone.
-        let mut d60 = DeHum::new(SR, 1);
+        let mut d60 = HumRemover::new(SR, 1);
         d60.set_param("frequency", 1.0);
         d60.reset();
         let mut y = hum(50.0);
@@ -292,8 +292,8 @@ mod tests {
     }
 
     #[test]
-    fn denoise_zero_reduction_is_delayed_identity() {
-        let mut d = DeNoise::new(SR, 1);
+    fn noise_reducer_zero_reduction_is_delayed_identity() {
+        let mut d = NoiseReducer::new(SR, 1);
         d.set_param("reduction", 0.0);
         let lat = d.latency();
         let mut rng = Rng::new(9);
@@ -306,8 +306,8 @@ mod tests {
     }
 
     #[test]
-    fn denoise_reduces_noise_and_keeps_bursts() {
-        let mut d = DeNoise::new(SR, 1);
+    fn noise_reducer_reduces_noise_and_keeps_bursts() {
+        let mut d = NoiseReducer::new(SR, 1);
         d.set_param("reduction", 20.0);
         let lat = d.latency();
         let n = SR as usize * 8;

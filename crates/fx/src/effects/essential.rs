@@ -1,5 +1,5 @@
-//! Essential Sound processors: DeEsser (split-band), DeReverb (spectral late-reverberation
-//! suppression), Enhance Speech (a DSP voice-enhancement chain) and Stereo Width (mid/side).
+//! Voice and stereo-field processors: sibilance reducer (split-band), reverb reducer (spectral
+//! late-reverberation suppression), speech cleanup (a DSP voice chain) and stereo width (mid/side).
 //!
 //! All written from textbook descriptions:
 //! * de-esser: complementary split (band = 2nd-order high-pass, rest = x − band) with a relative
@@ -8,7 +8,7 @@
 //!   Polack): the late-reverb PSD at frame t is predicted from the reverberant PSD T_d earlier,
 //!   λ_r(t) = e^{−2Δ·T_d}·λ_x(t − T_d), Δ = 3·ln10 / RT60, and removed by spectral subtraction
 //!   with over-subtraction and a gain floor (Lebart et al. 2001; Habets 2007);
-//! * enhance speech: high-pass, de-mud cut, presence and air boosts (RBJ biquads), then one gain
+//! * speech cleanup: high-pass, de-mud cut, presence and air boosts (RBJ biquads), then one gain
 //!   computer combining a downward expander (noise between words) and a soft-knee compressor.
 
 use super::stft::{Spectral, StftChannel, fft_size};
@@ -33,7 +33,7 @@ fn pow_db(p: f64) -> f64 {
 /// ~60 ms, stereo-linked). At 0 dB reduction the shelf is an exact identity, so non-sibilant
 /// passages pass unchanged. (A subtractive split `x − HP(x)` is not used: the high-pass phase
 /// shift around the crossover makes `x − (1 − g)·HP(x)` boost there instead of cutting.)
-pub struct DeEsser {
+pub struct SibilanceReducer {
     pv: ParamValues,
     sr: f64,
     freq: Smoothed,
@@ -54,7 +54,7 @@ pub struct DeEsser {
     gr_meter: f32,
 }
 
-impl DeEsser {
+impl SibilanceReducer {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::log("frequency", "Frequency", 2000.0, 12000.0, 6000.0, Unit::Hertz),
         ParamSpec::new("threshold", "Threshold", -40.0, 0.0, -12.0, Unit::Decibels),
@@ -63,7 +63,7 @@ impl DeEsser {
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let sr = sample_rate as f64;
-        let mut s = DeEsser {
+        let mut s = SibilanceReducer {
             pv: ParamValues::new(Self::PARAMS),
             sr,
             freq: Smoothed::with_ms(6000.0, sample_rate, 20.0),
@@ -116,8 +116,8 @@ impl DeEsser {
     }
 }
 
-impl AudioEffect for DeEsser {
-    param_plumbing!("deesser");
+impl AudioEffect for SibilanceReducer {
+    param_plumbing!("sibilance_reducer");
     fn reset(&mut self) {
         self.freq.snap();
         self.design();
@@ -199,7 +199,7 @@ impl ReverbState {
 /// Spectral de-reverberation: suppresses the late reverberant tail predicted by the exponential
 /// decay model for the assumed `rt60`. `amount` sets the over-subtraction and the gain floor
 /// (0 % = identity apart from the STFT delay, 100 % ≈ −18 dB floor).
-pub struct DeReverb {
+pub struct ReverbReducer {
     pv: ParamValues,
     sr: f32,
     n: usize,
@@ -216,7 +216,7 @@ pub struct DeReverb {
     alpha: f32,
 }
 
-impl DeReverb {
+impl ReverbReducer {
     pub const PARAMS: &'static [ParamSpec] =
         &[ParamSpec::new("amount", "Amount", 0.0, 100.0, 50.0, Unit::Percent), ParamSpec::log("rt60", "Decay (RT60)", 0.1, 5.0, 0.8, Unit::Seconds)];
 
@@ -226,7 +226,7 @@ impl DeReverb {
         let bins = n / 2 + 1;
         let delay = ((DEREVERB_TD * sample_rate as f64 / hop as f64).round() as usize).max(1);
         let ch = channels.max(1);
-        let mut s = DeReverb {
+        let mut s = ReverbReducer {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             n,
@@ -256,8 +256,8 @@ impl DeReverb {
     }
 }
 
-impl AudioEffect for DeReverb {
-    param_plumbing!("dereverb");
+impl AudioEffect for ReverbReducer {
+    param_plumbing!("reverb_reducer");
     fn latency(&self) -> usize {
         self.n
     }
@@ -328,11 +328,11 @@ const ENH_COMP_KNEE: f64 = 6.0;
 /// Make-up gain: puts conversational speech (≈ −20 dBFS RMS) back near its input loudness.
 const ENH_MAKEUP: f64 = 3.0;
 
-/// Enhance Speech: a DSP voice-enhancement chain (no machine learning) — 80 Hz high-pass,
+/// Speech cleanup: a DSP voice chain (no machine learning) — 80 Hz high-pass,
 /// de-mud cut, presence and air boosts, then a combined downward expander + soft-knee
 /// compressor with make-up gain. `tone` picks the cut/boost frequencies for lower or higher
 /// voices; `mix` blends with the dry signal.
-pub struct SpeechEnhance {
+pub struct SpeechCleanup {
     pv: ParamValues,
     sr: f64,
     coeffs: [Coeffs; ENH_STAGES],
@@ -350,13 +350,13 @@ pub struct SpeechEnhance {
     comp_rel: f64,
 }
 
-impl SpeechEnhance {
+impl SpeechCleanup {
     pub const PARAMS: &'static [ParamSpec] =
         &[ParamSpec::new("mix", "Mix", 0.0, 100.0, 100.0, Unit::Percent), ParamSpec::choice("tone", "Tone", &["Low Tone", "High Tone"], 0)];
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let sr = sample_rate as f64;
-        let mut s = SpeechEnhance {
+        let mut s = SpeechCleanup {
             pv: ParamValues::new(Self::PARAMS),
             sr,
             coeffs: [Coeffs::IDENTITY; ENH_STAGES],
@@ -408,8 +408,8 @@ impl SpeechEnhance {
     }
 }
 
-impl AudioEffect for SpeechEnhance {
-    param_plumbing!("speech_enhance");
+impl AudioEffect for SpeechCleanup {
+    param_plumbing!("speech_cleanup");
     fn reset(&mut self) {
         self.filters.iter_mut().for_each(|f| f.iter_mut().for_each(Biquad::reset));
         self.mix.snap();
@@ -549,8 +549,8 @@ mod tests {
     }
 
     #[test]
-    fn deesser_zero_reduction_is_identity() {
-        let mut d = DeEsser::new(SR, 1);
+    fn sibilance_reducer_zero_reduction_is_identity() {
+        let mut d = SibilanceReducer::new(SR, 1);
         d.set_param("reduction", 0.0);
         d.reset();
         let mut r = Rng::new(3);
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn deesser_reduces_sibilance_keeps_voice() {
+    fn sibilance_reducer_reduces_sibilance_keeps_voice() {
         let n = SR as usize * 4;
         let voice = harmonic_voice(n, 150.0, 0.15);
         let sib = bandpassed_noise(11, n, 5000.0, 10000.0, 0.6);
@@ -574,7 +574,7 @@ mod tests {
         };
         let x: Vec<f32> = (0..n).map(|i| voice[i] + if burst(i) { sib[i] } else { 0.0 }).collect();
         for (reduction, need) in [(8.0f32, 5.0f64), (16.0, 6.0)] {
-            let mut d = DeEsser::new(SR, 1);
+            let mut d = SibilanceReducer::new(SR, 1);
             d.set_param("reduction", reduction);
             d.reset();
             let mut y = x.clone();
@@ -588,7 +588,7 @@ mod tests {
             let (xq, yq) = (pick(&x, false), pick(&y, false));
             let quiet_change = 10.0 * (energy(&yq) / energy(&xq)).log10();
             println!(
-                "deesser reduction {reduction} dB: sibilance {sib_drop:.2} dB, voice band {low_change:.3} dB, non-sibilant passages {quiet_change:.3} dB"
+                "sibilance_reducer reduction {reduction} dB: sibilance {sib_drop:.2} dB, voice band {low_change:.3} dB, non-sibilant passages {quiet_change:.3} dB"
             );
             assert!(sib_drop < -need, "sibilance only {sib_drop} dB");
             assert!(low_change.abs() < 1.0, "voice band changed {low_change} dB");
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn dereverb_suppresses_tail() {
+    fn reverb_reducer_suppresses_tail() {
         let sr = SR as f64;
         let n = SR as usize * 6;
         let period = (0.5 * sr) as usize;
@@ -618,7 +618,7 @@ mod tests {
                 d + (rng.uniform() as f64 * 3f64.sqrt() * e.sqrt()) as f32
             })
             .collect();
-        let mut fx = DeReverb::new(SR, 1);
+        let mut fx = ReverbReducer::new(SR, 1);
         fx.set_param("amount", 100.0);
         fx.reset();
         let lat = fx.latency();
@@ -639,14 +639,14 @@ mod tests {
         let before = 10.0 * (xg / xb).log10();
         let after = 10.0 * (yg / yb).log10();
         let burst_loss = 10.0 * (yb / xb).log10();
-        println!("dereverb: tail/burst {before:.2} dB → {after:.2} dB (improvement {:.2} dB), burst energy {burst_loss:.2} dB", before - after);
+        println!("reverb_reducer: tail/burst {before:.2} dB → {after:.2} dB (improvement {:.2} dB), burst energy {burst_loss:.2} dB", before - after);
         assert!(before - after >= 4.0, "tail improvement only {} dB", before - after);
         assert!(burst_loss > -3.0, "burst energy lost {burst_loss} dB");
     }
 
     #[test]
-    fn dereverb_zero_amount_is_delayed_identity() {
-        let mut d = DeReverb::new(SR, 1);
+    fn reverb_reducer_zero_amount_is_delayed_identity() {
+        let mut d = ReverbReducer::new(SR, 1);
         d.set_param("amount", 0.0);
         let lat = d.latency();
         let mut rng = Rng::new(9);
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_enhance_presence_noise_and_level() {
+    fn speech_cleanup_presence_noise_and_level() {
         let sr = SR as usize;
         let n = sr * 4;
         let voice = harmonic_voice(n, 140.0, 0.08);
@@ -668,7 +668,7 @@ mod tests {
         // syllables: 200 ms on, 200 ms off; −60 dBFS-ish background noise throughout
         let syl = |i: usize| (i / (sr / 5)).is_multiple_of(2);
         let x: Vec<f32> = (0..n).map(|i| rng.uniform() * 0.0017 + if syl(i) { voice[i] + fric[i] } else { 0.0 }).collect();
-        let mut fx = SpeechEnhance::new(SR, 1);
+        let mut fx = SpeechCleanup::new(SR, 1);
         let mut y = x.clone();
         fx.process(&mut [&mut y]);
         let pick = |v: &[f32], on: bool| -> Vec<f32> {
@@ -689,14 +689,14 @@ mod tests {
         let noise = 10.0 * (energy(&pick(&y, false)) / energy(&pick(&x, false))).log10();
         let level = 10.0 * (energy(&y[sr..]) / energy(&x[sr..])).log10();
         println!(
-            "enhance speech: presence/mud tilt {tilt_in:.2} → {tilt_out:.2} dB (+{:.2}), noise between syllables {noise:.2} dB, level {level:.2} dB",
+            "speech cleanup: presence/mud tilt {tilt_in:.2} → {tilt_out:.2} dB (+{:.2}), noise between syllables {noise:.2} dB, level {level:.2} dB",
             tilt_out - tilt_in
         );
         assert!(tilt_out - tilt_in > 3.0);
         assert!(noise <= -3.0, "noise floor only {noise} dB");
         assert!(level.abs() <= 3.0, "level changed {level} dB");
         // mix 0 is identity
-        let mut fx = SpeechEnhance::new(SR, 1);
+        let mut fx = SpeechCleanup::new(SR, 1);
         fx.set_param("mix", 0.0);
         fx.reset();
         let mut z = x.clone();
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(m, l0);
     }
 
-    /// The Essential Sound "Dialogue" chain on 60 s of stereo 48 kHz.
+    /// A dialogue-cleanup chain on 60 s of stereo 48 kHz.
     /// `cargo test --release -p soundcraft-fx dialogue_chain_realtime -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -746,11 +746,20 @@ mod tests {
         let voice = harmonic_voice(n, 140.0, 0.1);
         let mut l: Vec<f32> = (0..n).map(|i| voice[i] + rng.uniform() * 0.01).collect();
         let mut r: Vec<f32> = l.iter().map(|v| v * 0.9 + rng.uniform() * 0.01).collect();
-        let mut chain: Vec<Box<dyn AudioEffect>> =
-            ["denoise", "parametric_eq", "dehum", "deesser", "dereverb", "compressor", "simple_eq", "speech_enhance", "reverb"]
-                .iter()
-                .map(|id| crate::create_effect(id, SR, 2).unwrap())
-                .collect();
+        let mut chain: Vec<Box<dyn AudioEffect>> = [
+            "noise_reducer",
+            "parametric_eq",
+            "hum_remover",
+            "sibilance_reducer",
+            "reverb_reducer",
+            "compressor",
+            "simple_eq",
+            "speech_cleanup",
+            "reverb",
+        ]
+        .iter()
+        .map(|id| crate::create_effect(id, SR, 2).unwrap())
+        .collect();
         chain[1].set_param("b1.on", 1.0);
         chain[1].set_param("b2.on", 1.0);
         chain[1].set_param("b2.type", 4.0);

@@ -1,6 +1,6 @@
 //! Dynamics rack ("Dynamics": auto gate → expander → compressor → limiter), the four-band
 //! Multiband Compressor (Linkwitz–Riley crossovers with all-pass phase compensation, so the
-//! bands sum to an all-pass) and the Tube-modeled Compressor.
+//! bands sum to an all-pass) and the tube compressor.
 
 use super::dynamics::{compressor_curve, expander_curve};
 use super::util::{coef, lin_db};
@@ -39,7 +39,7 @@ pub fn soft_clip(x: f32, t: f32) -> f32 {
 
 // --------------------------------------------------------------------------------- dynamics
 
-/// Premiere-style Dynamics: Auto Gate, Compressor, Expander and Limiter sections in series
+/// Dynamics rack: auto gate, Compressor, Expander and Limiter sections in series
 /// (stereo-linked peak detection), plus output gain.
 pub struct DynamicsRack {
     pv: ParamValues,

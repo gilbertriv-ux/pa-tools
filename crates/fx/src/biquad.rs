@@ -16,7 +16,7 @@ pub enum FilterType {
     AllPass,
     /// Constant-bandwidth cut: `1 + (g − 1)·BP(s)` — the −3 dB width of the band-pass stays
     /// `f/Q` however deep the cut (`gain_db` ≤ 0), unlike the RBJ peaking filter whose cut
-    /// widens with depth. Used by the Notch Filter.
+    /// widens with depth. Used by the multi-notch filter.
     Cut,
 }
 

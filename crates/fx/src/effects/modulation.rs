@@ -1,6 +1,6 @@
-//! Modulation and echo effects: Chorus/Flanger, Flanger, Phaser, Analog Delay and Multitap
-//! Delay. All modulated delays read with linear interpolation; feedback loops are bounded
-//! (|g| < 1, or saturating for the Analog Delay).
+//! Modulation and echo effects: chorus/flanger, flanger, phaser, tape delay and multitap
+//! delay. All modulated delays read with linear interpolation; feedback loops are bounded
+//! (|g| < 1, or saturating for the tape delay).
 
 use super::util::{AllPass1, DelayLine, Envelope, Lfo, OnePole, coef, uni_sine, uni_tri};
 use crate::{AudioEffect, ParamSpec, ParamValues, Smoothed, Unit, block_len, db_to_gain, param_plumbing};
@@ -342,7 +342,7 @@ pub const ANALOG_MODES: &[&str] = &["Tape", "Tape/Tube", "Analog"];
 
 /// Delay with a coloured, saturating feedback path (tape / tape+tube / bucket-brigade style
 /// low-pass and soft clipping) and stereo spread.
-pub struct AnalogDelay {
+pub struct TapeDelay {
     pv: ParamValues,
     sr: f32,
     lines: Vec<DelayLine>,
@@ -355,7 +355,7 @@ pub struct AnalogDelay {
     spread: Smoothed,
 }
 
-impl AnalogDelay {
+impl TapeDelay {
     pub const MAX_MS: f32 = 8000.0;
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::choice("mode", "Mode", ANALOG_MODES, 0),
@@ -371,7 +371,7 @@ impl AnalogDelay {
         let ch = channels.max(1);
         let max = (Self::MAX_MS * 1.5 * 0.001 * sample_rate) as usize + 4;
         let sm = |v| Smoothed::with_ms(v, sample_rate, SM);
-        let mut s = AnalogDelay {
+        let mut s = TapeDelay {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             lines: vec![DelayLine::new(max); ch],
@@ -402,8 +402,8 @@ impl AnalogDelay {
     }
 }
 
-impl AudioEffect for AnalogDelay {
-    param_plumbing!("analog_delay");
+impl AudioEffect for TapeDelay {
+    param_plumbing!("tape_delay");
     fn reset(&mut self) {
         self.lines.iter_mut().for_each(DelayLine::reset);
         self.lp.iter_mut().for_each(OnePole::reset);

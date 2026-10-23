@@ -48,34 +48,34 @@ id, name, range, default, `Unit`, log-scale hint and choice labels so UIs can be
 | `reverb` | 8×8 Householder FDN, pre-delay, RT60 decay, HF damping, size, mix |
 | `amplify`, `channel_volume`, `balance` | gain, per-channel gain, balance / constant-power pan |
 | `invert`, `swap_channels`, `fill_left`, `fill_right` | polarity and routing |
-| `dehum` | 50/60 Hz notch comb with up to 10 harmonics |
-| `denoise` | STFT spectral gating, minimum-statistics noise floor (latency = FFT size) |
+| `hum_remover` | 50/60 Hz notch comb with up to 10 harmonics |
+| `noise_reducer` | STFT spectral gating, minimum-statistics noise floor (latency = FFT size) |
 | `pitch_shifter` | ±12 semitones, phase vocoder with peak shifting + phase locking (latency = FFT size) |
-| `deesser` | high-pass sidechain at `frequency` (2–12 kHz) detects sibilance relative to the broadband level (`threshold`); a dynamic high shelf cuts the band by up to `reduction` dB (1 ms / 60 ms, stereo-linked); exact identity when idle |
-| `dereverb` | STFT late-reverb suppression: λ_r(t) = e^{−2Δ·T_d}·λ_x(t − T_d) (Δ = 3 ln10 / `rt60`, T_d ≈ 50 ms), over-subtraction 1 + `amount`, gain floor down to −18 dB, smoothed gains (latency = FFT size) |
-| `speech_enhance` | Enhance Speech DSP chain: 80 Hz HPF, de-mud cut (250 / 350 Hz −3 dB), presence (2.5 / 4 kHz +4 dB) and air (+2 dB @ 10 kHz) boosts by `tone`, downward expander below −50 dBFS (3:1, ≤ 18 dB), 3:1 soft-knee compressor above −24 dBFS, +3 dB make-up, `mix` |
+| `sibilance_reducer` | high-pass sidechain at `frequency` (2–12 kHz) detects sibilance relative to the broadband level (`threshold`); a dynamic high shelf cuts the band by up to `reduction` dB (1 ms / 60 ms, stereo-linked); exact identity when idle |
+| `reverb_reducer` | STFT late-reverb suppression: λ_r(t) = e^{−2Δ·T_d}·λ_x(t − T_d) (Δ = 3 ln10 / `rt60`, T_d ≈ 50 ms), over-subtraction 1 + `amount`, gain floor down to −18 dB, smoothed gains (latency = FFT size) |
+| `speech_cleanup` | Enhance Speech DSP chain: 80 Hz HPF, de-mud cut (250 / 350 Hz −3 dB), presence (2.5 / 4 kHz +4 dB) and air (+2 dB @ 10 kHz) boosts by `tone`, downward expander below −50 dBFS (3:1, ≤ 18 dB), 3:1 soft-knee compressor above −24 dBFS, +3 dB make-up, `mix` |
 | `stereo_width` | mid/side width 0–200 % (100 % = identity, 0 % = mono) |
 | `graphic_eq_10/20/30` | constant-Q peaking bands at octave / half-octave / third-octave ISO centres (Q from the bandwidth), ±24 dB, master gain |
 | `parametric_eq_full` | Premiere's Parametric Equalizer: master gain, high-pass and low-pass (12–48 dB/oct Butterworth cascades), low shelf, 5 peaking bands, high shelf |
 | `notch_filter` | 6 constant-bandwidth cuts (`FilterType::Cut` = 1 + (g − 1)·BP: the width stays f/Q however deep), Narrow / Very Narrow / Super Narrow |
-| `scientific_filter` | Bessel / Butterworth / Chebyshev I / elliptic, LP / HP / BP / BS, order 1–12 (`design`: analog prototype → frequency transform at pre-warped edges → bilinear → biquads; elliptic via Landen-transformation Jacobi functions after Orfanidis) |
-| `fft_filter` | 8-point gain curve (log-frequency, linear or smoothstep), applied zero-phase by √Hann STFT at 75 % overlap (latency = FFT size) |
+| `classic_filter` | Bessel / Butterworth / Chebyshev I / elliptic, LP / HP / BP / BS, order 1–12 (`design`: analog prototype → frequency transform at pre-warped edges → bilinear → biquads; elliptic via Landen-transformation Jacobi functions after Orfanidis) |
+| `spectral_curve_eq` | 8-point gain curve (log-frequency, linear or smoothstep), applied zero-phase by √Hann STFT at 75 % overlap (latency = FFT size) |
 | `dynamics_rack` | Dynamics: auto gate (hold) → expander → compressor (auto make-up) → limiter (soft clip), stereo-linked; `transfer_db` gives the static curve |
 | `multiband_compressor` | 4 bands with LR4 crossovers and all-pass phase compensation (bands sum to an all-pass: flat magnitude), per-band threshold/ratio/attack/release/gain/solo/bypass, output limiter, channel link |
 | `tube_compressor` | RMS detector, 10 dB soft knee, program-dependent release, gentle `tanh(x/2)·2` saturation |
 | `chorus_flanger` | chorus (3 voices, 15–35 ms) or flanger (0.3–5 ms, feedback), transience emphasis, mix |
 | `flanger` | initial/final delay sweep, stereo phasing, ±feedback, inverted / special / sinusoidal modes |
 | `phaser` | 2–12 swept first-order all-passes, depth (octaves below the upper frequency), feedback, stereo phase difference |
-| `analog_delay` | Tape / Tape+Tube / Analog: low-passed, saturating feedback (bounded up to 200 %), trash, stereo spread |
+| `tape_delay` | Tape / Tape+Tube / Analog: low-passed, saturating feedback (bounded up to 200 %), trash, stereo spread |
 | `multitap_delay` | 4 independent feedback taps, levels, mix |
 | `convolution_reverb` | uniformly partitioned overlap-save convolution (256-sample partitions, latency 256) with 7 impulses generated here (noise with frequency-dependent exponential decay + early reflections, unit energy); room size (resampling), LF/HF damping, pre-delay, width |
 | `surround_reverb` | early reflections + FDN late field, centre input, low/high cut, width, dry/wet (stereo rendering) |
 | `click_remover` | LPC residual outlier detection (k·σ, σ from the median), AR forward/backward interpolation of ≤ 64-sample regions (latency 640) |
-| `channel_mixer`, `stereo_expander`, `mute` | 2×2 matrix with inversion; mid/side expand + centre pan; ramped mute |
-| `distortion`, `guitar_suite` | waveshaper (soft/hard/tube/foldback, asymmetry, tone); compressor → distortion → amp/cabinet voicing → filter |
-| `mastering`, `vocal_enhancer` | EQ → reverb → exciter → widener → loudness maximiser (transparent at defaults); fixed Male/Female/Music voicings |
-| `binauralizer` | ±angle virtual speakers through a spherical-head model (Woodworth ITD + Brown–Duda head shadow) |
-| `ambisonics_panner` | rotates a ±30° source pair (pan/tilt/roll) and re-pans to stereo; identity at 0/0/0 |
+| `channel_mixer`, `stereo_spread`, `mute` | 2×2 matrix with inversion; mid/side expand + centre pan; ramped mute |
+| `distortion`, `guitar_amp_suite` | waveshaper (soft/hard/tube/foldback, asymmetry, tone); compressor → distortion → amp/cabinet voicing → filter |
+| `master_chain`, `vocal_polish` | EQ → reverb → exciter → widener → loudness maximiser (transparent at defaults); fixed Male/Female/Music voicings |
+| `binaural_panner` | ±angle virtual speakers through a spherical-head model (Woodworth ITD + Brown–Duda head shadow) |
+| `ambisonic_rotator` | rotates a ±30° source pair (pan/tilt/roll) and re-pans to stereo; identity at 0/0/0 |
 | `loudness_meter` | pass-through BS.1770 meter (`LoudnessMeterFx::meter`) |
 
 `AudioEffect::response_db(freq)` (EQs and filters) and `transfer_db(band, input_db)` (dynamics)
@@ -87,24 +87,24 @@ playback.
 deterministic and latency constant (impulse lands at `latency()`), plus a level / frequency-response
 test on generated tones, noise or impulses and a realtime-factor floor.
 
-Essential Sound builds on these (Repair: `denoise`, high-pass via `parametric_eq`, `dehum`,
-`deesser`, `dereverb`; Clarity: `compressor`, `simple_eq`, `speech_enhance`; Creative: `reverb`,
+Essential Sound builds on these (Repair: `noise_reducer`, high-pass via `parametric_eq`, `hum_remover`,
+`sibilance_reducer`, `reverb_reducer`; Clarity: `compressor`, `simple_eq`, `speech_cleanup`; Creative: `reverb`,
 `stereo_width`).
 
 **Enhance Speech decision.** No machine-learning model is bundled: we found no openly licensed
 speech-enhancement model that is also practical to ship here (pure Rust, wasm, asset rules).
 DeepFilterNet (MIT/Apache-2.0, with a Rust implementation on `tract`) is the candidate for a future
 optional integration behind a trait outside this dependency-free crate, once its weights' licence and
-size are vetted as an asset. Until then `speech_enhance` is the DSP chain above.
+size are vetted as an asset. Until then `speech_cleanup` is the DSP chain above.
 
 Measured on synthetic signals (`effects::essential::tests`, 48 kHz):
 
 | Effect | Signal | Result |
 |---|---|---|
-| `deesser` | 150 Hz harmonic voice + 5–10 kHz noise bursts | sibilance −5.1 dB (8 dB max) / −9.8 dB (16 dB max) during bursts; voice band ±0.01 dB; non-sibilant passages ±0.001 dB |
-| `dereverb` (100 %) | harmonic syllables (100 ms / 400 ms gaps) + Polack-model late reverb, RT60 0.8 s | tail-to-burst energy −5.0 → −10.1 dB (5.0 dB better); burst energy −1.7 dB |
-| `speech_enhance` | voice + fricative noise syllables over −60 dBFS noise | presence/mud tilt +5.5 dB; noise between syllables −8.7 dB; overall level +1.0 dB |
-| Dialogue chain | `denoise` + `parametric_eq` (2 HP bands) + `dehum` + `deesser` + `dereverb` + `compressor` + `simple_eq` + `speech_enhance` + `reverb`, 60 s stereo | 1.36 s = **44× realtime** on one core (release, Apple Silicon; `cargo test --release -p soundcraft-fx dialogue_chain_realtime -- --ignored --nocapture`) |
+| `sibilance_reducer` | 150 Hz harmonic voice + 5–10 kHz noise bursts | sibilance −5.1 dB (8 dB max) / −9.8 dB (16 dB max) during bursts; voice band ±0.01 dB; non-sibilant passages ±0.001 dB |
+| `reverb_reducer` (100 %) | harmonic syllables (100 ms / 400 ms gaps) + Polack-model late reverb, RT60 0.8 s | tail-to-burst energy −5.0 → −10.1 dB (5.0 dB better); burst energy −1.7 dB |
+| `speech_cleanup` | voice + fricative noise syllables over −60 dBFS noise | presence/mud tilt +5.5 dB; noise between syllables −8.7 dB; overall level +1.0 dB |
+| Dialogue chain | `noise_reducer` + `parametric_eq` (2 HP bands) + `hum_remover` + `sibilance_reducer` + `reverb_reducer` + `compressor` + `simple_eq` + `speech_cleanup` + `reverb`, 60 s stereo | 1.36 s = **44× realtime** on one core (release, Apple Silicon; `cargo test --release -p soundcraft-fx dialogue_chain_realtime -- --ignored --nocapture`) |
 
 ## Ducking analysis (`ducking`)
 
@@ -140,6 +140,6 @@ sub-sample estimate, and two trust figures (`confidence` = peak / RMS of the cor
 
 - Effects assume ≤ the channel count they were built with; extra channels pass through
   (channel-generic gain effects process all of them).
-- DeNoise adapts continuously; a perfectly stationary tone is (by design) treated as noise after
+- NoiseReducer adapts continuously; a perfectly stationary tone is (by design) treated as noise after
   ~1.5 s. There is no explicit "learn noise print" mode yet.
 - Filter type / choice changes switch immediately (continuous parameters are smoothed).

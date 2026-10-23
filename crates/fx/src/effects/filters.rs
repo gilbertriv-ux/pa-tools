@@ -1,6 +1,6 @@
 //! Filter and EQ effects: graphic equalisers (10/20/30 bands), the full parametric equaliser
-//! (pass filters, shelves, five peaking bands), the six-notch filter, the Scientific Filter
-//! (Bessel / Butterworth / Chebyshev / elliptic designs) and the FFT Filter (frequency-sampled
+//! (pass filters, shelves, five peaking bands), the six-notch filter, the classic filter
+//! (Bessel / Butterworth / Chebyshev / elliptic designs) and the spectral curve EQ (frequency-sampled
 //! gain curve applied by STFT overlap-add).
 
 use super::eq::{BandBank, MAX_BANDS};
@@ -275,7 +275,7 @@ pub fn butterworth_q(m: usize, k: usize) -> f32 {
     (1.0 / (2.0 * (std::f64::consts::PI * (2 * k + 1) as f64 / (2 * n) as f64).cos())) as f32
 }
 
-/// Premiere-style parametric equaliser: master gain, high-pass (12–48 dB/oct), low shelf,
+/// Full parametric equaliser: master gain, high-pass (12–48 dB/oct), low shelf,
 /// five peaking bands, high shelf and low-pass (12–48 dB/oct), all RBJ biquads.
 pub struct FullParametricEq {
     pv: ParamValues,
@@ -417,7 +417,7 @@ pub const SCI_MODES: &[&str] = &["Low Pass", "High Pass", "Band Pass", "Band Sto
 
 /// Classical IIR designs (see [`crate::design`]) as a cascade of biquads. Cutoff changes glide
 /// (redesigned every 32 samples while moving); type/order/ripple changes switch immediately.
-pub struct ScientificFilter {
+pub struct ClassicFilter {
     pv: ParamValues,
     sr: f32,
     proto_key: (usize, usize, f32, f32),
@@ -433,7 +433,7 @@ pub struct ScientificFilter {
     dirty: bool,
 }
 
-impl ScientificFilter {
+impl ClassicFilter {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::choice("type", "Type", SCI_TYPES, 1),
         ParamSpec::choice("mode", "Mode", SCI_MODES, 0),
@@ -447,7 +447,7 @@ impl ScientificFilter {
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let proto = design::prototype(Family::Butterworth, 1, 1.0, 60.0);
-        let mut s = ScientificFilter {
+        let mut s = ClassicFilter {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             proto_key: (usize::MAX, 0, 0.0, 0.0),
@@ -500,8 +500,8 @@ impl ScientificFilter {
     }
 }
 
-impl AudioEffect for ScientificFilter {
-    param_plumbing!("scientific_filter");
+impl AudioEffect for ClassicFilter {
+    param_plumbing!("classic_filter");
     fn response_db(&self, freq: f64) -> Option<f64> {
         Some(self.target_sections().magnitude_db(freq, self.sr as f64) + self.pv.v("gain") as f64)
     }
@@ -541,7 +541,7 @@ impl AudioEffect for ScientificFilter {
 
 // ------------------------------------------------------------------------------ FFT filter
 
-/// Number of FFT Filter curve points.
+/// Number of spectral-curve points.
 pub const FFT_POINTS: usize = 8;
 const FFT_POINT_IDS: [[&str; 2]; FFT_POINTS] = [
     ["p1_freq", "p1_gain"],
@@ -575,7 +575,7 @@ const FFT_POINT_PARAMS: [ParamSpec; 16] = flatten([
 ]);
 const FFT_PARAMS: [ParamSpec; 17] = join(FFT_POINT_PARAMS, [ParamSpec::choice("interp", "Interpolation", &["Linear", "Smooth"], 1)]);
 
-/// Gain (dB) of the FFT Filter curve at `freq` for points `(freq, gain_db)` (any order):
+/// Gain (dB) of the spectral curve at `freq` for points `(freq, gain_db)` (any order):
 /// constant beyond the end points, interpolated in log-frequency between them (linearly or with
 /// a smoothstep).
 pub fn fft_curve_db(points: &[(f32, f32)], freq: f32, smooth: bool) -> f32 {
@@ -605,7 +605,7 @@ pub fn fft_curve_db(points: &[(f32, f32)], freq: f32, smooth: bool) -> f32 {
 
 /// Zero-phase frequency-domain gain curve (8 points), applied with a √Hann STFT at 75 %
 /// overlap (latency = FFT size). Curve changes glide over a few frames.
-pub struct FftFilter {
+pub struct SpectralCurveEq {
     pv: ParamValues,
     sr: f32,
     n: usize,
@@ -617,13 +617,13 @@ pub struct FftFilter {
     gains: Vec<f32>,
 }
 
-impl FftFilter {
+impl SpectralCurveEq {
     pub const PARAMS: &'static [ParamSpec] = &FFT_PARAMS;
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let n = fft_size(sample_rate);
         let bins = n / 2 + 1;
-        let mut s = FftFilter {
+        let mut s = SpectralCurveEq {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             n,
@@ -659,8 +659,8 @@ impl FftFilter {
     }
 }
 
-impl AudioEffect for FftFilter {
-    param_plumbing!("fft_filter");
+impl AudioEffect for SpectralCurveEq {
+    param_plumbing!("spectral_curve_eq");
     fn latency(&self) -> usize {
         self.n
     }

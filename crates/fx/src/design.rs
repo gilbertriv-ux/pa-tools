@@ -1,4 +1,4 @@
-//! IIR filter design from classical analog prototypes (Scientific Filter).
+//! IIR filter design from classical analog prototypes (classic filter).
 //!
 //! Textbook method: a normalised low-pass prototype (zeros, poles, gain) — Butterworth, Bessel
 //! (roots of the reverse Bessel polynomial, normalised to −3 dB at Ω = 1), Chebyshev type I and

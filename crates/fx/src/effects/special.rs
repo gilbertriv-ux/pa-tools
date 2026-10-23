@@ -1,5 +1,5 @@
-//! Special and stereo effects: Channel Mixer, Distortion, GuitarSuite, Mastering, Vocal
-//! Enhancer, Stereo Expander, Binauralizer, Ambisonics Panner, Loudness Meter and Mute.
+//! Special and stereo effects: channel mixer, distortion, guitar amp suite, master chain, vocal
+//! polish, stereo spread, binaural panner, ambisonic rotator, loudness meter and mute.
 
 use super::multiband::soft_clip;
 use super::time::Reverb;
@@ -199,15 +199,15 @@ impl AudioEffect for Distortion {
     }
 }
 
-// -------------------------------------------------------------------------------- GuitarSuite
+// -------------------------------------------------------------------------------- GuitarAmpSuite
 
-pub const GS_AMPS: &[&str] = &["None", "Clean Combo", "British Stack", "Tweed", "Modern High Gain"];
+pub const GS_AMPS: &[&str] = &["None", "Clean Combo", "Crunch Stack", "Vintage Combo", "Modern High Gain"];
 pub const GS_FILTERS: &[&str] = &["None", "Low Pass", "High Pass", "Band Pass"];
 pub const GS_DIST: &[&str] = &["Soft", "Hard", "Fuzz"];
 
 /// Guitar chain: compressor → distortion → amplifier/cabinet voicing → filter, with mix and
 /// output gain.
-pub struct GuitarSuite {
+pub struct GuitarAmpSuite {
     pv: ParamValues,
     sr: f32,
     env: f32,
@@ -220,7 +220,7 @@ pub struct GuitarSuite {
     drive: Smoothed,
 }
 
-impl GuitarSuite {
+impl GuitarAmpSuite {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("compressor", "Compressor", 0.0, 100.0, 30.0, Unit::Percent),
         ParamSpec::new("distortion", "Distortion", 0.0, 100.0, 40.0, Unit::Percent),
@@ -235,7 +235,7 @@ impl GuitarSuite {
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let ch = channels.max(1);
-        let mut s = GuitarSuite {
+        let mut s = GuitarAmpSuite {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             env: 0.0,
@@ -281,8 +281,8 @@ impl GuitarSuite {
     }
 }
 
-impl AudioEffect for GuitarSuite {
-    param_plumbing!("guitar_suite");
+impl AudioEffect for GuitarAmpSuite {
+    param_plumbing!("guitar_amp_suite");
     fn reset(&mut self) {
         self.env = 0.0;
         self.st.iter_mut().for_each(|s| s.iter_mut().for_each(Biquad::reset));
@@ -337,13 +337,13 @@ impl AudioEffect for GuitarSuite {
     }
 }
 
-// --------------------------------------------------------------------------------- mastering
+// --------------------------------------------------------------------------------- master_chain
 
 pub const EXCITER_MODES: &[&str] = &["Retro", "Tape", "Tube"];
 
-/// Mastering chain: three-band EQ → reverb → exciter → widener → loudness maximiser → output.
+/// MasterChain chain: three-band EQ → reverb → exciter → widener → loudness maximiser → output.
 /// At its defaults it is transparent.
-pub struct Mastering {
+pub struct MasterChain {
     pv: ParamValues,
     sr: f32,
     eq: [Coeffs; 3],
@@ -359,7 +359,7 @@ pub struct Mastering {
     out: Smoothed,
 }
 
-impl Mastering {
+impl MasterChain {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("eq_low", "Low Shelf Gain", -12.0, 12.0, 0.0, Unit::Decibels),
         ParamSpec::log("eq_mid_freq", "Peak Frequency", 100.0, 10000.0, 1000.0, Unit::Hertz),
@@ -380,7 +380,7 @@ impl Mastering {
         rev.set_param("decay", 1.4);
         rev.set_param("size", 40.0);
         rev.reset();
-        let mut s = Mastering {
+        let mut s = MasterChain {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             eq: [Coeffs::IDENTITY; 3],
@@ -420,8 +420,8 @@ impl Mastering {
     }
 }
 
-impl AudioEffect for Mastering {
-    param_plumbing!("mastering");
+impl AudioEffect for MasterChain {
+    param_plumbing!("master_chain");
     fn response_db(&self, freq: f64) -> Option<f64> {
         Some(self.eq.iter().map(|c| c.magnitude_db(freq, self.sr as f64)).sum::<f64>() + self.pv.v("output") as f64)
     }
@@ -521,7 +521,7 @@ pub const VOCAL_MODES: &[&str] = &["Male", "Female", "Music"];
 
 /// Fixed voicings: Male / Female (rumble cut, de-mud, presence and air, gentle 2:1
 /// compression) or Music (carves the vocal presence range so a voice sits on top).
-pub struct VocalEnhancer {
+pub struct VocalPolish {
     pv: ParamValues,
     sr: f32,
     eq: [Coeffs; 4],
@@ -529,11 +529,11 @@ pub struct VocalEnhancer {
     env: f32,
 }
 
-impl VocalEnhancer {
+impl VocalPolish {
     pub const PARAMS: &'static [ParamSpec] = &[ParamSpec::choice("mode", "Mode", VOCAL_MODES, 0)];
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
-        let mut s = VocalEnhancer {
+        let mut s = VocalPolish {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             eq: [Coeffs::IDENTITY; 4],
@@ -556,8 +556,8 @@ impl VocalEnhancer {
     }
 }
 
-impl AudioEffect for VocalEnhancer {
-    param_plumbing!("vocal_enhancer");
+impl AudioEffect for VocalPolish {
+    param_plumbing!("vocal_polish");
     fn response_db(&self, freq: f64) -> Option<f64> {
         Some(self.eq.iter().map(|c| c.magnitude_db(freq, self.sr as f64)).sum())
     }
@@ -599,14 +599,14 @@ impl AudioEffect for VocalEnhancer {
 // --------------------------------------------------------------------------- stereo expander
 
 /// Mid/side: the side signal is scaled by Stereo Expand and the centre (mid) signal is panned.
-pub struct StereoExpander {
+pub struct StereoSpread {
     pv: ParamValues,
     gl: Smoothed,
     gr: Smoothed,
     side: Smoothed,
 }
 
-impl StereoExpander {
+impl StereoSpread {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("center_pan", "Center Channel Pan", -100.0, 100.0, 0.0, Unit::Pan),
         ParamSpec::new("expand", "Stereo Expand", 0.0, 300.0, 100.0, Unit::Percent),
@@ -614,7 +614,7 @@ impl StereoExpander {
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
         let mut s =
-            StereoExpander { pv: ParamValues::new(Self::PARAMS), gl: sm(1.0, sample_rate), gr: sm(1.0, sample_rate), side: sm(1.0, sample_rate) };
+            StereoSpread { pv: ParamValues::new(Self::PARAMS), gl: sm(1.0, sample_rate), gr: sm(1.0, sample_rate), side: sm(1.0, sample_rate) };
         s.apply_params(true);
         s
     }
@@ -632,8 +632,8 @@ impl StereoExpander {
     }
 }
 
-impl AudioEffect for StereoExpander {
-    param_plumbing!("stereo_expander");
+impl AudioEffect for StereoSpread {
+    param_plumbing!("stereo_spread");
     fn reset(&mut self) {
         for s in [&mut self.gl, &mut self.gr, &mut self.side] {
             s.snap();
@@ -655,7 +655,7 @@ impl AudioEffect for StereoExpander {
     }
 }
 
-// ------------------------------------------------------------------------------ binauralizer
+// ------------------------------------------------------------------------------ binaural_panner
 
 const SPEED_OF_SOUND: f32 = 343.0;
 
@@ -695,7 +695,7 @@ impl Shadow {
 
 /// Renders the stereo input as two virtual loudspeakers at ±`angle` heard through a spherical
 /// head model (Woodworth interaural time difference + head-shadow filtering), for headphones.
-pub struct Binauralizer {
+pub struct BinauralPanner {
     pv: ParamValues,
     sr: f32,
     lines: [DelayLine; 2],
@@ -705,7 +705,7 @@ pub struct Binauralizer {
     mix: Smoothed,
 }
 
-impl Binauralizer {
+impl BinauralPanner {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("angle", "Speaker Angle", 0.0, 90.0, 30.0, Unit::None),
         ParamSpec::new("head_size", "Head Size", 12.0, 24.0, 17.5, Unit::None),
@@ -714,7 +714,7 @@ impl Binauralizer {
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
         let max = (0.002 * sample_rate) as usize + 4;
-        let mut s = Binauralizer {
+        let mut s = BinauralPanner {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
             lines: [DelayLine::new(max), DelayLine::new(max)],
@@ -745,8 +745,8 @@ impl Binauralizer {
     }
 }
 
-impl AudioEffect for Binauralizer {
-    param_plumbing!("binauralizer");
+impl AudioEffect for BinauralPanner {
+    param_plumbing!("binaural_panner");
     fn reset(&mut self) {
         self.lines.iter_mut().for_each(DelayLine::reset);
         for s in &mut self.sh {
@@ -784,13 +784,13 @@ impl AudioEffect for Binauralizer {
 /// Rotates the sound field (pan / tilt / roll) of a stereo source pair placed at ±30° and
 /// re-renders it to stereo with constant-power panning; sources turned behind the listener
 /// are attenuated, raised/lowered sources slightly softened. Identity at 0/0/0.
-pub struct AmbisonicsPanner {
+pub struct AmbisonicRotator {
     pv: ParamValues,
     /// out L ← in L, out L ← in R, out R ← in L, out R ← in R
     m: [Smoothed; 4],
 }
 
-impl AmbisonicsPanner {
+impl AmbisonicRotator {
     pub const PARAMS: &'static [ParamSpec] = &[
         ParamSpec::new("pan", "Pan", -180.0, 180.0, 0.0, Unit::None),
         ParamSpec::new("tilt", "Tilt", -90.0, 90.0, 0.0, Unit::None),
@@ -798,7 +798,7 @@ impl AmbisonicsPanner {
     ];
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
-        let mut s = AmbisonicsPanner {
+        let mut s = AmbisonicRotator {
             pv: ParamValues::new(Self::PARAMS),
             m: [sm(1.0, sample_rate), sm(0.0, sample_rate), sm(0.0, sample_rate), sm(1.0, sample_rate)],
         };
@@ -855,8 +855,8 @@ impl AmbisonicsPanner {
     }
 }
 
-impl AudioEffect for AmbisonicsPanner {
-    param_plumbing!("ambisonics_panner");
+impl AudioEffect for AmbisonicRotator {
+    param_plumbing!("ambisonic_rotator");
     fn reset(&mut self) {
         self.m.iter_mut().for_each(Smoothed::snap);
     }

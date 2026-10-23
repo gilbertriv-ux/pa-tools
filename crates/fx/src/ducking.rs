@@ -1,4 +1,4 @@
-//! Offline analysis for Essential Sound auto-ducking: level envelope of the trigger audio
+//! Offline analysis for auto-ducking: level envelope of the trigger audio
 //! (dialogue, SFX…), activity detection with blip removal and gap bridging, and the volume
 //! keyframes that duck a music clip under the detected regions.
 //!
@@ -69,7 +69,7 @@ pub fn activity(env_db: &[f32], hop_s: f32, threshold_db: f32, min_on_s: f32, br
     merged
 }
 
-/// Essential Sound ducking "Sensitivity" (0…10) → detection threshold in dBFS:
+/// Ducking "Sensitivity" (0…10) → detection threshold in dBFS:
 /// `−20 − 4·s` (5 → −40 dBFS; higher sensitivity reacts to quieter triggers).
 pub fn sensitivity_threshold_db(sensitivity: f32) -> f32 {
     -20.0 - 4.0 * sensitivity.clamp(0.0, 10.0)

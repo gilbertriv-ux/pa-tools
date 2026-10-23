@@ -429,7 +429,7 @@ pub fn normalize_gain_db(measured_lufs: f64, target_lufs: f64) -> f64 {
 
 /// Like [`normalize_gain_db`] but limited so that the resulting true peak does not exceed
 /// `max_true_peak_dbtp` (a linear gain can't fix peaks, so the loudness target is sacrificed —
-/// the behaviour of "Normalize" / Essential Sound auto-match without a limiter).
+/// the behaviour of "Normalize" / loudness auto-match without a limiter).
 pub fn normalize_gain_db_peak_limited(measured_lufs: f64, target_lufs: f64, true_peak_dbtp: f64, max_true_peak_dbtp: f64) -> f64 {
     let g = normalize_gain_db(measured_lufs, target_lufs);
     if true_peak_dbtp.is_finite() { g.min(max_true_peak_dbtp - true_peak_dbtp) } else { g }

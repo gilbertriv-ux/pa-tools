@@ -1,5 +1,5 @@
-//! Convolution Reverb (uniformly partitioned overlap-save convolution with impulse responses
-//! we generate ourselves) and Surround Reverb (early reflections + the FDN late field).
+//! Convolution reverb (uniformly partitioned overlap-save convolution with impulse responses
+//! we generate ourselves) and the room reverb (early reflections + the FDN late field).
 
 use super::time::Reverb;
 use super::util::{DelayLine, OnePole, Prng};
