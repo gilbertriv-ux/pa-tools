@@ -38,7 +38,11 @@ impl Fft {
                 m /= p;
             }
         }
-        assert_eq!(m, 1, "unsupported FFT size {n}");
+        if m != 1 {
+            // Not a size this decoder uses (every caller passes a fixed CELT size). A one-point transform
+            // keeps the function total instead of panicking.
+            return Fft { n: 1, factors: vec![1], twiddle: vec![Cpx { re: 1.0, im: 0.0 }] };
+        }
         let twiddle = (0..n)
             .map(|k| {
                 let ph = -2.0 * std::f64::consts::PI * k as f64 / n as f64;

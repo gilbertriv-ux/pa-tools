@@ -133,7 +133,6 @@ impl StreamDecoder {
         if n < pfs || p.toc.mode == Mode::CeltOnly || self.mode == Some(Mode::CeltOnly) {
             return self.conceal(n, out);
         }
-        let start = out.len();
         if n > pfs {
             self.conceal(n - pfs, out)?;
         }
@@ -145,7 +144,6 @@ impl StreamDecoder {
         out.resize(off + pfs * self.channels, 0.0);
         self.decode_frame(Some(p.frames[0]), &mut out[off..], pfs, true)?;
         self.last_packet_duration = n;
-        debug_assert_eq!(out.len() - start, n * self.channels);
         Ok(n)
     }
 

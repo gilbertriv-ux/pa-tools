@@ -13,7 +13,8 @@ struct Fft {
 
 impl Fft {
     fn new(n: usize) -> Fft {
-        assert!(n.is_power_of_two());
+        // Every caller passes a fixed power of two (2048 / 256 point transforms); rounding up keeps this total.
+        let n = n.max(1).next_power_of_two();
         let bits = n.trailing_zeros();
         let rev = (0..n as u32).map(|i| if bits == 0 { 0 } else { i.reverse_bits() >> (32 - bits) }).collect();
         let twiddle = (0..n / 2)

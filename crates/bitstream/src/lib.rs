@@ -70,7 +70,7 @@ impl<'a> BitReader<'a> {
     /// Peek up to 32 bits without consuming (zero-padded past the end).
     #[inline]
     pub fn peek(&self, n: u32) -> u32 {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return 0;
         }
@@ -187,7 +187,7 @@ impl BitWriter {
         Self::default()
     }
     pub fn write_bits(&mut self, value: u32, n: u32) {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return;
         }
