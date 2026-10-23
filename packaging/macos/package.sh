@@ -15,6 +15,10 @@
 #   MACOS_KEYCHAIN        keychain holding the identity (optional)
 # Notarization (env; all three needed, and a real identity):
 #   APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID
+# Speech-to-text (env, optional):
+#   PT_FEATURES           cargo features for both binaries, e.g. "whisper,download" (default: none)
+#   PT_MODELS_DIR         a models folder (holding e.g. whisper-base/) copied into
+#                         Contents/Resources/models before signing, where the app looks for it
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -26,7 +30,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
-    -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +67,7 @@ echo "==> $PT_NAME $VERSION for macOS ($ARCH), identity: $IDENTITY, notarize: $N
 if [ "$SKIP_BUILD" = 0 ]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
+  if [ -n "${PT_FEATURES:-}" ]; then args+=(--features "$PT_FEATURES"); fi
   (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli "${args[@]}")
 fi
 
@@ -113,6 +118,19 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
   "$HERE/Info.plist.in" >"$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
+
+# Speech models go in before signing (the signature seals Resources). The app finds them through
+# its bundle tier: <bundle>/Contents/Resources/models/<model id>/.
+if [ -n "${PT_MODELS_DIR:-}" ]; then
+  if [ -d "$PT_MODELS_DIR" ] && [ -n "$(ls -A "$PT_MODELS_DIR" 2>/dev/null)" ]; then
+    mkdir -p "$APP/Contents/Resources/models"
+    cp -R "$PT_MODELS_DIR/." "$APP/Contents/Resources/models/"
+    echo "==> bundled speech models from $PT_MODELS_DIR:"
+    ls -l "$APP/Contents/Resources/models"/*
+  else
+    warn "macOS: PT_MODELS_DIR=$PT_MODELS_DIR is missing or empty; no speech model bundled"
+  fi
+fi
 
 # Drop extended attributes picked up during the build (quarantine, FinderInfo) before signing:
 # `codesign --verify --strict` rejects them, and nothing after signing may touch the bundle.
