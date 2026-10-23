@@ -36,6 +36,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
 
 env:
+  # The Rust release every job installs: the exact one the developers build with. GitHub's `stable`
+  # moves on its own schedule, and a new clippy adds lints (1.99 added chunks_exact_to_as_chunks),
+  # which turned feature branches red for a reason that was not in their code. Upgrading Rust is a
+  # deliberate one-line change here (and in windows-msi.yml), made after running the new clippy
+  # locally. `rust-version` (the MSRV) in Cargo.toml is a separate, lower floor and is not touched.
+  RUST_TOOLCHAIN: "1.97.0"
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
   # Debug and test builds without debug info: faster compiles and links and a much smaller target
@@ -75,11 +81,11 @@ jobs:
             libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev \
             libfontconfig1-dev mesa-vulkan-drivers pkg-config
 
-      - name: Install Rust (stable with clippy, rustfmt and wasm32)
+      - name: Install Rust (pinned, with clippy, rustfmt and wasm32)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt \
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt \
             --target wasm32-unknown-unknown
-          rustup default stable
+          rustup default "$RUST_TOOLCHAIN"
           rustc --version
           cargo --version
 
@@ -135,10 +141,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust (stable)
+      - name: Install Rust (pinned)
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
           rustc --version
           cargo --version
 

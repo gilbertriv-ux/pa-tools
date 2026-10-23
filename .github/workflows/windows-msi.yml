@@ -34,6 +34,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
 
 env:
+  # The Rust release to build with; the same pin as ci.yml (see the note there before changing it).
+  RUST_TOOLCHAIN: "1.97.0"
   CARGO_INCREMENTAL: "0"
   # A missing resource compiler must fail the build, not ship an icon-less exe. (package.ps1 sets it
   # too; stating it here keeps the requirement visible.)
@@ -57,12 +59,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust (stable with the MSVC target)
+      - name: Install Rust (pinned, with the MSVC target)
         shell: pwsh
         run: |
           $target = if ($env:ARCH -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-          rustup toolchain install stable --profile minimal --target $target
-          rustup default stable
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $target
+          rustup default $env:RUST_TOOLCHAIN
           rustc --version
           cargo --version
 

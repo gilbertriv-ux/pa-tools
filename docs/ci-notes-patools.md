@@ -57,7 +57,7 @@ The release workflow (signing, notarisation, draft release) is therefore still t
 
 Common to both: `permissions: contents: read`, no secrets, standard free GitHub-hosted runners (no
 xlarge), every third-party action pinned to a commit SHA with its version in a comment, Rust installed
-with `rustup` (no action for it), `Swatinem/rust-cache` for dependencies, `concurrency` that cancels
+with `rustup` at one pinned version (no action for it), `Swatinem/rust-cache` for dependencies, `concurrency` that cancels
 superseded runs (but never on `pa-tools`). Pa Tools keeps its own version numbers: nothing here reads or
 sets upstream's version; `package.ps1` reads `[workspace.package] version` from this repository's
 `Cargo.toml`.
@@ -71,12 +71,30 @@ sets upstream's version; `package.ps1` reads `[workspace.package] version` from 
 All three were checked against the tags on github.com (`git ls-remote`). Dependabot's `github-actions`
 ecosystem proposes bumps of these SHAs.
 
+### The Rust toolchain is pinned
+
+Both workflows install one exact Rust release, set once per file in `env: RUST_TOOLCHAIN: "1.97.0"`
+(`ci.yml` and `windows-msi.yml`), not GitHub's moving `stable`. Why: on 2026-10-23 `stable` became
+Rust/clippy 1.99, which added the lint `chunks_exact_to_as_chunks`; under `clippy -D warnings` that broke
+two feature branches whose code builds clean on the developers' machines (`rustc 1.97.0`). A gate that
+turns red because the tool changed, not the code, teaches people to ignore it.
+
+- **Upgrading Rust is a deliberate one-line change** in each workflow (the two `RUST_TOOLCHAIN` lines,
+  kept equal), made after running the new clippy locally (`cargo clippy --workspace --all-targets -- -D
+  warnings` with the new toolchain) and fixing or allowing what it reports, in the same pull request.
+- **There is no `rust-toolchain.toml`, on purpose.** Agents' local toolchains cannot download the
+  `wasm32-unknown-unknown` target, and a toolchain file that lists it would break their builds. CI names
+  the target itself.
+- **The MSRV is separate and unchanged:** `rust-version = "1.90"` in the root `Cargo.toml` is the lowest
+  compiler the code promises to build with; the pin is what CI builds with.
+- `rust-cache` keys its cache on the compiler version, so a new pin starts from a cold cache once.
+
 ### `ci.yml` (Pa Tools CI)
 
 - **`gate`** (`ubuntu-24.04`): `cargo xtask ci` = rustfmt check, `clippy --workspace --all-targets -D
-  warnings`, `cargo test --workspace`, `assets`, `layers`, and the wasm32 check. The toolchain is stable
-  Rust with clippy, rustfmt and the `wasm32-unknown-unknown` target (without the target the wasm step
-  could not run). Apt packages: `libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev
+  warnings`, `cargo test --workspace`, `assets`, `layers`, and the wasm32 check. The toolchain is the
+  pinned Rust release (see "The Rust toolchain is pinned") with clippy, rustfmt and the
+  `wasm32-unknown-unknown` target (without the target the wasm step could not run). Apt packages: `libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev
   libfontconfig1-dev mesa-vulkan-drivers pkg-config` (the last-but-one gives the egui render tests a
   software Vulkan adapter).
 - **`build-test`** (`macos-15`, `windows-latest`): `cargo build --workspace`, then `cargo test
