@@ -100,11 +100,13 @@ Copy-Item (Join-Path $Bin "$PtBin.exe"), (Join-Path $Bin "$PtCli.exe") $Stage
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage "$PtBin.exe") (Join-Path $Stage "$PtCli.exe")
 
 # ---- MSI ---------------------------------------------------------------------------------------
+# The MSI also installs NOTICE, LICENSE-MIT, LICENSE-APACHE and ATTRIBUTION.md from the repository
+# root (-d LegalDir); the portable zip below ships the same files.
 $IconPath = Join-Path $Root "assets\app-icon\$PtSlug.ico"
 $Msi = Join-Path $Dist "$PtSlug-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   wix build (Join-Path $PSScriptRoot 'patools.wxs') -arch $Arch `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$IconPath" `
+    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$IconPath" -d "LegalDir=$Root" `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
