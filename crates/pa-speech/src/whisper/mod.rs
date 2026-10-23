@@ -85,6 +85,7 @@ impl Whisper {
         let cfg: Config = serde_json::from_slice(&read("config.json")?).map_err(|e| SpeechError::Model(format!("config.json: {e}")))?;
         let gen_cfg: serde_json::Value = serde_json::from_slice(&read("generation_config.json")?).unwrap_or_default();
         let tok = Tokenizer::from_json(&String::from_utf8_lossy(&read("tokenizer.json")?))?;
+        tok.validate_vocab_size(cfg.vocab_size)?;
         let weights = read("model.safetensors")?;
         let alignment_heads = gen_cfg["alignment_heads"]
             .as_array()

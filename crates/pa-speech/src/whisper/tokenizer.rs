@@ -50,16 +50,19 @@ impl Tokenizer {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| bad(&e.to_string()))?;
         let vocab = v["model"]["vocab"].as_object().ok_or_else(|| bad("no model.vocab"))?;
         let table = unicode_to_byte();
-        let max = vocab.values().filter_map(|x| x.as_u64()).max().unwrap_or(0) as usize;
+        // Whisper vocabularies fit in 16 bits. Reject hostile IDs before allocating an ID table.
+        let token_id = |v: &serde_json::Value| v.as_u64().filter(|id| *id <= u16::MAX as u64).ok_or_else(|| bad("token id out of range"));
+        let max = vocab.values().map(token_id).collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0) as usize;
         let mut bytes = vec![Vec::new(); max + 1];
         for (tok, id) in vocab {
-            let id = id.as_u64().ok_or_else(|| bad("vocab id"))? as usize;
+            let id = token_id(id)? as usize;
             bytes[id] = tok.chars().filter_map(|c| table.get(&c).copied()).collect();
         }
         let mut special = HashMap::new();
         let mut special_by_id = HashMap::new();
         for a in v["added_tokens"].as_array().ok_or_else(|| bad("no added_tokens"))? {
-            let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str()) else { continue };
+            let id = token_id(&a["id"])?;
+            let c = a["content"].as_str().ok_or_else(|| bad("added token content"))?;
             special.insert(c.to_string(), id as u32);
             special_by_id.insert(id as u32, c.to_string());
         }
@@ -90,6 +93,13 @@ impl Tokenizer {
 
     pub fn multilingual(&self) -> bool {
         !self.languages.is_empty()
+    }
+
+    pub fn validate_vocab_size(&self, size: usize) -> Result<(), SpeechError> {
+        if self.bytes.len() > size || self.special_by_id.keys().any(|id| *id as usize >= size) || self.eot >= self.timestamp_begin {
+            return Err(SpeechError::Model("tokenizer IDs do not match the model vocabulary".into()));
+        }
+        Ok(())
     }
 
     pub fn language_token(&self, code: &str) -> Option<u32> {
@@ -165,4 +175,17 @@ pub fn group_words(tok: &Tokenizer, ids: &[u32]) -> Vec<(String, std::ops::Range
         groups.push((pre, start..ids.len()));
     }
     groups.into_iter().map(|(b, r)| (String::from_utf8_lossy(&b).trim().to_string(), r)).filter(|(t, _)| !t.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_ids_return_errors_before_allocating() {
+        for id in [u64::MAX, 65_536] {
+            let json = format!(r#"{{"model":{{"vocab":{{"a":{id}}}}},"added_tokens":[]}}"#);
+            assert!(Tokenizer::from_json(&json).is_err());
+        }
+    }
 }

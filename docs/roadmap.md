@@ -1,6 +1,6 @@
 # Pa Tools roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** trivial (M8 batch limit validation) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-22 · **Change:** minor (G-18 local implementation) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
@@ -78,7 +78,8 @@ AAX, `.ptx` and Avid cloud features.
 
 Control surfaces (G-10), immersive delivery (G-12), the rest of the built-in plugin catalogue
 (G-08), Elastic Audio depth (G-15), session templates and browser (G-16), video depth (G-17),
-speech-to-text (G-18), notation and instrument depth (G-20), compressed export (G-21), and the
+transcription accuracy and editing depth (G-18; local recognition and the Transcript window are
+implemented with a real spoken-fixture check), notation and instrument depth (G-20), compressed export (G-21), and the
 remaining languages.
 
 There is no `cargo xtask scorecard` in this repo; the measured number is `cargo xtask parity`
@@ -88,6 +89,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | G-18 local recognition and searchable transcript implemented; remaining quality and editing work retained |
 | 2026-10-14 | trivial | M8: reject oversized MCP batches before execution (#460) |
 | 2026-10-10 | minor | Added the alpha gate (3 of 6 core workflows fail → pre-alpha) |
 | 2026-10-10 | major | Created from ROADMAP.md's milestones and alpha list; added M12–M17 and the beta plan with estimates |

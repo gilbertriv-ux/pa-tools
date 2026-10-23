@@ -27,6 +27,7 @@ pub mod shortcuts;
 pub mod spot;
 pub mod theme;
 pub mod toolbar;
+pub mod transcript_window;
 pub mod video_track;
 pub mod video_window;
 pub mod waveform;
@@ -114,6 +115,8 @@ pub struct UiState {
     pub show_search: bool,
     /// Window › Video, Window › Video Universe, timecode burn-in in the Video window.
     pub show_video: bool,
+    pub show_transcript: bool,
+    pub transcript: transcript_window::State,
     pub show_video_universe: bool,
     pub video_burn_in: bool,
     pub workspace_dir: String,
@@ -177,6 +180,8 @@ impl Default for UiState {
             show_score: false,
             show_search: false,
             show_video: false,
+            show_transcript: false,
+            transcript: transcript_window::State::default(),
             show_video_universe: false,
             video_burn_in: false,
             workspace_dir: String::new(),
@@ -266,6 +271,7 @@ pub struct SoundApp {
     take_plan: Option<soundcraft_engine::io::Recording>,
     pub ui: UiState,
     pub audio_health_report: Option<Result<Value, String>>,
+    pub transcription: Option<transcript_window::Job>,
     pub services: Services,
     /// Set only by a desktop host after installing an OS menu bar.
     pub native_menu_bar: bool,
@@ -361,6 +367,7 @@ impl SoundApp {
             take_plan: None,
             ui: UiState::default(),
             audio_health_report: None,
+            transcription: None,
             services,
             native_menu_bar: false,
             autosave_dir: None,
@@ -1164,6 +1171,7 @@ impl SoundApp {
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
+        transcript_window::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
@@ -1261,6 +1269,7 @@ impl SoundApp {
         }
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
+        transcript_window::show(self, &ctx);
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);

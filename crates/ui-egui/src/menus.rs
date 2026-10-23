@@ -29,6 +29,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
     ("window.universe", "Universe", "View > Other Displays > Universe", Some("Alt+7")),
     ("window.video", "Video", "Window > Video", Some("Cmd+9")),
+    ("window.transcript", "Transcript", "Window > Transcript", None),
     ("window.video_universe", "Video Universe", "Window > Video Universe", None),
     ("window.automation", "Automation", "Window > Automation", Some("Cmd+4")),
     ("window.color_palette", "Color Palette", "Window > Color Palette", None),
@@ -496,6 +497,7 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
         Some("window.renderer") => app.extra.show_renderer,
+        Some("window.transcript") => app.ui.show_transcript,
         Some("window.ui_customization") => app.extra.show_ui_customization,
         Some("window.config_auto_update") => app.extra.auto_update_config,
         Some("view.mix_section") => path.rsplit(" > ").next().map(mix_section_id).is_some_and(|s| app.ui.mix_views.iter().any(|v| v == s)),
@@ -748,6 +750,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         }
         "window.universe" => toggle(&mut app.ui.show_universe),
         "window.video" => toggle(&mut app.ui.show_video),
+        "window.transcript" => toggle(&mut app.ui.show_transcript),
         "window.video_universe" => toggle(&mut app.ui.show_video_universe),
         "window.close" | "window.hide_floating" => {
             app.ui.show_transport = false;
@@ -756,6 +759,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             app.ui.show_undo_history = false;
             app.ui.show_session_info = false;
             app.ui.show_audio_health = false;
+            app.ui.show_transcript = false;
             app.ui.show_automation = false;
             app.ui.plugin_windows.clear();
             app.ui.audiosuite = None;

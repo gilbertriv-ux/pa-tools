@@ -236,12 +236,13 @@ pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgres
     use sha2::Digest;
     use std::io::{Read, Write};
     std::fs::create_dir_all(dir)?;
-    let total: u64 = files.iter().filter(|f| !std::fs::metadata(dir.join(f.name)).is_ok_and(|md| md.len() == f.size)).map(|f| f.size).sum();
+    let missing = files.iter().map(|file| verified_file(&dir.join(file.name), file).map(|valid| !valid)).collect::<Result<Vec<_>, _>>()?;
+    let total: u64 = files.iter().zip(&missing).filter(|(_, missing)| **missing).map(|(f, _)| f.size).sum();
     let agent = agent();
     let mut done = 0u64;
-    for f in files {
+    for (f, missing) in files.iter().zip(missing) {
         let dest = dir.join(f.name);
-        if std::fs::metadata(&dest).is_ok_and(|md| md.len() == f.size) {
+        if !missing {
             continue;
         }
         let part = dir.join(format!("{}.part", f.name));
@@ -256,6 +257,11 @@ pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgres
             let n = reader.read(&mut buf).map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
             if n == 0 {
                 break;
+            }
+            if got.saturating_add(n as u64) > f.size {
+                drop(out);
+                let _ = std::fs::remove_file(&part);
+                return Err(SpeechError::Download(format!("{}: response exceeds pinned size", f.name)));
             }
             hasher.update(&buf[..n]);
             out.write_all(&buf[..n])?;
@@ -283,6 +289,31 @@ pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgres
 }
 
 #[cfg(feature = "download")]
+fn verified_file(path: &Path, file: &ModelFile) -> Result<bool, crate::SpeechError> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut input = match std::fs::File::open(path) {
+        Ok(input) => input,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if !input.metadata()?.is_file() || input.metadata()?.len() != file.size {
+        return Ok(false);
+    }
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let sha: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(sha == file.sha256)
+}
+
+#[cfg(feature = "download")]
 fn agent() -> ureq::Agent {
     let provider = std::sync::Arc::new(rustls_rustcrypto::provider());
     ureq::Agent::config_builder()
@@ -301,6 +332,27 @@ fn agent() -> ureq::Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn equal_size_cache_files_are_checked_by_checksum() {
+        let dir = std::env::temp_dir().join(format!("pa-speech-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = ModelFile {
+            name: "cache.bin",
+            url: "invalid://test-no-network",
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let path = dir.join(file.name);
+        std::fs::write(&path, b"BAD").unwrap();
+        assert!(!verified_file(&path, &file).unwrap());
+        assert!(download_files(&dir, &[file], &mut |_, _, _| true).is_err());
+        std::fs::write(&path, b"abc").unwrap();
+        assert!(verified_file(&path, &file).unwrap());
+        assert!(download_files(&dir, &[file], &mut |_, _, _| true).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn catalogue_is_pinned_and_checksummed() {

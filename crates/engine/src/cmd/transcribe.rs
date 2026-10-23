@@ -40,7 +40,9 @@ fn transcribe(e: &mut Engine, p: &Value) -> Result<Value> {
     };
 
     let model = str_param(p, "model").unwrap_or(soundcraft_pa_speech::models::DEFAULT_MODEL).to_string();
-    let models_dir = str_param(p, "models_dir").map(PathBuf::from).or_else(|| std::env::var_os("PA_SPEECH_MODELS_DIR").map(PathBuf::from));
+    let models_dir = str_param(p, "models_dir")
+        .map(PathBuf::from)
+        .or_else(|| soundcraft_pa_speech::discovery::resolve_models_dir(&model, soundcraft_brand::CONFIG_DIR_NAME).ok());
 
     // Render the track's clips and downmix to mono at the session rate, then resample to 16 kHz.
     let sr = e.session().sample_rate;

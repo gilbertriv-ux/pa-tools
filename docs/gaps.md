@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-22 · **Change:** minor (G-18 implementation and remaining quality work) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -32,7 +32,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 | G-15 | Elastic Audio depth: one algorithm, no Elastic Pitch | Features | [target-app-parity.md](target-app-parity.md) | 30–45 |
 | G-16 | Session templates, track presets, workspace browser, batch rename | Features | [target-app-parity.md](target-app-parity.md) | 25–40 |
 | G-17 | Video: HEVC/DNx decode, video export, external timecode | Features / Formats | [file-format-parity.md](file-format-parity.md) | 30–50 |
-| G-18 | Speech-to-text transcription | AI | this file | 30–50 |
+| G-18 | Transcription accuracy, editing depth and cross-platform validation (local recognition implemented) | AI | this file | reassess |
 | G-19 | UI feel: generic plugin windows, shortcut collisions, pro-grade meters and scaling | UI/UX | [ui-parity.md](ui-parity.md) | 60–100 |
 | G-20 | MIDI/instrument depth: MIDI learn, sampler, notation editing | Features | [target-app-parity.md](target-app-parity.md) | 40–60 |
 | G-21 | Compressed export (MP3, AAC/M4A, Ogg/Opus) | File formats | [file-format-parity.md](file-format-parity.md) | 10–20 |
@@ -188,8 +188,14 @@ field-recorder conform. ≈ 30–50 h.
 
 ### G-18. Speech-to-text
 
-Pro Tools transcribes dialogue to a searchable transcript (upgraded in 2026.4). We have a
-settings command only. Needs an openly licensed local speech model. ≈ 30–50 h.
+**Implemented (2026-10-22):** opt-in local recognition with word timestamps, synthetic-tested
+speaker clustering, a searchable per-track Transcript window and click-to-seek. Models use a
+pinned, checksum-verified catalogue and discovery supports bundled or per-user stores. A real
+base-model run correctly transcribed a generated spoken fixture.
+
+**Remaining:** measured accuracy across languages/noisy dialogue, overlapping-speaker quality,
+transcript correction/editing, and validation on the other desktop platforms. The generated
+fixture proves the local round-trip, not production dialogue quality.
 
 ### G-19. UI feel
 
@@ -214,6 +220,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | G-18 shrunk to accuracy, correction/editing and platform validation after real spoken-fixture recognition |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |
