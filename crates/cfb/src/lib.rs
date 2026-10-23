@@ -9,18 +9,30 @@
 //! FAT for streams smaller than 4096 bytes.
 //!
 //! - [`CompoundFile::open`] parses a file held in memory (no copies of large streams; every chain
-//!   is bounds- and cycle-checked, so damaged files give errors, never panics or endless loops).
+//!   is bounds- and cycle-checked and every allocation is capped by [`Limits`], so damaged or
+//!   hostile files give errors, never panics, endless loops or runaway memory).
 //! - [`Writer`] builds a tree of storages and streams and lays it out in one pass
 //!   ([`Writer::finish`]): stream sectors, mini stream, mini FAT, directory, FAT and DIFAT.
 //!
 //! Layer L0: no dependencies beyond `std`, no `unsafe`, builds for `wasm32-unknown-unknown`.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented,
+        clippy::todo,
+        clippy::unreachable,
+        clippy::indexing_slicing
+    )
+)]
 
 mod read;
 mod write;
 
-pub use read::{CompoundFile, Entry, EntryKind};
+pub use read::{CompoundFile, Entry, EntryKind, Limits, MAX_ENTRIES, MAX_READ_BYTES};
 pub use write::{NodeId, Version, Writer};
 
 use std::cmp::Ordering;
@@ -58,6 +70,8 @@ pub enum Error {
     NotFound(String),
     /// A name the format cannot store (too long, illegal characters, duplicate).
     BadName(String),
+    /// The writer was asked for a file larger than the format can hold.
+    TooLarge(String),
 }
 
 impl fmt::Display for Error {
@@ -67,6 +81,7 @@ impl fmt::Display for Error {
             Error::Invalid(s) => write!(f, "invalid compound file: {s}"),
             Error::NotFound(s) => write!(f, "no entry {s:?}"),
             Error::BadName(s) => write!(f, "invalid entry name {s:?}"),
+            Error::TooLarge(s) => write!(f, "compound file too large: {s}"),
         }
     }
 }
@@ -77,7 +92,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Whether `head` starts with the compound file signature.
 pub fn sniff(head: &[u8]) -> bool {
-    head.len() >= 8 && head[..8] == SIGNATURE
+    head.get(..8) == Some(&SIGNATURE[..])
 }
 
 fn upper(u: u16) -> u16 {

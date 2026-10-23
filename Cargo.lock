@@ -3629,6 +3629,9 @@ version = "0.11.0"
 [[package]]
 name = "soundcraft-cfb"
 version = "0.11.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "soundcraft-clap-host"

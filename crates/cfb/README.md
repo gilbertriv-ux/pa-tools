@@ -24,9 +24,16 @@ for &child in &cf.entries[header].children { /* sorted siblings */ }
 
 - Accepts version 3 (512-byte sectors) and version 4 (4096-byte sectors) files; other sector
   shifts between 7 and 16 are tolerated.
-- Every chain (DIFAT, FAT, mini FAT, directory, streams) is bounds-checked and cycle-checked; a
-  directory tree that references an entry twice is rejected. Damaged or truncated files return
-  `Error::Invalid`, never panic or loop.
+- The file is treated as hostile. Every chain (DIFAT, FAT, mini FAT, directory, streams) is
+  bounds-checked and cycle-checked: the structural chains are claimed in one bitmap (a loop, or two
+  chains sharing a sector, fails at `open`), and stream chains are walked with Brent's cycle
+  detection. A directory tree that references an entry twice is rejected. Nothing indexes a slice
+  with a number from the file (`clippy::indexing_slicing` is denied outside tests).
+- Allocations follow `Limits`, derived from the file size and capped absolutely: directory entries
+  (`len / 128 + 1`, at most `MAX_ENTRIES`) and the total stream bytes `read` may return
+  (`4 * len + 1 MiB`, at most `MAX_READ_BYTES`; each declared size is charged before it is
+  allocated). `CompoundFile::open_with` takes explicit limits.
+- Damaged or truncated files return `Error::Invalid`, never panic or loop.
 - Version 3 stream sizes ignore the high 32 bits (§2.6.3).
 
 ## Writing
@@ -36,7 +43,7 @@ let mut w = soundcraft_cfb::Writer::new(soundcraft_cfb::Version::V4);
 w.set_clsid(soundcraft_cfb::Writer::ROOT, root_class);
 let h = w.storage(soundcraft_cfb::Writer::ROOT, "Header-2", header_class)?;
 w.stream(h, "properties", bytes)?;
-let file: Vec<u8> = w.finish();
+let file: Vec<u8> = w.finish()?;
 ```
 
 Layout: stream sectors (streams ≥ 4096 bytes), mini stream, mini FAT, directory, FAT, DIFAT. Each

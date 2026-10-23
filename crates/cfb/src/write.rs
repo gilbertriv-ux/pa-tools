@@ -5,9 +5,31 @@
 //! when the FAT needs more than the 109 header slots. Every chain is contiguous. Sibling trees are
 //! balanced binary search trees coloured as valid red-black trees (§2.6.4).
 
+// The writer lays out a file from the tree the caller built: every index below is a node id this
+// module handed out or a sector number computed from the layout it builds (the FAT and the
+// directory are sized to hold them), never a number from a file. Counts that must fit in the
+// format's 32-bit fields are checked (`TooLarge`).
+#![allow(clippy::indexing_slicing)]
+
 use std::collections::HashSet;
 
-use crate::{DIFSECT, ENDOFCHAIN, FATSECT, FREESECT, MINI_SECTOR_SIZE, MINI_STREAM_CUTOFF, NOSTREAM, Result, SIGNATURE, compare_names, validate_name};
+use crate::{
+    DIFSECT, ENDOFCHAIN, Error, FATSECT, FREESECT, MAXREGSECT, MINI_SECTOR_SIZE, MINI_STREAM_CUTOFF, NOSTREAM, Result, SIGNATURE, compare_names,
+    validate_name,
+};
+
+/// Version 3 files are limited to 2 GiB (§2.2); version 4 files are capped here at 64 GiB, far
+/// beyond what the in-memory writer can hold.
+const MAX_FILE_BYTES_V3: u64 = 1 << 31;
+const MAX_FILE_BYTES_V4: u64 = 1 << 36;
+
+fn too_large(what: &str) -> Error {
+    Error::TooLarge(what.to_string())
+}
+
+fn cast32(x: usize, what: &str) -> Result<u32> {
+    u32::try_from(x).ok().filter(|&v| v <= MAXREGSECT).ok_or_else(|| too_large(what))
+}
 
 /// File format version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,10 +145,17 @@ impl Writer {
         }
     }
 
-    /// Lay the file out and return its bytes.
-    pub fn finish(self) -> Vec<u8> {
+    /// Lay the file out and return its bytes, or `TooLarge` when the streams do not fit in the
+    /// format (2 GiB for version 3).
+    pub fn finish(self) -> Result<Vec<u8>> {
         let ss = self.version.sector_size();
         let per_sector = ss / 4;
+        let payload: u64 = self.nodes.iter().try_fold(0u64, |a, n| a.checked_add(n.data.len() as u64)).ok_or_else(|| too_large("stream data"))?;
+        let cap = if self.version == Version::V3 { MAX_FILE_BYTES_V3 } else { MAX_FILE_BYTES_V4 };
+        // (the directory, FAT and padding add a little; the exact size is checked below)
+        if payload > cap {
+            return Err(too_large(&format!("{payload} bytes of stream data")));
+        }
         // Directory order: depth-first pre-order from the root.
         let mut order = Vec::with_capacity(self.nodes.len());
         let mut stack = vec![0usize];
@@ -138,7 +167,7 @@ impl Writer {
         }
         let mut dir_index = vec![0u32; self.nodes.len()];
         for (i, &n) in order.iter().enumerate() {
-            dir_index[n] = i as u32;
+            dir_index[n] = cast32(i, "directory entries")?;
         }
 
         // Stream placement.
@@ -148,10 +177,10 @@ impl Writer {
         for &n in &order {
             let node = &self.nodes[n];
             if node.kind == Kind::Stream && node.data.len() as u64 >= MINI_STREAM_CUTOFF as u64 {
-                let count = node.data.len().div_ceil(ss) as u32;
+                let count = cast32(node.data.len().div_ceil(ss), "stream sectors")?;
                 start[n] = next_sector;
                 big_chains.push((next_sector, count));
-                next_sector += count;
+                next_sector = next_sector.checked_add(count).filter(|&v| v <= MAXREGSECT).ok_or_else(|| too_large("sectors"))?;
             }
         }
         let mut next_mini = 0u32;
@@ -159,22 +188,22 @@ impl Writer {
         for &n in &order {
             let node = &self.nodes[n];
             if node.kind == Kind::Stream && !node.data.is_empty() && (node.data.len() as u64) < MINI_STREAM_CUTOFF as u64 {
-                let count = node.data.len().div_ceil(MINI_SECTOR_SIZE) as u32;
+                let count = cast32(node.data.len().div_ceil(MINI_SECTOR_SIZE), "mini sectors")?;
                 start[n] = next_mini;
                 mini_chains.push((next_mini, count));
-                next_mini += count;
+                next_mini = next_mini.checked_add(count).filter(|&v| v <= MAXREGSECT).ok_or_else(|| too_large("mini sectors"))?;
             }
         }
         let mini_bytes = next_mini as usize * MINI_SECTOR_SIZE;
-        let mini_stream_sectors = mini_bytes.div_ceil(ss) as u32;
+        let mini_stream_sectors = cast32(mini_bytes.div_ceil(ss), "mini stream sectors")?;
         let mini_stream_start = if mini_stream_sectors > 0 { next_sector } else { ENDOFCHAIN };
-        next_sector += mini_stream_sectors;
-        let minifat_sectors = (next_mini as usize * 4).div_ceil(ss) as u32;
+        next_sector = next_sector.checked_add(mini_stream_sectors).ok_or_else(|| too_large("sectors"))?;
+        let minifat_sectors = cast32((next_mini as usize * 4).div_ceil(ss), "mini FAT sectors")?;
         let minifat_start = if minifat_sectors > 0 { next_sector } else { ENDOFCHAIN };
-        next_sector += minifat_sectors;
-        let dir_sectors = (order.len() * 128).div_ceil(ss) as u32;
+        next_sector = next_sector.checked_add(minifat_sectors).ok_or_else(|| too_large("sectors"))?;
+        let dir_sectors = cast32((order.len() * 128).div_ceil(ss), "directory sectors")?;
         let dir_start = next_sector;
-        next_sector += dir_sectors;
+        next_sector = next_sector.checked_add(dir_sectors).ok_or_else(|| too_large("sectors"))?;
         let base = next_sector as usize;
         let (mut fat_n, mut difat_n) = (1usize, 0usize);
         loop {
@@ -188,8 +217,13 @@ impl Writer {
             difat_n = need_difat.max(difat_n);
         }
         let fat_start = next_sector;
-        let difat_start = fat_start + fat_n as u32;
+        let difat_start = cast32(fat_start as usize + fat_n, "sectors")?;
         let total = base + fat_n + difat_n;
+        cast32(total, "sectors")?;
+        let file_bytes = (total as u64 + 1) * ss as u64;
+        if file_bytes > cap {
+            return Err(too_large(&format!("a {file_bytes}-byte file")));
+        }
 
         // FAT.
         let mut fat = vec![FREESECT; fat_n * per_sector];
@@ -344,7 +378,7 @@ impl Writer {
             out.extend_from_slice(&s);
         }
         debug_assert_eq!(out.len(), (total + 1) * ss);
-        out
+        Ok(out)
     }
 }
 
