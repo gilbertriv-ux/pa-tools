@@ -880,6 +880,10 @@ fn the_window_paints_no_third_party_names_in_its_error_states() {
         finish_job(&mut rig);
         assert_error_state_reads_well(&rig, "model files unusable", &["Check the speech model's folder"]);
         let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        // Said out loud so that a run that is meant to cover this case (the real-model CI step builds
+        // with the speech feature) fails on seeing it, rather than passing without the case.
+        eprintln!("SKIPPED: the `model files unusable` case needs the speech feature (build with --features whisper)");
     }
 
     // 3. The model loads and fails while it runs: its files are damaged.

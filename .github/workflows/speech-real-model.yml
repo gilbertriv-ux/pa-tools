@@ -6,7 +6,8 @@
 #   1. runs the speech crate + engine tests with the speech features, including the real-model
 #      test, which must RUN (a configured fixture with no model is a failure, never a skip);
 #   2. runs the Transcript window's own real-model test (menu -> background job -> stored
-#      transcript), which must also RUN: a skip fails the step;
+#      transcript) and its error-states test (whose "model files unusable" case needs the speech
+#      feature), which must also RUN: a skip, or a name that matches no test, fails the step;
 #   3. builds the CLI with the speech feature and transcribes the clip end to end
 #      (import -> track.transcribe -> saved session), checking the stored words.
 # Nothing downloaded here is committed to the repository. ffmpeg is used only on the runner to
@@ -124,11 +125,17 @@ jobs:
           PA_SPEECH_FIXTURE_REFERENCE: ${{ env.REFERENCE }}
         run: |
           set -o pipefail
-          cargo test -p soundcraft-ui-egui --features whisper --test transcript_window the_real_model_transcribes_a_track_through_the_window -- --nocapture 2>&1 | tee window-tests.log
-          # The test must have run, not skipped (a skip prints SKIPPED and still passes).
-          if grep -q "SKIPPED" window-tests.log; then echo "::error::the window's real-model test skipped"; exit 1; fi
+          # Two tests, each named exactly: the real-model one, and the error states, whose "model files
+          # unusable" case is skipped (with a SKIPPED line) in a build without the speech feature.
+          cargo test -p soundcraft-ui-egui --features whisper --test transcript_window \
+            -- --exact the_real_model_transcribes_a_track_through_the_window the_window_paints_no_third_party_names_in_its_error_states \
+            --nocapture 2>&1 | tee window-tests.log
+          # Neither may have skipped (a skip prints SKIPPED and still passes).
+          if grep -q "SKIPPED" window-tests.log; then echo "::error::a window test skipped"; exit 1; fi
+          # Both must have run: by name, and as exactly two passes (a name that matches nothing runs nothing).
           grep -q "the_real_model_transcribes_a_track_through_the_window ... ok" window-tests.log
-          grep -q "test result: ok. 1 passed" window-tests.log
+          grep -q "the_window_paints_no_third_party_names_in_its_error_states ... ok" window-tests.log
+          grep -q "test result: ok. 2 passed" window-tests.log
           grep "real model through the window" window-tests.log
 
       - name: End to end through the CLI (import, transcribe, save)
