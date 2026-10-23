@@ -54,6 +54,14 @@ pub(crate) fn describe(cfg: &Av1Config) -> Described {
     // The sequence header the record carries says how large frames get. A picture whose references and
     // working copies cannot fit the decoder's memory budget (1.6 GiB, Gil's decision 5b) would open as
     // decodable and then fail on every frame, so it is refused here, up front, the way HEVC is.
+    //
+    // The size checked is the sequence header's DECLARED MAXIMUM (`max_frame_width` x `max_frame_height`),
+    // not the size of any frame coded in the stream: this runs when the file opens, before one frame has
+    // been read, and Gil wants a refusal before anything is allocated. So a stream that declares an 8K
+    // ceiling but codes smaller frames is refused here too, although a `Decoder` fed such a stream
+    // directly would decode it (its own check at each frame header uses the coded size). Encoders write
+    // the ceiling they mean to use, so this is the size the file will need. `docs/video-codecs.md`
+    // ("Limits") says the same.
     let unsupported = crate::av1::find_sequence_header(&cfg.config_obus).and_then(|seq| {
         let (w, h) = (seq.max_frame_width, seq.max_frame_height);
         let fits = |budget| crate::av1::picture_fits_budget(&seq, w, h, budget);
@@ -326,6 +334,23 @@ mod tests {
         for obus in [&[][..], &[0x0a, 0x0b][..], &[0xff; 20][..]] {
             assert_eq!(describe(&Av1Config { config_obus: obus.to_vec(), ..base.clone() }).unsupported, None);
         }
+    }
+
+    /// The size that is checked when the file opens is the sequence header's declared maximum, not the
+    /// size of a coded frame: a record that declares an 8K ceiling is refused up front (before any
+    /// frame is read), and one that declares a ceiling that fits is not, whatever its frames hold.
+    #[test]
+    fn the_up_front_check_reads_the_declared_maximum_size() {
+        let declared_8k = describe(&record(8192, 4320, Chroma::C420, false, false));
+        assert!(declared_8k.unsupported.is_some_and(|w| w.contains("8192x4320")), "a stream that declares an 8K ceiling is refused when it opens");
+        // the same stream declaring the smaller ceiling it actually uses is admitted
+        assert_eq!(describe(&record(7680, 4320, Chroma::C420, false, false)).unsupported, None);
+        assert_eq!(describe(&record(1920, 1080, Chroma::C420, false, false)).unsupported, None);
+        // the decoder itself, given a small frame under a large declared ceiling, is not the one refusing
+        // it: its check is per coded frame (`tests/av1_dims.rs` covers the refusals it makes)
+        let seq = crate::av1::find_sequence_header(&record(8192, 4320, Chroma::C420, false, false).config_obus).unwrap();
+        assert!(crate::av1::picture_fits_budget(&seq, 1920, 1080, crate::av1::DEFAULT_MEMORY_BUDGET));
+        assert!(!crate::av1::picture_fits_budget(&seq, seq.max_frame_width, seq.max_frame_height, crate::av1::DEFAULT_MEMORY_BUDGET));
     }
 
     /// 7680 x 4320 at 4:2:0 is admitted at 8 and 10 bits; at 4:2:2, at 4:4:4 and with film grain it is not.
