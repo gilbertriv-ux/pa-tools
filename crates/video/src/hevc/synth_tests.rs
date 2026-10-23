@@ -2,13 +2,13 @@
 //! with and without loop filtering across tile boundaries), PCM (with and without in-loop filtering),
 //! multiple slices, dependent slice segments, long-term reference pictures and reference list
 //! modification. A small CABAC encoder (9.3.5, informative) writes the slice data. The expected output
-//! is known exactly where the in-loop filters leave the samples alone, and every stream is also checked
-//! against ffmpeg (when present).
+//! is known exactly where the in-loop filters leave the samples alone. (The donor also compared every
+//! stream with ffmpeg when it was installed; that check is left out here, no tool runs from the tests.)
 
+use crate::bitstream::{BitWriter, escape_rbsp};
 use crate::hevc::Decoder;
 use crate::hevc::cabac::{Contexts, NEXT_STATE, RANGE_TAB_LPS, init_contexts};
 use crate::hevc::spec_tables::*;
-use crate::bitstream::{BitWriter, escape_rbsp};
 
 const W: usize = 96;
 const H: usize = 64;
@@ -122,13 +122,13 @@ fn content(pic: u32) -> Planes {
     p
 }
 
-fn nal(t: u8, rbsp: &[u8]) -> Vec<u8> {
+pub(super) fn nal(t: u8, rbsp: &[u8]) -> Vec<u8> {
     let mut out = vec![0, 0, 0, 1, t << 1, 1];
     out.extend(escape_rbsp(rbsp));
     out
 }
 
-fn ptl(w: &mut BitWriter) {
+pub(super) fn ptl(w: &mut BitWriter) {
     w.write_bits(0, 2); // profile_space
     w.write_bits(0, 1); // tier
     w.write_bits(1, 5); // Main
@@ -140,7 +140,7 @@ fn ptl(w: &mut BitWriter) {
     w.write_bits(93, 8); // level 3.1
 }
 
-fn vps() -> Vec<u8> {
+pub(super) fn vps() -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(0, 4);
     w.write_bits(3, 2); // base layer internal / available
@@ -161,7 +161,7 @@ fn vps() -> Vec<u8> {
     nal(32, &w.finish())
 }
 
-fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
+pub(super) fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(0, 4);
     w.write_bits(0, 3);
@@ -208,7 +208,7 @@ fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
 /// Tile layout: None = no tiles; Some((column widths, row heights, uniform, across)).
 type Tiles = Option<(Vec<usize>, Vec<usize>, bool, bool)>;
 
-fn pps(id: u32, tiles: &Tiles, lists_mod: bool) -> Vec<u8> {
+pub(super) fn pps(id: u32, tiles: &Tiles, lists_mod: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_ue(id);
     w.write_ue(0);
@@ -532,6 +532,29 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
     (s, expect)
 }
 
+/// The synthetic streams as seeds for the hostile-input tests: (name, Annex-B stream).
+pub(super) fn seed_streams() -> Vec<(&'static str, Vec<u8>)> {
+    let tiles_slices = vec![
+        Segment { start: 0, len: 12, dependent: false },
+        Segment { start: 12, len: 2, dependent: false },
+        Segment { start: 14, len: 4, dependent: true },
+        Segment { start: 18, len: 6, dependent: true },
+    ];
+    let slices = vec![
+        Segment { start: 0, len: 7, dependent: false },
+        Segment { start: 7, len: 9, dependent: true },
+        Segment { start: 16, len: 8, dependent: false },
+    ];
+    vec![
+        ("pcm_lt", sequence(&None, true, whole(WC * HC)).0),
+        ("pcm_dbk", sequence(&None, false, whole(WC * HC)).0),
+        ("tiles_uniform", sequence(&Some((vec![2, 2, 2], vec![2, 2], true, true)), true, whole(WC * HC)).0),
+        ("tiles_explicit", sequence(&Some((vec![1, 3, 2], vec![1, 3], false, true)), false, whole(WC * HC)).0),
+        ("tiles_slices", sequence(&Some((vec![3, 3], vec![2, 2], true, false)), false, tiles_slices).0),
+        ("slices", sequence(&None, false, slices).0),
+    ]
+}
+
 fn decode_all(stream: &[u8], threads: usize) -> Vec<crate::hevc::Picture> {
     let mut dec = Decoder::with_threads(threads);
     let mut pics = dec.decode(stream, 0).expect("decode");
@@ -544,43 +567,8 @@ fn as_u8(p: &crate::hevc::Plane) -> &[u8] {
     p.as_u8().expect("8-bit output")
 }
 
-/// Compare with ffmpeg's decode of the same stream (skipped when ffmpeg is absent).
-fn check_ffmpeg(name: &str, stream: &[u8], pics: &[crate::hevc::Picture]) {
-    let Some(ff) = filmcraft_testkit::ffmpeg_or_skip(name) else { return };
-    let dir = filmcraft_testkit::fixtures_dir("hevc");
-    let src = filmcraft_testkit::temp_path(&dir.join(format!("synth_{name}.hevc")));
-    let yuv = filmcraft_testkit::temp_path(&dir.join(format!("synth_{name}.yuv")));
-    std::fs::write(&src, stream).unwrap();
-    let st = std::process::Command::new(ff)
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(&src)
-        .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&yuv)
-        .status()
-        .unwrap();
-    assert!(st.success(), "ffmpeg failed on {name}");
-    let r = std::fs::read(&yuv).unwrap();
-    let fs = W * H * 3 / 2;
-    assert_eq!(r.len(), fs * pics.len(), "{name}: ffmpeg decoded {} frames", r.len() / fs);
-    for (i, p) in pics.iter().enumerate() {
-        let f = &r[i * fs..(i + 1) * fs];
-        let mut ours = as_u8(&p.y).to_vec();
-        ours.extend_from_slice(as_u8(&p.u));
-        ours.extend_from_slice(as_u8(&p.v));
-        if ours != f {
-            let k = ours.iter().zip(f).position(|(a, b)| a != b).unwrap();
-            panic!("{name}: picture {i} differs from ffmpeg at byte {k}: {} vs {}", ours[k], f[k]);
-        }
-    }
-    let _ = std::fs::remove_file(&yuv);
-    let _ = std::fs::remove_file(&src);
-}
-
 fn run(name: &str, tiles: Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) {
     let (stream, expect) = sequence(&tiles, pcm_lf_disabled, segments);
-    if let Ok(d) = std::env::var("HEVC_SYNTH_DUMP") {
-        std::fs::write(format!("{d}/{name}.hevc"), &stream).unwrap();
-    }
     for threads in [1, 4] {
         let pics = decode_all(&stream, threads);
         assert_eq!(pics.len(), expect.len(), "{name}");
@@ -590,9 +578,6 @@ fn run(name: &str, tiles: Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) 
                 assert!(as_u8(&p.y) == &e.y[..], "{name}: picture {i} luma");
                 assert!(as_u8(&p.u) == &e.u[..] && as_u8(&p.v) == &e.v[..], "{name}: picture {i} chroma");
             }
-        }
-        if threads == 1 {
-            check_ffmpeg(name, &stream, &pics);
         }
     }
 }
@@ -637,7 +622,10 @@ fn tiles_slices_and_dependent_segments() {
 
 #[test]
 fn slices_without_tiles() {
-    let segs =
-        vec![Segment { start: 0, len: 7, dependent: false }, Segment { start: 7, len: 9, dependent: true }, Segment { start: 16, len: 8, dependent: false }];
+    let segs = vec![
+        Segment { start: 0, len: 7, dependent: false },
+        Segment { start: 7, len: 9, dependent: true },
+        Segment { start: 16, len: 8, dependent: false },
+    ];
     run("slices", None, false, segs);
 }
