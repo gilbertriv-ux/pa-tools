@@ -1,0 +1,35 @@
+[package]
+name = "soundcraft-aac"
+description = "Clean-room AAC-LC encoder and decoder (ISO/IEC 14496-3) with .m4a and ADTS writers, behind the aac-encode feature"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Everything that makes AAC: the encoder, the decoder used to verify it, and the .m4a / ADTS writers.
+# OFF by default and off in the shipped app (Gil's decision of 2026-10-23, docs/audio-codecs.md): AAC
+# patent pools still license encoders and decoders. A build without it has only the error type, the
+# limits and stubs that answer `Error::NotBuilt`, so callers need no `cfg`. CI and the tests build with it on.
+default = []
+aac-encode = ["dep:soundcraft-bitstream", "dep:soundcraft-isobmff"]
+# Channels are quantised in parallel inside the encoder's rate loop. It only does anything together with
+# `aac-encode` (the only code that uses rayon is the encoder) and does NOT switch that feature on: AAC
+# encoding stays off unless `aac-encode` is named explicitly (Gil's decision, 2026-10-23).
+rayon = ["dep:rayon"]
+
+[dependencies]
+soundcraft-bitstream = { workspace = true, optional = true }
+soundcraft-isobmff = { workspace = true, optional = true }
+thiserror = { workspace = true }
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+soundcraft-audio-io = { workspace = true }
+soundcraft-isobmff = { workspace = true }
+soundcraft-dsp = { workspace = true }
+proptest = { workspace = true }

@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** trivial (WAV: empty data chunk with trailing metadata (#466); previously minor: continuous fade curvature in Pa Tools sessions) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (Audio: Ogg Opus and AAC/M4A write written as crates, not yet in Bounce; previously trivial: WAV: empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -39,7 +39,8 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | AIFF / AIFF-C | native | ✅ | ✅ (`fl32`) | Native |
 | FLAC | import | ✅ | ✅ | Own encoder |
 | MP3 | import, bounce | ✅ (symphonia) | ❌ | G-21 |
-| AAC / M4A / MP4 audio | import, bounce | ✅ (symphonia) | ❌ | G-21 |
+| AAC / M4A / MP4 audio | import, bounce | ✅ (symphonia; not 88.2 / 96 kHz in MP4, and the edit list is not applied) | 🟡 | Own encoder in `soundcraft-aac`: `.m4a` with an exact priming and tail edit list, and ADTS `.aac`. Behind the Cargo feature `aac-encode`, **off in shipped builds** for patent-licensing reasons (Gil's decision, [audio-codecs.md](audio-codecs.md)). Crate only: Bounce does not call it yet (G-21) |
+| Ogg Opus | — | ❌ (own decoder exists as a test tool, not wired to import) | 🟡 | Own encoder in `soundcraft-opus`: ships enabled, royalty-free. Crate only: Bounce does not call it yet (G-21). Decoded in tests by the clean-room decoder and by ffmpeg |
 | ALAC | import | ✅ | ❌ | |
 | Ogg Vorbis | — | ✅ | ❌ | Beyond Pro Tools |
 | CAF | — | ✅ | ❌ | |
@@ -80,6 +81,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | Audio (G-21): AAC / M4A and Ogg Opus write exist as crates (AAC behind `aac-encode`, off in shipped builds; patent posture in [audio-codecs.md](audio-codecs.md)), not yet reachable from Bounce, so shown 🟡; MP3 write still missing. Readiness estimate unchanged |
 | 2026-10-13 | trivial | WAV: empty data chunk with trailing metadata (#466) |
 | 2026-10-13 | minor | Fade curvature round-trips in sessions with a zero default for older files. Format version and readiness estimate unchanged |
 | 2026-10-10 | major | Created: format inventory against Pro Tools 2026.4.1's declared document types and import/bounce options |

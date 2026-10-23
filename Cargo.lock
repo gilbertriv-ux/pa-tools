@@ -3590,6 +3590,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-aac"
+version = "0.11.0"
+dependencies = [
+ "proptest",
+ "rayon",
+ "soundcraft-audio-io",
+ "soundcraft-bitstream",
+ "soundcraft-dsp",
+ "soundcraft-isobmff",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-au-host"
 version = "0.11.0"
 dependencies = [
@@ -3620,6 +3633,13 @@ dependencies = [
  "soundcraft-brand",
  "soundcraft-engine",
  "soundcraft-time",
+]
+
+[[package]]
+name = "soundcraft-bitstream"
+version = "0.11.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -3688,6 +3708,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-isobmff"
+version = "0.11.0"
+dependencies = [
+ "proptest",
+ "soundcraft-bitstream",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.11.0"
 dependencies = [
@@ -3726,6 +3755,24 @@ dependencies = [
  "soundcraft-time",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "soundcraft-ogg"
+version = "0.11.0"
+
+[[package]]
+name = "soundcraft-opus"
+version = "0.11.0"
+dependencies = [
+ "proptest",
+ "soundcraft-dsp",
+ "soundcraft-ogg",
+ "soundcraft-opus-decode",
+]
+
+[[package]]
+name = "soundcraft-opus-decode"
+version = "0.11.0"
 
 [[package]]
 name = "soundcraft-playback"
