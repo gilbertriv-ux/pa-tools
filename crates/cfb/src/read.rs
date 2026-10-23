@@ -13,9 +13,10 @@
 //! - allocations follow [`Limits`]: entries, chain length and the total bytes of stream data
 //!   returned all scale with the file size, and each has an absolute ceiling.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
+use std::collections::HashMap;
 
-use crate::{ENDOFCHAIN, Error, FREESECT, MAXREGSECT, MINI_SECTOR_SIZE, NOSTREAM, Result, SIGNATURE, compare_names};
+use crate::{ENDOFCHAIN, Error, FREESECT, MAXREGSECT, MINI_SECTOR_SIZE, NOSTREAM, Result, SIGNATURE, fold_name};
 
 /// Absolute ceiling on directory entries (a 4 Mi-entry directory is 512 MiB of file).
 pub const MAX_ENTRIES: usize = 4 << 20;
@@ -113,6 +114,9 @@ pub struct CompoundFile<'a> {
     limits: Limits,
     /// Stream bytes handed out so far (charged against `limits.max_read_bytes`).
     read_total: Cell<u64>,
+    /// (storage, folded name) → entry, built on the first lookup: a storage with many children
+    /// would otherwise cost a scan of all of them per lookup.
+    names: OnceCell<HashMap<(usize, Vec<u16>), usize>>,
 }
 
 /// Little-endian fields. They return 0 when the field lies outside `b`: callers pass the fixed
@@ -264,6 +268,7 @@ impl<'a> CompoundFile<'a> {
             entries: Vec::new(),
             limits,
             read_total: Cell::new(0),
+            names: OnceCell::new(),
         };
         let mut claims = Claims::new(n_sectors);
 
@@ -437,7 +442,19 @@ impl<'a> CompoundFile<'a> {
 
     /// Child of storage `parent` named `name` (case-insensitive as in §2.6.4).
     pub fn child(&self, parent: usize, name: &str) -> Option<usize> {
-        self.entries.get(parent)?.children.iter().copied().find(|&c| self.entries.get(c).is_some_and(|e| compare_names(&e.name, name).is_eq()))
+        let index = self.names.get_or_init(|| {
+            let mut m: HashMap<(usize, Vec<u16>), usize> = HashMap::new();
+            for (p, e) in self.entries.iter().enumerate() {
+                for &c in &e.children {
+                    if let Some(ce) = self.entries.get(c) {
+                        // First in sibling order wins, as a linear scan would.
+                        m.entry((p, fold_name(&ce.name))).or_insert(c);
+                    }
+                }
+            }
+            m
+        });
+        index.get(&(parent, fold_name(name))).copied()
     }
 
     /// Entry at a `/`-separated path below the root (`""` is the root).

@@ -114,6 +114,12 @@ fn upper(u: u16) -> u16 {
     }
 }
 
+/// A name folded for equality: its UTF-16 units, upper-cased (two names are the same entry name
+/// exactly when their folded forms are equal).
+pub(crate) fn fold_name(name: &str) -> Vec<u16> {
+    name.encode_utf16().map(upper).collect()
+}
+
 /// The sibling order of directory entries (§2.6.4): shorter names first, then a code-unit
 /// comparison of the upper-cased names.
 pub fn compare_names(a: &str, b: &str) -> Ordering {
