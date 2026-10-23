@@ -68,5 +68,4 @@ The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is 
 | `assets/app-icon/patools.ico` | Pa Tools (GR8 ID YUZ.AI) | original, rendered from `icon.svg` | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/` | Pa Tools (GR8 ID YUZ.AI) | original, rendered from `icon.svg` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft (upstream UI, before the Pa Tools rebrand; to be replaced with Pa Tools screenshots) rendered from the synthesised demo session | MIT OR Apache-2.0 |
-
 | `docs/images-patools/edit.jpg`, `docs/images-patools/mix.jpg`, `docs/images-patools/about.jpg` | Pa Tools screenshots captured on 2026-10-22 from the V2 Intel build (demo song synthesised by the app) | Pa Tools build | MIT OR Apache-2.0 |
