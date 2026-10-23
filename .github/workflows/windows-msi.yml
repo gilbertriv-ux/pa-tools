@@ -68,6 +68,19 @@ jobs:
           key: windows-msi-${{ matrix.arch }}
           cache-on-failure: true
 
+      # WiX v5 is distributed as a .NET tool (https://www.nuget.org/packages/wix/5.0.2). patools.wxs
+      # uses core WiX elements only (no UI, Util or other extension namespace), so the tool alone
+      # builds it and no extension is installed. The tool goes into a folder of its own under the
+      # runner's temp directory; a path written to GITHUB_PATH takes effect from the next step on.
+      - name: Install WiX (the tool, no extensions)
+        shell: pwsh
+        run: |
+          $wixDir = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install wix --version $env:WIX_VERSION --tool-path $wixDir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install exited with $LASTEXITCODE" }
+          Add-Content -Path $env:GITHUB_PATH -Value $wixDir
+          & (Join-Path $wixDir 'wix.exe') --version
+
       - name: Build and package (unsigned)
         shell: pwsh
         run: ./packaging/windows/package.ps1 -Arch $env:ARCH
