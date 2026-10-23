@@ -383,26 +383,27 @@ mod tests {
     }
 
     /// An MP4 with one AV1 sample whose `av1C` carries `cfg`.
-    fn av1_movie(w: u16, h: u16, cfg: Av1Config) -> crate::Movie {
+    fn av1_movie(w: u16, h: u16, cfg: Av1Config) -> Result<crate::Movie> {
         use crate::isobmff::{Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
-        let mut mw = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let container = |e: crate::isobmff::Error| VideoError::Container(e.to_string());
+        let mut mw = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).map_err(container)?;
         let entry = SampleEntry::video(FourCc(*b"av01"), crate::isobmff::CodecConfig::Av1(cfg), w, h);
-        let t = mw.add_track(TrackConfig::new(entry, 24)).unwrap();
-        mw.write_sample(t, WriteSample { data: &[0u8; 16], duration: 1, composition_offset: 0, is_sync: true }).unwrap();
-        crate::Movie::open(mw.finish().unwrap().into_inner()).unwrap()
+        let t = mw.add_track(TrackConfig::new(entry, 24)).map_err(container)?;
+        mw.write_sample(t, WriteSample { data: &[0u8; 16], duration: 1, composition_offset: 0, is_sync: true }).map_err(container)?;
+        crate::Movie::open(mw.finish().map_err(container)?.into_inner())
     }
 
     #[test]
     fn an_8k_uhd_av1_movie_opens_as_decodable_and_the_refused_ones_say_why_on_every_request() {
         // 4:2:0 at 8 and 10 bits: decodable (no frame is requested; the sample is not a real picture)
         for high in [false, true] {
-            let m = av1_movie(7680, 4320, record(7680, 4320, Chroma::C420, high, false));
+            let m = av1_movie(7680, 4320, record(7680, 4320, Chroma::C420, high, false)).unwrap();
             let i = m.info();
             assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", 7680, 4320, true));
         }
         // 4:4:4, film grain and DCI 8K: not decodable, with the reason, on every request
         for (w, h, chroma, grain) in [(7680, 4320, Chroma::C444, false), (7680, 4320, Chroma::C420, true), (8192, 4320, Chroma::C420, false)] {
-            let mut m = av1_movie(w as u16, h as u16, record(w, h, chroma, false, grain));
+            let mut m = av1_movie(w as u16, h as u16, record(w, h, chroma, false, grain)).unwrap();
             let i = m.info().clone();
             assert_eq!((i.codec.as_str(), i.width, i.height, i.decodable), ("av1", w, h, false));
             for _ in 0..2 {
