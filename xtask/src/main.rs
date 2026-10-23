@@ -151,7 +151,15 @@ fn ci() -> Result<(), String> {
     let steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = vec![
         ("fmt", Box::new(|| cargo(&["fmt", "--all", "--", "--check"]))),
         ("clippy", Box::new(|| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
+        // The speech crate's recogniser and downloader are behind features the workspace build leaves
+        // off, so they are linted and tested here with them on. The real-model test skips without
+        // `PA_SPEECH_FIXTURE`, so this stays model-free.
+        (
+            "clippy-speech",
+            Box::new(|| cargo(&["clippy", "-p", "soundcraft-pa-speech", "--all-targets", "--features", "whisper,download", "--", "-D", "warnings"])),
+        ),
         ("test", Box::new(|| cargo(&["test", "--workspace"]))),
+        ("test-speech", Box::new(|| cargo(&["test", "-p", "soundcraft-pa-speech", "--features", "whisper,download"]))),
         ("assets", Box::new(assets)),
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),

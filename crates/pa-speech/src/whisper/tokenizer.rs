@@ -44,34 +44,70 @@ fn unicode_to_byte() -> HashMap<char, u8> {
     bs.iter().zip(&cs).filter_map(|(&b, &c)| char::from_u32(c).map(|ch| (ch, b as u8))).collect()
 }
 
+/// Most entries a tokenizer file may declare (real vocabularies hold about 52 000). A number read
+/// from the file never sizes an allocation past this.
+pub const MAX_VOCAB: usize = 262_144;
+
+/// The longest language code accepted for a language token (`haw`, `yue`, ...).
+const MAX_LANGUAGE_CODE: usize = 8;
+
+/// The language code inside a `<|xx|>` token, if it has one. `<|>` and `<|en` have none.
+fn language_code(token: &str) -> Option<&str> {
+    token.strip_prefix("<|")?.strip_suffix("|>")
+}
+
+fn plausible_language_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= MAX_LANGUAGE_CODE && code.bytes().all(|b| b.is_ascii_lowercase())
+}
+
 impl Tokenizer {
-    pub fn from_json(json: &str) -> Result<Self, SpeechError> {
+    /// Parse `tokenizer.json`. `vocab_size` is the model's (from `config.json`): every token id in
+    /// the file must lie below it, and the file may not declare more tokens than that, so a damaged
+    /// or hostile file is refused instead of sizing tables from its numbers.
+    pub fn from_json(json: &str, vocab_size: usize) -> Result<Self, SpeechError> {
         let bad = |m: &str| SpeechError::Model(format!("tokenizer.json: {m}"));
+        if vocab_size == 0 || vocab_size > MAX_VOCAB {
+            return Err(bad(&format!("vocab_size {vocab_size} is outside 1..={MAX_VOCAB}")));
+        }
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| bad(&e.to_string()))?;
         let vocab = v["model"]["vocab"].as_object().ok_or_else(|| bad("no model.vocab"))?;
+        if vocab.len() > vocab_size {
+            return Err(bad(&format!("{} vocabulary entries, but the model's vocab_size is {vocab_size}", vocab.len())));
+        }
         let table = unicode_to_byte();
-        let max = vocab.values().filter_map(|x| x.as_u64()).max().unwrap_or(0) as usize;
-        let mut bytes = vec![Vec::new(); max + 1];
+        let mut bytes = vec![Vec::new(); vocab_size];
         for (tok, id) in vocab {
-            let id = id.as_u64().ok_or_else(|| bad("vocab id"))? as usize;
-            bytes[id] = tok.chars().filter_map(|c| table.get(&c).copied()).collect();
+            let id = id.as_u64().ok_or_else(|| bad("vocab id is not a whole number"))?;
+            let slot = usize::try_from(id).ok().and_then(|i| bytes.get_mut(i));
+            let Some(slot) = slot else { return Err(bad(&format!("vocab id {id} is outside 0..{vocab_size}"))) };
+            *slot = tok.chars().filter_map(|c| table.get(&c).copied()).collect();
+        }
+        let added = v["added_tokens"].as_array().ok_or_else(|| bad("no added_tokens"))?;
+        if added.len() > vocab_size {
+            return Err(bad(&format!("{} added tokens, but the model's vocab_size is {vocab_size}", added.len())));
         }
         let mut special = HashMap::new();
         let mut special_by_id = HashMap::new();
-        for a in v["added_tokens"].as_array().ok_or_else(|| bad("no added_tokens"))? {
+        for a in added {
             let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str()) else { continue };
-            special.insert(c.to_string(), id as u32);
-            special_by_id.insert(id as u32, c.to_string());
+            let id = u32::try_from(id).ok().filter(|&i| (i as usize) < vocab_size);
+            let Some(id) = id else { return Err(bad(&format!("added token {c:?} has an id outside 0..{vocab_size}"))) };
+            special.insert(c.to_string(), id);
+            special_by_id.insert(id, c.to_string());
         }
         let get = |k: &str| special.get(k).copied();
         let need = |k: &str| get(k).ok_or_else(|| bad(&format!("no {k}")));
         let sot = need("<|startoftranscript|>")?;
         let translate = get("<|translate|>");
-        let mut languages: Vec<(String, u32)> = special
-            .iter()
-            .filter(|(k, id)| **id > sot && translate.is_none_or(|t| **id < t) && k.starts_with("<|") && k.ends_with("|>"))
-            .map(|(k, id)| (k[2..k.len() - 2].to_string(), *id))
-            .collect();
+        let mut languages: Vec<(String, u32)> = Vec::new();
+        // Between the start token and the translate token only language tokens live (none at all
+        // in an English-only model, whose start and translate tokens are adjacent).
+        for (k, &id) in special.iter().filter(|(_, id)| translate.is_some_and(|t| **id > sot && **id < t)) {
+            match language_code(k).filter(|c| plausible_language_code(c)) {
+                Some(code) => languages.push((code.to_string(), id)),
+                None => return Err(bad(&format!("language token {k:?} is malformed"))),
+            }
+        }
         languages.sort_by_key(|x| x.1);
         Ok(Self {
             eot: need("<|endoftext|>")?,
@@ -133,7 +169,7 @@ pub fn group_words(tok: &Tokenizer, ids: &[u32]) -> Vec<(String, std::ops::Range
         }
         let text = String::from_utf8_lossy(b);
         let trimmed = text.trim();
-        let starts_space = b[0] == b' ';
+        let starts_space = b.first() == Some(&b' ');
         let punct = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_punctuation() || "“”‘’«»¿¡…。，！？：、".contains(c));
         let opening = punct && trimmed.chars().all(|c| "\"'“‘¿¡([{«-".contains(c)) && starts_space;
         if opening {
@@ -165,4 +201,61 @@ pub fn group_words(tok: &Tokenizer, ids: &[u32]) -> Vec<(String, std::ops::Range
         groups.push((pre, start..ids.len()));
     }
     groups.into_iter().map(|(b, r)| (String::from_utf8_lossy(&b).trim().to_string(), r)).filter(|(t, _)| !t.is_empty()).collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// A small multilingual tokenizer: ids below 100, specials at 90..=99.
+    fn json(vocab: &str, extra: &str) -> String {
+        format!(
+            r#"{{"model": {{"vocab": {vocab}}}, "added_tokens": [
+                {{"id": 90, "content": "<|endoftext|>"}}, {{"id": 91, "content": "<|startoftranscript|>"}},
+                {{"id": 92, "content": "<|en|>"}}, {{"id": 93, "content": "<|translate|>"}},
+                {{"id": 94, "content": "<|transcribe|>"}}, {{"id": 95, "content": "<|notimestamps|>"}},
+                {{"id": 96, "content": "<|0.00|>"}}{extra}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_well_formed_tokenizer_parses() {
+        let t = Tokenizer::from_json(&json(r#"{"a": 0, "b": 1}"#, ""), 100).unwrap();
+        assert_eq!((t.eot, t.sot, t.timestamp_begin), (90, 91, 96));
+        assert_eq!(t.languages, vec![("en".to_string(), 92)]);
+        assert_eq!(t.decode(&[0, 1, 90]), "ab");
+    }
+
+    #[test]
+    fn ids_at_or_past_vocab_size_are_refused() {
+        for id in [100u64, 1 << 32, 1_000_000_000_000_000] {
+            let err = Tokenizer::from_json(&json(&format!(r#"{{"a": {id}}}"#), ""), 100).err().unwrap();
+            assert!(err.to_string().contains("vocab id"), "{err}");
+            let extra = format!(r#", {{"id": {id}, "content": "<|zz|>"}}"#);
+            let err = Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), 100).err().unwrap();
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+        assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, ""), 0).is_err());
+        assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, ""), MAX_VOCAB + 1).is_err());
+    }
+
+    #[test]
+    fn malformed_language_tokens_are_refused_not_sliced() {
+        for content in ["<|>", "<|", "|>", "<|EN|>", "<|a b|>", "<||>", "<|waytoolongcode|>"] {
+            let extra = format!(r#", {{"id": 97, "content": {}}}"#, serde_json::to_string(content).unwrap());
+            // 97 is outside (sot, translate) = (91, 93): only tokens in that range are language tokens
+            assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), 100).is_ok(), "{content}");
+            let in_range = json(r#"{"a": 0}"#, "")
+                .replace(r#""id": 92, "content": "<|en|>""#, &format!(r#""id": 92, "content": {}"#, serde_json::to_string(content).unwrap()));
+            let err = Tokenizer::from_json(&in_range, 100).err().unwrap_or_else(|| panic!("{content} was accepted as a language"));
+            assert!(err.to_string().contains("language token"), "{err}");
+        }
+    }
+
+    #[test]
+    fn more_entries_than_vocab_size_are_refused() {
+        let err = Tokenizer::from_json(&json(r#"{"a": 0, "b": 1, "c": 2}"#, ""), 2).err().unwrap();
+        assert!(err.to_string().contains("vocab"), "{err}");
+    }
 }

@@ -1,17 +1,17 @@
 //! The speech model catalogue and the model store.
 //!
-//! Models are downloaded on first use, after the user confirms (the dialog shows the size, the
-//! source URL and the licence), into `<data dir>/models/<id>/`. They are never bundled with Pa
-//! Tools or committed to the repository. Every file is pinned to a Hugging Face revision of
-//! OpenAI's own repositories and checked against its SHA-256 before it is used.
+//! The catalogue lists the models that exist: each file is pinned to a revision of the model
+//! author's own repository, with its SHA-256, size and licence. Weights are never bundled with Pa
+//! Tools or committed to the repository. The program only *uses* a model that is already on disk,
+//! found by [`crate::discover`]; the verified downloader here (feature `download`) fills
+//! `<data dir>/models/<id>/`, but nothing in the app calls it yet, so today a model is put there by
+//! hand (or `$PA_SPEECH_MODELS_DIR` points at one).
 //!
 //! Licence: OpenAI released the Whisper code and model weights under the MIT licence
 //! (<https://github.com/openai/whisper/blob/main/LICENSE>); the safetensors conversions OpenAI
-//! publishes at `huggingface.co/openai/whisper-*` are labelled Apache-2.0. Both are permissive.
-//!
-//! Flesh-out (feature `download`): port the donor's verified streaming downloader
-//! (`download`, `download_files`, `agent`) from `filmcraft-speech` `models.rs`, and add
-//! `ureq` + `rustls` + `rustls-rustcrypto` + `sha2` to the `download` feature in `Cargo.toml`.
+//! publishes at `huggingface.co/openai/whisper-*` are labelled Apache-2.0. Both are permissive. The
+//! author, licence and source fields below are attribution data and are kept as such; the
+//! catalogue's display names are neutral.
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +63,7 @@ const TOKENIZER_MULTI: &str = "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec
 static CATALOGUE: &[ModelInfo] = &[
     ModelInfo {
         id: "whisper-tiny",
-        name: "Whisper tiny (multilingual)",
+        name: "Speech model, tiny (multilingual)",
         multilingual: true,
         description: "39 M parameters. Fastest; fine for clear speech, rough on noisy audio.",
         license: LICENSE,
@@ -103,7 +103,7 @@ static CATALOGUE: &[ModelInfo] = &[
     },
     ModelInfo {
         id: "whisper-base",
-        name: "Whisper base (multilingual)",
+        name: "Speech model, base (multilingual)",
         multilingual: true,
         description: "74 M parameters. The default: a good balance of speed and accuracy.",
         license: LICENSE,
@@ -143,7 +143,7 @@ static CATALOGUE: &[ModelInfo] = &[
     },
     ModelInfo {
         id: "whisper-small",
-        name: "Whisper small (multilingual)",
+        name: "Speech model, small (multilingual)",
         multilingual: true,
         description: "244 M parameters. Most accurate here; about 4× slower than base.",
         license: LICENSE,
@@ -221,8 +221,9 @@ pub fn shared_tokenizer_sha() -> &'static str {
 pub type DownloadProgress<'a> = &'a mut dyn FnMut(u64, u64, &str) -> bool;
 
 /// Download the missing files of `m` into `models_dir/<id>/`: each file streams into `<name>.part`,
-/// its SHA-256 is checked, then it is renamed into place. A wrong checksum deletes the part file
-/// and fails. Pure Rust TLS (rustls + RustCrypto) with the operating system's certificate verifier.
+/// its SHA-256 is checked, then it is renamed into place. A file that is too big, has a wrong
+/// checksum, stalls, or fails any other way deletes its part file and fails. Pure Rust TLS (rustls
+/// + RustCrypto) with the operating system's certificate verifier.
 #[cfg(feature = "download")]
 pub fn download(models_dir: &Path, m: &ModelInfo, progress: DownloadProgress) -> Result<(), crate::SpeechError> {
     download_files(&model_dir(models_dir, m), m.files, progress)
@@ -232,60 +233,99 @@ pub fn download(models_dir: &Path, m: &ModelInfo, progress: DownloadProgress) ->
 /// against its SHA-256 and size before it is renamed into place.
 #[cfg(feature = "download")]
 pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgress) -> Result<(), crate::SpeechError> {
-    use crate::SpeechError;
-    use sha2::Digest;
-    use std::io::{Read, Write};
+    download_with(&agent(CONNECT_TIMEOUT, READ_TIMEOUT, true), dir, files, progress)
+}
+
+/// Give up on a server that does not accept the connection within this long.
+#[cfg(feature = "download")]
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Give up on a transfer in which no data arrives for this long (each read restarts it, so a slow
+/// but moving download is fine).
+#[cfg(feature = "download")]
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "download")]
+fn download_with(agent: &ureq::Agent, dir: &Path, files: &[ModelFile], progress: DownloadProgress) -> Result<(), crate::SpeechError> {
     std::fs::create_dir_all(dir)?;
-    let total: u64 = files.iter().filter(|f| !std::fs::metadata(dir.join(f.name)).is_ok_and(|md| md.len() == f.size)).map(|f| f.size).sum();
-    let agent = agent();
+    let present = |f: &ModelFile| std::fs::metadata(dir.join(f.name)).is_ok_and(|md| md.len() == f.size);
+    let total: u64 = files.iter().filter(|f| !present(f)).map(|f| f.size).sum();
     let mut done = 0u64;
     for f in files {
-        let dest = dir.join(f.name);
-        if std::fs::metadata(&dest).is_ok_and(|md| md.len() == f.size) {
+        if present(f) {
             continue;
         }
         let part = dir.join(format!("{}.part", f.name));
-        let resp = agent.get(f.url).call().map_err(|e| SpeechError::Download(format!("{}: {e}", f.url)))?;
-        let mut body = resp.into_body();
-        let mut reader = body.as_reader();
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&part)?);
-        let mut hasher = sha2::Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut got = 0u64;
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])?;
-            got += n as u64;
-            if !progress(done + got, total, f.name) {
-                drop(out);
-                let _ = std::fs::remove_file(&part);
-                return Err(SpeechError::Cancelled);
-            }
-        }
-        out.flush()?;
-        drop(out);
-        let sha: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if sha != f.sha256 || got != f.size {
+        let result = download_one(agent, f, &part, &dir.join(f.name), done, total, progress);
+        if result.is_err() {
+            // Whatever went wrong (network, size, checksum, cancel, disk), no part file is left.
             let _ = std::fs::remove_file(&part);
-            return Err(SpeechError::Download(format!(
-                "{}: checksum mismatch (got {sha}, {got} bytes; expected {}, {} bytes)",
-                f.name, f.sha256, f.size
-            )));
         }
-        std::fs::rename(&part, &dest)?;
-        done += f.size;
+        result?;
+        done = done.saturating_add(f.size);
     }
     Ok(())
 }
 
+/// Fetch one file into `part`, verify it, and rename it to `dest`. On `Err` the caller removes `part`.
 #[cfg(feature = "download")]
-fn agent() -> ureq::Agent {
+fn download_one(
+    agent: &ureq::Agent,
+    f: &ModelFile,
+    part: &Path,
+    dest: &Path,
+    done: u64,
+    total: u64,
+    progress: DownloadProgress,
+) -> Result<(), crate::SpeechError> {
+    use crate::SpeechError;
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    let resp = agent.get(f.url).call().map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
+    if resp.body().content_length().is_some_and(|n| n > f.size) {
+        return Err(SpeechError::Download(format!("{}: the server announces more than the {} bytes expected", f.name, f.size)));
+    }
+    let mut body = resp.into_body();
+    // Never read more than one byte past the expected size, whatever the server sends.
+    let mut reader = body.as_reader().take(f.size.saturating_add(1));
+    let mut out = std::io::BufWriter::new(std::fs::File::create(part)?);
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
+        if n == 0 {
+            break;
+        }
+        got = got.saturating_add(n as u64);
+        if got > f.size {
+            return Err(SpeechError::Download(format!("{}: more than the {} bytes expected", f.name, f.size)));
+        }
+        let chunk = buf.get(..n).unwrap_or_default();
+        hasher.update(chunk);
+        out.write_all(chunk)?;
+        if !progress(done.saturating_add(got), total, f.name) {
+            return Err(SpeechError::Cancelled);
+        }
+    }
+    out.flush()?;
+    drop(out);
+    let sha: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if sha != f.sha256 || got != f.size {
+        return Err(SpeechError::Download(format!(
+            "{}: checksum mismatch (got {sha}, {got} bytes; expected {}, {} bytes)",
+            f.name, f.sha256, f.size
+        )));
+    }
+    std::fs::rename(part, dest)?;
+    Ok(())
+}
+
+/// The HTTP client: pure-Rust TLS with the operating system's certificate verifier, a connect
+/// timeout and a per-read timeout. `use_env_proxy` follows the proxy environment variables.
+#[cfg(feature = "download")]
+fn agent(connect: std::time::Duration, read: std::time::Duration, use_env_proxy: bool) -> ureq::Agent {
     let provider = std::sync::Arc::new(rustls_rustcrypto::provider());
-    ureq::Agent::config_builder()
+    let mut config = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
@@ -293,12 +333,16 @@ fn agent() -> ureq::Agent {
                 .unversioned_rustls_crypto_provider(provider)
                 .build(),
         )
-        .timeout_connect(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .into()
+        .timeout_connect(Some(connect))
+        .timeout_per_read(Some(read));
+    if !use_env_proxy {
+        config = config.proxy(None);
+    }
+    config.build().into()
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -316,6 +360,201 @@ mod tests {
                     assert_eq!(f.sha256, shared_tokenizer_sha());
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "download")]
+    mod download {
+        use super::super::*;
+        use sha2::Digest;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        /// What the test server does with a request for a path.
+        #[derive(Clone)]
+        enum Reply {
+            /// 200 with this body (Content-Length set).
+            Body(Vec<u8>),
+            /// 200 announcing `announce` bytes, sending only `body`, then closing.
+            Short {
+                announce: usize,
+                body: Vec<u8>,
+            },
+            /// 200 with no Content-Length (read until close): `body`.
+            Unannounced(Vec<u8>),
+            /// 200 announcing `announce` bytes, sending `body` and then going quiet for a while.
+            Stall {
+                announce: usize,
+                body: Vec<u8>,
+            },
+            Status(u16),
+        }
+
+        /// Serve `reply` for every request on a loopback port; returns the URL of `/file`.
+        fn serve(reply: Reply) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut c) = conn else { continue };
+                    let reply = reply.clone();
+                    std::thread::spawn(move || {
+                        let mut req = [0u8; 4096];
+                        let mut n = 0;
+                        while n < req.len() {
+                            let Ok(k) = c.read(&mut req[n..]) else { return };
+                            if k == 0 {
+                                return;
+                            }
+                            n += k;
+                            if req[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let head = |status: &str, len: Option<usize>| {
+                            let len = len.map(|l| format!("Content-Length: {l}\r\n")).unwrap_or_default();
+                            format!("HTTP/1.1 {status}\r\n{len}Connection: close\r\n\r\n")
+                        };
+                        let _ = match reply {
+                            Reply::Body(b) => c.write_all(head("200 OK", Some(b.len())).as_bytes()).and_then(|_| c.write_all(&b)),
+                            Reply::Short { announce, body } => {
+                                c.write_all(head("200 OK", Some(announce)).as_bytes()).and_then(|_| c.write_all(&body))
+                            }
+                            Reply::Unannounced(b) => c.write_all(head("200 OK", None).as_bytes()).and_then(|_| c.write_all(&b)),
+                            Reply::Stall { announce, body } => {
+                                let r =
+                                    c.write_all(head("200 OK", Some(announce)).as_bytes()).and_then(|_| c.write_all(&body)).and_then(|_| c.flush());
+                                std::thread::sleep(Duration::from_secs(5));
+                                r
+                            }
+                            Reply::Status(code) => c.write_all(head(&format!("{code} Nope"), Some(0)).as_bytes()),
+                        };
+                    });
+                }
+            });
+            format!("http://127.0.0.1:{port}/file")
+        }
+
+        fn sha(bytes: &[u8]) -> &'static str {
+            let hex: String = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+            Box::leak(hex.into_boxed_str())
+        }
+
+        /// A catalogue entry for `want` served at `url` (the strings are leaked: it is a test).
+        fn file(url: String, want: &[u8]) -> ModelFile {
+            ModelFile { name: "weights.bin", url: Box::leak(url.into_boxed_str()), sha256: sha(want), size: want.len() as u64 }
+        }
+
+        struct Dir(PathBuf);
+        impl Dir {
+            fn new(tag: &str) -> Dir {
+                let d = std::env::temp_dir().join(format!("pa-speech-dl-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&d);
+                Dir(d)
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn run(dir: &Dir, f: ModelFile, read: Duration) -> Result<(), crate::SpeechError> {
+            download_with(&agent(Duration::from_secs(5), read, false), &dir.0, &[f], &mut |_, _, _| true)
+        }
+
+        fn leftovers(dir: &Dir) -> Vec<String> {
+            let mut names: Vec<String> =
+                std::fs::read_dir(&dir.0).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn a_good_download_lands_in_place_with_no_part_file() {
+            let want = vec![7u8; 100_000];
+            let dir = Dir::new("good");
+            run(&dir, file(serve(Reply::Body(want.clone())), &want), Duration::from_secs(5)).unwrap();
+            assert_eq!(leftovers(&dir), ["weights.bin"]);
+            assert_eq!(std::fs::read(dir.0.join("weights.bin")).unwrap(), want);
+        }
+
+        #[test]
+        fn a_body_larger_than_the_catalogue_size_is_cut_off_and_removed() {
+            let want = vec![1u8; 1_000];
+            let dir = Dir::new("big");
+            // announced and unannounced: the first is refused up front, the second after one extra byte
+            for reply in [Reply::Body(vec![1u8; 5_000_000]), Reply::Unannounced(vec![1u8; 5_000_000])] {
+                let err = run(&dir, file(serve(reply), &want), Duration::from_secs(5)).unwrap_err();
+                assert!(matches!(err, crate::SpeechError::Download(_)), "{err:?}");
+                let text = err.to_string();
+                assert!(text.contains("more than") && !text.contains("checksum"), "refused for its size, not after reading it all: {text}");
+                assert_eq!(leftovers(&dir), Vec::<String>::new(), "no part file and no destination");
+            }
+        }
+
+        #[test]
+        fn a_wrong_checksum_or_a_short_body_leaves_nothing_behind() {
+            let want = vec![2u8; 4_000];
+            let dir = Dir::new("sum");
+            // same size, different content
+            let err = run(&dir, file(serve(Reply::Body(vec![3u8; 4_000])), &want), Duration::from_secs(5)).unwrap_err();
+            assert!(err.to_string().contains("checksum mismatch"), "{err}");
+            assert_eq!(leftovers(&dir), Vec::<String>::new());
+            // the server hangs up early
+            let err = run(&dir, file(serve(Reply::Short { announce: 4_000, body: vec![2u8; 1_000] }), &want), Duration::from_secs(5)).unwrap_err();
+            assert!(matches!(err, crate::SpeechError::Download(_)), "{err:?}");
+            assert_eq!(leftovers(&dir), Vec::<String>::new());
+            // an error status
+            let err = run(&dir, file(serve(Reply::Status(404)), &want), Duration::from_secs(5)).unwrap_err();
+            assert!(matches!(err, crate::SpeechError::Download(_)), "{err:?}");
+            assert_eq!(leftovers(&dir), Vec::<String>::new());
+        }
+
+        #[test]
+        fn a_stalled_transfer_times_out_and_removes_the_part_file() {
+            let want = vec![4u8; 4_000];
+            let dir = Dir::new("stall");
+            let url = serve(Reply::Stall { announce: 4_000, body: vec![4u8; 1_000] });
+            let started = std::time::Instant::now();
+            let err = run(&dir, file(url, &want), Duration::from_millis(400)).unwrap_err();
+            assert!(matches!(err, crate::SpeechError::Download(_)), "{err:?}");
+            assert!(started.elapsed() < Duration::from_secs(4), "gave up promptly, not after the server's 5 s");
+            assert_eq!(leftovers(&dir), Vec::<String>::new());
+        }
+
+        #[test]
+        fn cancelling_removes_the_part_file() {
+            let want = vec![5u8; 50_000];
+            let dir = Dir::new("cancel");
+            let f = file(serve(Reply::Body(want.clone())), &want);
+            let err = download_with(&agent(Duration::from_secs(5), Duration::from_secs(5), false), &dir.0, &[f], &mut |_, _, _| false).unwrap_err();
+            assert_eq!(err, crate::SpeechError::Cancelled);
+            assert_eq!(leftovers(&dir), Vec::<String>::new());
+        }
+
+        #[test]
+        fn the_real_agent_has_timeouts_set() {
+            // 30 s to connect and 30 s without data: pinned so they are not quietly removed.
+            assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+            assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn display_text_names_no_third_party_product() {
+        // The author, licence and source fields carry the (required) attribution; what a person is
+        // shown to pick a model does not name a product or company.
+        for m in catalogue() {
+            for text in [m.name, m.description] {
+                let lower = text.to_lowercase();
+                assert!(!["whisper", "openai", "hugging"].iter().any(|n| lower.contains(n)), "{}: {text:?}", m.id);
+            }
+            assert!(m.id.starts_with("whisper-"), "the id is a file-system name and stays");
+            assert_eq!(m.author, "OpenAI");
+            assert!(m.license.contains("MIT") && m.license_url.starts_with("https://"));
+            assert!(m.source.starts_with("https://"));
         }
     }
 

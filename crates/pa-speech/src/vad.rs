@@ -51,7 +51,7 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
     for w in words {
         let a = (w.start.0 / frame_ticks).max(0) as usize;
-        let b = (((w.end.0 + frame_ticks - 1) / frame_ticks).max(0) as usize).min(db.len());
+        let b = ((w.end.0.saturating_add(frame_ticks - 1) / frame_ticks).max(0) as usize).min(db.len());
         if b <= a + MIN_WORD_FRAMES {
             continue;
         }
@@ -67,11 +67,48 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
         if (s..e).all(|f| db[f] < th) {
             continue;
         }
+        let at = |frame: usize| Tick(i64::try_from(frame).unwrap_or(i64::MAX).saturating_mul(frame_ticks));
         if s > a {
-            w.start = Tick(s as i64 * frame_ticks);
+            w.start = at(s);
         }
         if e < b {
-            w.end = Tick(e as i64 * frame_ticks).max(w.start);
+            w.end = at(e).max(w.start);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::tick::seconds_tick;
+
+    // Ported from the donor's `vad.rs` (filmcraft-speech, MIT OR Apache-2.0).
+    #[test]
+    fn silence_is_trimmed_from_words() {
+        // 0.0–0.5 silence, 0.5–1.0 tone, 1.0–2.0 silence, 2.0–2.5 tone
+        let mut audio: Vec<f32> = (0..40_000).map(|i| if i % 2 == 0 { 0.0001 } else { 0.0 }).collect();
+        for i in (8_000..16_000).chain(32_000..40_000) {
+            audio[i] = 0.3 * (i as f32 * 0.2).sin();
+        }
+        let mut w = vec![Word::new("a", seconds_tick(0.0), seconds_tick(2.0)), Word::new("b", seconds_tick(2.0), seconds_tick(2.5))];
+        tighten_words(&audio, &mut w);
+        assert_eq!(w[0].start, seconds_tick(0.5));
+        assert_eq!(w[0].end, seconds_tick(1.0));
+        assert_eq!((w[1].start, w[1].end), (seconds_tick(2.0), seconds_tick(2.5)));
+    }
+
+    #[test]
+    fn word_bounds_near_the_numeric_limits_do_not_overflow() {
+        let audio = vec![0.1f32; 16_000];
+        let mut words = vec![
+            Word::new("late", Tick(i64::MAX - 5), Tick(i64::MAX)),
+            Word::new("long", Tick(0), Tick(i64::MAX)),
+            Word::new("early", Tick(i64::MIN), Tick(i64::MIN + 10)),
+            Word::new("backwards", Tick(i64::MAX), Tick(0)),
+        ];
+        tighten_words(&audio, &mut words);
+        assert_eq!(words.len(), 4);
+        assert!(words.iter().all(|w| w.end >= w.start || w.start.0 == i64::MAX));
     }
 }

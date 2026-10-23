@@ -1,11 +1,12 @@
 //! Speech-to-text (`soundcraft-pa-speech`). Render a track's audio, downmix to mono, resample to
 //! 16 kHz, run the recogniser, and store the resulting transcript on the session.
 //!
-//! Actual recognition needs a downloaded Whisper model and a build with the `whisper` feature; the
-//! command reports a clear status (`model_unavailable`, with the reason and every place searched)
-//! when either is missing instead of failing. Where the model is looked for: an explicit
-//! `models_dir` parameter, else [`soundcraft_pa_speech::resolve_models_dir`] (`$PA_SPEECH_MODELS_DIR`,
-//! then the app bundle's resources, then the user's application data folder).
+//! Actual recognition needs the speech model on disk and a build with the speech feature (the
+//! `whisper` cargo feature); the command reports a clear status (`model_unavailable`, with the
+//! reason and every place searched) when either is missing instead of failing. Where the model is
+//! looked for: an explicit `models_dir` parameter, else [`soundcraft_pa_speech::resolve_models_dir`]
+//! (`$PA_SPEECH_MODELS_DIR`, then the app bundle's resources, then the user's application data
+//! folder). Nothing downloads the model yet: it has to be put in one of those places.
 //!
 //! Two ways in, one code path:
 //! - `track.transcribe` does everything on the calling thread (CLI, MCP, scripts).
@@ -19,11 +20,16 @@ use crate::cmd;
 use serde_json::json;
 use soundcraft_model::{TrackKind, Transcript, TranscriptWord};
 use soundcraft_pa_speech::{ModelSearch, resolve_models_dir};
-use soundcraft_time::{Range, SampleRate};
+use soundcraft_time::{Range, SampleRate, Samples};
 use std::path::PathBuf;
 
 const TRANSCRIBE: &str = "track.transcribe";
 const SET_TRANSCRIPT: &str = "track.set_transcript";
+
+/// Longest stretch of a track, in seconds, that is rendered for transcription: the recogniser's own
+/// limit ([`soundcraft_pa_speech::MAX_AUDIO_SECS`], 4 hours). Checked before any audio is rendered
+/// or allocated, so a very long session is refused at once with a clear error.
+pub const MAX_TRANSCRIBE_SECS: usize = soundcraft_pa_speech::MAX_AUDIO_SECS;
 
 /// Most words one stored transcript may hold (about 100 hours of speech); more is refused.
 pub const MAX_TRANSCRIPT_WORDS: usize = 2_000_000;
@@ -33,23 +39,25 @@ const MAX_WORD_BYTES: usize = 256;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
-            noundo "track.transcribe",
-            "Transcribe Track...",
+            "track.transcribe",
+            "Transcribe Track",
             ["Track"],
             None,
             "{track?: id|name, model?: 'whisper-base', models_dir?: path, language?: 'en', diarize?: bool} — \
-             speech-to-text for a track; the model downloads first via Setup › Transcription Settings and is \
-             found automatically (`models_dir` overrides the search)",
+             speech-to-text for a track (undoable); needs a build with the speech feature and the speech model on \
+             disk: it is looked for in $PA_SPEECH_MODELS_DIR, then the app bundle's resources, then the application \
+             data folder (`models_dir` overrides the search); nothing downloads it yet; sessions over 4 hours are refused",
             always,
             transcribe
         ),
         cmd!(
-            noundo "track.set_transcript",
+            "track.set_transcript",
             "Set Track Transcript",
             [],
             None,
-            "{track: id|name, words: [{start, end, text, speaker?}], language?, source?} — stores a transcript, \
-             replacing the track's; `start`/`end` are samples from session start; `words: []` stores an empty one",
+            "{track: id|name, words: [{start, end, text, speaker?: 0..255}], language?, source?} — stores a transcript, \
+             replacing the track's (undoable); `start`/`end` are samples from session start; `text` must not be empty; \
+             `words: []` stores an empty one",
             always,
             set_transcript
         ),
@@ -79,9 +87,10 @@ pub struct TranscribeOutcome {
 }
 
 /// Gather what `track.transcribe` needs for `p`, without recognising anything yet. The model is
-/// looked for where the running program would find it ([`ModelSearch::from_environment`]).
+/// looked for where the running program would find it ([`ModelSearch::from_environment`], with the
+/// brand's folder names).
 pub fn transcribe_job(e: &Engine, p: &Value) -> Result<TranscribeJob> {
-    transcribe_job_with(e, p, &ModelSearch::from_environment(soundcraft_brand::APP_NAME))
+    transcribe_job_with(e, p, &ModelSearch::from_environment(soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG))
 }
 
 /// [`transcribe_job`] with the places to look for the model given (tests pass their own, so no
@@ -110,6 +119,7 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
     // Render the track's clips and downmix to mono at the session rate, then resample to 16 kHz.
     let sr = e.session().sample_rate;
     let end = e.session().content_end();
+    check_length(end, sr)?;
     let channels = soundcraft_mix::render_clips(e.session(), track, Range::new(0, end));
     let mono = soundcraft_pa_speech::downmix(&channels);
     // High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's 16 kHz.
@@ -121,6 +131,35 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
         max_speakers: 6,
     };
     Ok(TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts })
+}
+
+/// What to do about a `model_unavailable` outcome: where the app looks for the model, and what the
+/// build needs. Nothing here promises a download, because nothing downloads the model yet.
+fn model_hint() -> String {
+    let looked_for = "the speech model (the folder `whisper-base` with its four files) is looked for in $PA_SPEECH_MODELS_DIR, then the app \
+                      bundle's resources, then the application data folder (`error` lists the exact folders and says why a folder was \
+                      refused); pass `models_dir` to use another folder; nothing downloads the model yet, so put the folder there by hand";
+    if soundcraft_pa_speech::available() {
+        looked_for.to_string()
+    } else {
+        format!("this build does not include the speech feature, so it cannot recognise speech whatever is on disk; {looked_for}")
+    }
+}
+
+/// Refuse a session longer than [`MAX_TRANSCRIBE_SECS`] (`end` samples at `sr`) before rendering it.
+fn check_length(end: Samples, sr: SampleRate) -> Result<()> {
+    let secs = end.max(0) as f64 / sr.as_f64().max(1.0);
+    if secs > MAX_TRANSCRIBE_SECS as f64 {
+        return Err(bad(
+            TRANSCRIBE,
+            format!(
+                "the session is {:.1} hours long; transcription is limited to {} hours (shorten the track or the session first)",
+                secs / 3600.0,
+                MAX_TRANSCRIBE_SECS / 3600
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl TranscribeJob {
@@ -136,15 +175,13 @@ impl TranscribeJob {
     pub fn run(self, progress: soundcraft_pa_speech::ProgressFn) -> Result<TranscribeOutcome> {
         let TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts } = self;
 
-        // A model must be on disk (and the `whisper` feature built in) to recognise speech.
+        // A model must be on disk (and the speech feature built in) to recognise speech.
         let transcriber = match models_dir.and_then(|dir| soundcraft_pa_speech::load(&dir, &model)) {
             Ok(t) => t,
             Err(err) => {
                 let result = json!({
                     "status": "model_unavailable", "track": track.0, "model": model, "error": err.to_string(),
-                    "samples_16k": audio.len(),
-                    "hint": "download the model (Setup › Transcription Settings), pass models_dir or set PA_SPEECH_MODELS_DIR, \
-                             or build with the `whisper` feature"
+                    "samples_16k": audio.len(), "hint": model_hint()
                 });
                 return Ok(TranscribeOutcome { result, transcript: None });
             }
@@ -152,18 +189,32 @@ impl TranscribeJob {
 
         let produced = transcriber.transcribe(&audio, &opts, progress).map_err(|err| bad(TRANSCRIBE, format!("transcription failed: {err}")))?;
 
-        // Convert the recogniser's seconds to session samples (origin: session start).
-        let words: Vec<TranscriptWord> = produced
-            .words
-            .iter()
-            .map(|w| TranscriptWord { start: sr.samples(w.start_sec), end: sr.samples(w.end_sec), text: w.text.clone(), speaker: w.speaker })
-            .collect();
+        let words = session_words(&produced.words, sr);
         let count = words.len();
         let text = produced.text();
         let (language, source) = (produced.language.clone(), produced.source.clone());
         let result = json!({"status": "ok", "track": track.0, "words": count, "language": language, "source": source, "text": text});
         Ok(TranscribeOutcome { result, transcript: Some(Transcript { track, words, language, source, speaker_names: Vec::new() }) })
     }
+}
+
+/// The recogniser's words as session words (origin: session start), held to exactly the rules
+/// `track.set_transcript` enforces, so a job's transcript is always accepted when a UI stores it
+/// through that command: text trimmed and cut to [`MAX_WORD_BYTES`], words with no text dropped,
+/// `0 <= start <= end <= MAX_POSITION`.
+fn session_words(words: &[soundcraft_pa_speech::Word], sr: SampleRate) -> Vec<TranscriptWord> {
+    words
+        .iter()
+        .filter_map(|w| {
+            let text = clip_text(w.text.trim(), MAX_WORD_BYTES);
+            if text.is_empty() {
+                return None;
+            }
+            let start = sr.samples(w.start_sec).clamp(0, MAX_POSITION);
+            let end = sr.samples(w.end_sec).clamp(start, MAX_POSITION);
+            Some(TranscriptWord { start, end, text: text.to_string(), speaker: w.speaker })
+        })
+        .collect()
 }
 
 fn transcribe(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -201,12 +252,23 @@ fn set_transcript(e: &mut Engine, p: &Value) -> Result<Value> {
         if start < 0 || end < start {
             return Err(bad(SET_TRANSCRIPT, format!("words[{i}]: need 0 <= start <= end (got {start}..{end})")));
         }
-        let text = w.get("text").and_then(Value::as_str).ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].text must be a string")))?;
-        let speaker = w.get("speaker").and_then(Value::as_u64).map_or(0, |s| u8::try_from(s).unwrap_or(u8::MAX));
+        let text = w.get("text").and_then(Value::as_str).ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].text must be a string")))?.trim();
+        if text.is_empty() {
+            return Err(bad(SET_TRANSCRIPT, format!("words[{i}].text is empty")));
+        }
+        // A missing speaker is speaker 0; one that is given must be a whole number 0..=255 (it is
+        // never silently turned into 0 or clamped to 255).
+        let speaker = match w.get("speaker") {
+            None => 0,
+            Some(s) => s
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].speaker must be a whole number from 0 to 255 (got {s})")))?,
+        };
         words.push(TranscriptWord {
             start: start.min(MAX_POSITION),
             end: end.min(MAX_POSITION),
-            text: clip_text(text.trim(), MAX_WORD_BYTES).to_string(),
+            text: clip_text(text, MAX_WORD_BYTES).to_string(),
             speaker,
         });
     }
@@ -229,19 +291,48 @@ mod tests {
         e.session().tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap()
     }
 
+    /// Whatever the recogniser returns, the job's words must be accepted by `track.set_transcript`
+    /// (the path the Transcript window stores them through): a blank or inverted word must not
+    /// make a whole transcription fail to store.
+    #[test]
+    fn job_words_always_pass_set_transcript() {
+        use soundcraft_pa_speech::Word;
+        let w = |s: f64, e: f64, t: &str| Word { start_sec: s, end_sec: e, text: t.to_string(), speaker: 1 };
+        let produced = vec![
+            w(0.0, 0.5, "hello"),
+            w(0.5, 0.6, "   "),
+            w(0.6, 0.7, ""),
+            w(-1.0, 0.8, " world "),
+            w(1.2, 1.0, "inverted"),
+            w(1.3, f64::NAN, "nan"),
+            w(1.4, 1.5, &"é".repeat(MAX_WORD_BYTES)),
+        ];
+        let sr = SampleRate::new(48_000).unwrap();
+        let words = session_words(&produced, sr);
+        assert_eq!(words.iter().map(|w| w.text.as_str()).take(2).collect::<Vec<_>>(), ["hello", "world"]);
+        assert_eq!(words.len(), 5, "only the two blank words are dropped");
+        assert!(words.iter().all(|w| 0 <= w.start && w.start <= w.end && !w.text.is_empty() && w.text.len() <= MAX_WORD_BYTES));
+
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let stored = serde_json::to_value(&words).unwrap();
+        let r = e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": stored})).unwrap();
+        assert_eq!(r["words"], 5);
+    }
+
     #[test]
     fn set_transcript_stores_sorted_words_and_replaces() {
         let mut e = demo_engine();
         let t = first_audio(&e);
         let words = json!([
             {"start": 48_000, "end": 60_000, "text": " world ", "speaker": 1},
-            {"start": 0, "end": 12_000, "text": "hello", "speaker": 300},
+            {"start": 0, "end": 12_000, "text": "hello", "speaker": 255},
         ]);
         let r = e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": words, "language": "en", "source": "test"})).unwrap();
         assert_eq!(r["words"], 2);
         let got = e.session().transcript(t).unwrap();
         assert_eq!(got.text(), "hello world");
-        assert_eq!(got.words[0].speaker, u8::MAX, "speaker ids past 255 saturate");
+        assert_eq!(got.words[0].speaker, u8::MAX);
         assert_eq!(got.words[1].speaker, 1);
         assert_eq!((got.language.as_str(), got.source.as_str()), ("en", "test"));
         assert!(e.is_dirty());
@@ -266,6 +357,16 @@ mod tests {
             json!({"track": t.0, "words": [{"start": 1.5, "end": 5, "text": "x"}]}),
             json!({"track": t.0, "words": [{"start": 0, "end": 5}]}),
             json!({"track": t.0, "words": [{"start": 0, "end": u64::MAX, "text": "x"}]}),
+            // a speaker that is given must be a whole number 0..=255: never 0, never clamped
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 256}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 300}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": -1}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 1.5}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": "2"}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": null}]}),
+            // a word with no text is not a word
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": ""}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "  \t\n "}]}),
         ] {
             assert!(e.execute(SET_TRANSCRIPT, &bad_params).is_err(), "{bad_params}");
         }
@@ -281,6 +382,51 @@ mod tests {
         let w = &e.session().transcript(t).unwrap().words[0];
         assert!(w.text.len() <= MAX_WORD_BYTES && !w.text.is_empty());
         assert!(w.text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn both_transcript_commands_are_undoable() {
+        for id in [SET_TRANSCRIPT, TRANSCRIBE] {
+            let spec = crate::cmd::find_command(id).unwrap();
+            assert!(spec.undoable, "{id} replaces document data, so it must be undoable");
+        }
+    }
+
+    #[test]
+    fn undo_restores_the_previous_transcript() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let set = |e: &mut Engine, text: &str| {
+            e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": [{"start": 0, "end": 10, "text": text}], "language": "en", "source": "test"}))
+                .unwrap();
+        };
+        assert!(e.session().transcript(t).is_none());
+
+        set(&mut e, "first");
+        set(&mut e, "second");
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+        assert_eq!(e.undo_label(), Some("Set Track Transcript"));
+
+        assert!(e.undo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "first", "undo brings back the transcript that was replaced");
+        assert!(e.undo());
+        assert!(e.session().transcript(t).is_none(), "and before that there was none");
+        assert!(e.redo() && e.redo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+
+        // Clearing is undoable too.
+        e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": []})).unwrap();
+        assert!(e.undo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+    }
+
+    #[test]
+    fn a_refused_set_transcript_adds_no_undo_step() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let steps = e.undo_history().len();
+        assert!(e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 999}]})).is_err());
+        assert_eq!(e.undo_history().len(), steps);
     }
 
     /// A scratch folder removed when dropped.
@@ -330,6 +476,12 @@ mod tests {
         );
         assert!(out.result["samples_16k"].as_u64().unwrap() > 0);
         assert!(out.transcript.is_none());
+        // The hint says where the model is looked for and promises no download.
+        let hint = out.result["hint"].as_str().unwrap();
+        assert!(hint.contains("PA_SPEECH_MODELS_DIR") && hint.contains("app bundle") && hint.contains("application data folder"), "{hint}");
+        assert!(hint.contains("models_dir") && hint.contains("nothing downloads the model yet"), "{hint}");
+        assert!(!hint.contains("Transcription Settings"), "{hint}");
+        assert_eq!(hint.contains("does not include the speech feature"), !soundcraft_pa_speech::available(), "{hint}");
         // The old status for "no folder to look in" is gone: every miss reads the same way.
         let none = transcribe_job_with(&e, &json!({"track": t.0}), &ModelSearch::default()).unwrap().run(&mut |_, _| true).unwrap();
         assert_eq!(none.result["status"], "model_unavailable");
@@ -365,19 +517,46 @@ mod tests {
         let out =
             transcribe_job_with(&e, &json!({"track": t.0, "models_dir": empty.to_string_lossy()}), &search).unwrap().run(&mut |_, _| true).unwrap();
         assert_eq!(out.result["status"], "model_unavailable");
-        assert_eq!(out.result["error"], "the speech model `whisper-base` is not downloaded");
+        assert_eq!(out.result["error"], "the speech model `whisper-base` is not installed");
     }
 
     #[test]
     fn model_folders_are_named_from_the_brand() {
         let home = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/gil"));
-        let mac = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Mac, soundcraft_brand::APP_NAME, home, None);
+        let (name, xdg) = (soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG);
+        let mac = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Mac, name, xdg, home, None);
         let expected = std::path::Path::new("/home/gil/Library/Application Support").join(soundcraft_brand::CONFIG_DIR_NAME).join("models");
         assert_eq!(mac.app_support, Some(expected));
         // On the other Unixes the folder is the brand's XDG name, the same one the settings use.
-        let other = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Other, soundcraft_brand::APP_NAME, home, None);
+        let other = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Other, name, xdg, home, None);
         let expected = std::path::Path::new("/home/gil/.local/share").join(soundcraft_brand::CONFIG_DIR_XDG).join("models");
         assert_eq!(other.app_support, Some(expected));
+    }
+
+    #[test]
+    fn a_session_longer_than_the_cap_is_refused_before_anything_is_rendered() {
+        let sr = SampleRate::HZ_48000;
+        let cap = MAX_TRANSCRIBE_SECS as i64 * 48_000;
+        assert!(check_length(0, sr).is_ok());
+        assert!(check_length(cap, sr).is_ok(), "exactly the cap is allowed");
+        let msg = check_length(cap + 48_000, sr).unwrap_err().to_string();
+        assert!(msg.contains("4.0 hours") && msg.contains("limited to 4 hours"), "{msg}");
+        assert!(check_length(i64::MAX, sr).is_err(), "no overflow");
+        assert!(check_length(-5, sr).is_ok());
+
+        // And through the command: move a clip to just past the cap; the job (and so the
+        // command) refuses without rendering the 4+ hours of audio that would otherwise be built.
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let clip = e.session().tracks.iter().find(|x| x.id == t).and_then(|x| x.clips().first().map(|c| c.id)).unwrap();
+        let hz = i64::from(e.session().sample_rate.hz());
+        e.session_mut().find_clip_mut(clip).unwrap().start = (MAX_TRANSCRIBE_SECS as i64 + 60) * hz;
+        let search = ModelSearch::default();
+        let refused = transcribe_job_with(&e, &json!({"track": t.0}), &search).err().expect("too long");
+        assert!(refused.to_string().contains("hours long"), "{refused}");
+        let steps = e.undo_history().len();
+        assert!(e.execute(TRANSCRIBE, &json!({"track": t.0})).is_err());
+        assert_eq!(e.undo_history().len(), steps);
     }
 
     #[test]
@@ -385,8 +564,11 @@ mod tests {
         let mut e = demo_engine();
         let t = first_audio(&e);
         let dir = std::env::temp_dir().join(format!("pa-tools-no-models-cmd-{}", std::process::id()));
+        let steps = e.undo_history().len();
         let r = e.execute(TRANSCRIBE, &json!({"track": t.0, "models_dir": dir.to_string_lossy()})).unwrap();
         assert_eq!(r["status"], "model_unavailable");
         assert!(e.session().transcript(t).is_none());
+        // Nothing was stored, so there is nothing to undo.
+        assert_eq!(e.undo_history().len(), steps);
     }
 }

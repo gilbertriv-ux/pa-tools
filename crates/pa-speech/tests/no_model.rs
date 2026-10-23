@@ -16,7 +16,10 @@ fn fixed_transcriber_drops_out_of_range_and_keeps_order() {
         words: vec![
             Word::new("hello", 0.10, 0.45),
             Word::new("world", 0.60, 0.95),
-            Word::new("late", 5.00, 5.40), // past the clip end -> dropped
+            Word::new("late", 5.00, 5.40),       // starts past the clip end -> dropped
+            Word::new("straddle", 1.80, 2.40),   // starts inside but ends past the end -> dropped
+            Word::new("edge", 1.50, 2.00),       // ends exactly at the end -> kept
+            Word::new("broken", 0.20, f64::NAN), // no finite bounds -> dropped
         ],
         language: "en".into(),
         source: "fixture".into(),
@@ -24,8 +27,9 @@ fn fixed_transcriber_drops_out_of_range_and_keeps_order() {
     let f = FixedTranscriber { transcript, id: "fixed".into() };
     let out = f.transcribe(&audio, &Options::default(), &mut |_, _| true).expect("transcribe ok");
 
-    // The out-of-range word is dropped.
-    assert_eq!(out.words.len(), 2, "word past the clip end must be dropped");
+    // Every word that is not entirely inside the clip is dropped.
+    let kept: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(kept, ["hello", "world", "edge"], "only words that end inside the clip are kept");
     // `source` is set from the transcriber id.
     assert_eq!(out.source, "fixed");
     // Timestamps are monotonic and within [0, clip_len].
