@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use soundcraft_audio_io::FileFormat;
 use soundcraft_model::{
-    ChannelFormat, Clip, ClipContent, ClipId, Fade, FadeShape, MarkerKind, Session, Source as PtSource, SourceId, Track, TrackKind, VideoSource,
+    ChannelFormat, Clip, ClipContent, ClipId, Fade, FadeShape, MarkerId, MarkerKind, MemoryLocation, Session, Source as PtSource, SourceId, Track,
+    TrackKind, VideoSource,
 };
 use soundcraft_time::{FrameRate as PtRate, MAX_POSITION, SampleRate, Samples};
 
@@ -35,6 +36,15 @@ use crate::{Error, ExportOptions, Format, ImportOptions, MediaMode, Report, Resu
 /// Embedded audio larger than this in total is refused (AAF streams and OMF positions are 32-bit
 /// in practice, and the copy lives in memory next to the session's).
 pub const MAX_EMBED_BYTES: u64 = 1 << 31;
+/// What an import will build, whatever the file asks for. Real sessions are far below these (a
+/// large feature mix is about a thousand tracks and tens of thousands of clips).
+const MAX_TRACKS: usize = 4096;
+const MAX_CLIPS: usize = 1_000_000;
+const MAX_SOURCES: usize = 100_000;
+const MAX_MARKERS: usize = 100_000;
+/// The most lanes one track is spread over on export (a track more layered than this loses the
+/// clips that would need another lane, and the report says how many).
+const MAX_LANES: usize = 256;
 /// A gain envelope segment steeper than this many dB is written as several linear pieces, because
 /// the file interpolates amplitude linearly and the session interpolates decibels.
 const ENVELOPE_STEP_DB: f32 = 3.0;
@@ -83,7 +93,7 @@ fn session_rate(r: FrameRate, drop: bool, report: &mut Report) -> PtRate {
 /// start of a frame a sample before the exact boundary, which flooring would lose).
 fn start_frame(rate: PtRate, at: Samples, sr: SampleRate) -> i64 {
     let f = rate.frames_at(at, sr);
-    [f, f.saturating_add(1)].into_iter().min_by_key(|&c| (rate.samples_at_frame(c, sr) - at).abs()).unwrap_or(f)
+    [f, f.saturating_add(1)].into_iter().min_by_key(|&c| rate.samples_at_frame(c, sr).saturating_sub(at).saturating_abs()).unwrap_or(f)
 }
 
 /// The id written for a fade shape.
@@ -110,7 +120,8 @@ pub(crate) fn shape_of(id: &str) -> FadeShape {
 }
 
 fn hex_color(c: [u8; 3]) -> String {
-    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+    let [r, g, b] = c;
+    format!("#{r:02X}{g:02X}{b:02X}")
 }
 
 fn parse_color(s: &str) -> Option<[u8; 3]> {
@@ -118,8 +129,13 @@ fn parse_color(s: &str) -> Option<[u8; 3]> {
     if h.len() != 6 || !h.is_ascii() {
         return None;
     }
+    // (`from_str_radix` alone would take a leading `+`)
+    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let v = u32::from_str_radix(h, 16).ok()?;
-    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+    let [_, r, g, b] = v.to_be_bytes();
+    Some([r, g, b])
 }
 
 fn file_format_of(path: &str) -> FileFormat {
@@ -169,16 +185,24 @@ fn crossfade_ok(a: &Entry, b: &Entry) -> bool {
 }
 
 /// Spread clips over lanes: each lane holds clips that do not overlap, except as crossfades.
-fn pack<'a>(mut clips: Vec<Entry<'a>>, crossfades: bool) -> Vec<Vec<Entry<'a>>> {
+///
+/// Returns the lanes and the number of clips dropped because they would need more than
+/// [`MAX_LANES`] lanes.
+fn pack<'a>(mut clips: Vec<Entry<'a>>, crossfades: bool) -> (Vec<Vec<Entry<'a>>>, usize) {
     clips.sort_by_key(|e| (e.start, e.clip.id.0));
     let mut lanes: Vec<Vec<Entry<'a>>> = Vec::new();
+    let mut dropped = 0usize;
     for mut e in clips {
         let target = lanes.iter().position(|lane| match lane.last() {
             Some(last) => last.end <= e.start || (crossfades && crossfade_ok(last, &e)),
             None => true,
         });
         let Some(lane) = target.and_then(|i| lanes.get_mut(i)) else {
-            lanes.push(vec![e]);
+            if lanes.len() >= MAX_LANES {
+                dropped += 1;
+            } else {
+                lanes.push(vec![e]);
+            }
             continue;
         };
         if let Some(last) = lane.last_mut()
@@ -190,7 +214,7 @@ fn pack<'a>(mut clips: Vec<Entry<'a>>, crossfades: bool) -> Vec<Vec<Entry<'a>>> 
         }
         lane.push(e);
     }
-    lanes
+    (lanes, dropped)
 }
 
 /// What embedding needs to know about one source: the range of frames that clips use.
@@ -291,7 +315,7 @@ pub(crate) fn to_document(s: &Session, format: Format, opts: &ExportOptions, rep
         let end = if m.kind == MarkerKind::Selection { m.end.max(m.start) } else { m.start };
         comp.markers.push(CMarker {
             start: to_tick(m.start, ex.sr),
-            duration: to_tick(end - m.start, ex.sr).max(Tick::ZERO),
+            duration: to_tick(end.saturating_sub(m.start), ex.sr).max(Tick::ZERO),
             name: m.name.clone(),
             comment: m.comments.clone(),
             color: m.color.map(hex_color),
@@ -330,9 +354,11 @@ impl Exporter<'_> {
             if (c.stretch - 1.0).abs() > 1e-9 {
                 self.stretched += 1;
             }
-            let trim = (-c.start).max(0);
-            let start = c.start.max(0);
-            let end = c.start.saturating_add(c.length);
+            // positions beyond what a session accepts (a damaged file) are held to its limits
+            let at = c.start.clamp(-MAX_POSITION, MAX_POSITION);
+            let trim = at.min(0).saturating_neg();
+            let start = at.max(0);
+            let end = at.saturating_add(c.length.clamp(0, MAX_POSITION));
             if end <= start {
                 continue;
             }
@@ -359,7 +385,10 @@ impl Exporter<'_> {
 
     fn audio_track(&mut self, t: &Track, comp: &mut Composition, number: &mut u32) {
         let entries = self.entries(t, false);
-        let lanes = pack(entries, true);
+        let (lanes, dropped) = pack(entries, true);
+        if dropped > 0 {
+            self.report.warn(format!("{dropped} clip(s) of \"{}\" overlap more than {MAX_LANES} deep and were not exported", t.name));
+        }
         let channels = t.format.channels().max(1) as u32;
         let breakout = self.opts.breakout_to_mono && channels > 1;
         for (li, lane) in lanes.iter().enumerate() {
@@ -394,7 +423,10 @@ impl Exporter<'_> {
     }
 
     fn video_track(&mut self, t: &Track, comp: &mut Composition, number: &mut u32) {
-        let lanes = pack(self.entries(t, true), false);
+        let (lanes, dropped) = pack(self.entries(t, true), false);
+        if dropped > 0 {
+            self.report.warn(format!("{dropped} clip(s) of \"{}\" overlap more than {MAX_LANES} deep and were not exported", t.name));
+        }
         for (li, lane) in lanes.iter().enumerate() {
             let items = self.lane_items(lane, CKind::Picture, None);
             *number += 1;
@@ -409,7 +441,7 @@ impl Exporter<'_> {
         let mut out: Vec<CItem> = Vec::new();
         let mut cursor = Tick::ZERO;
         let mut tail = Tick::ZERO;
-        for e in lane {
+        for (k, e) in lane.iter().enumerate() {
             let src = match e.clip.content {
                 ClipContent::Audio { source, .. } if kind == CKind::Sound => self.audio_source(source, channel),
                 ClipContent::Video { source, .. } if kind == CKind::Picture => self.video_source(source),
@@ -453,7 +485,7 @@ impl Exporter<'_> {
             if let Some(ov) = e.xout {
                 let ts = to_tick(e.end - ov, sr);
                 // (the partner starts at `ts`; the crossfade takes its shape from the later clip)
-                let shape = lane_shape(lane, e);
+                let shape = lane_shape(lane.get(k.saturating_add(1)), e);
                 out.push(CItem::Transition(CTransition { len: end - ts, cut: Tick((end - ts).0 / 2), effect: shape_id(shape).to_string() }));
                 cursor = ts;
                 tail = tail.max(end);
@@ -488,7 +520,7 @@ impl Exporter<'_> {
         let c = e.clip;
         let base = if c.gain_db.is_finite() { c.gain_db } else { 0.0 };
         let mut env: Vec<(i64, f32)> =
-            c.gain_env.iter().filter(|(_, v)| v.is_finite()).map(|&(t, v)| ((t - e.trim).clamp(0, e.len()), base + v)).collect();
+            c.gain_env.iter().filter(|(_, v)| v.is_finite()).map(|&(t, v)| (t.saturating_sub(e.trim).clamp(0, e.len()), base + v)).collect();
         env.sort_by_key(|p| p.0);
         if env.is_empty() {
             return (base.abs() > 1e-6).then(|| Gain::Constant(db_to_gain(f64::from(base))));
@@ -610,7 +642,9 @@ impl Exporter<'_> {
             return Err("there is too much audio to embed".into());
         }
         self.embedded += size;
-        let mut pcm = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        let mut pcm = Vec::new();
+        pcm.try_reserve_exact(usize::try_from(size).map_err(|_| "there is too much audio to embed".to_string())?)
+            .map_err(|_| "there is not enough memory to embed it".to_string())?;
         for i in lo..hi {
             for ch in &picked {
                 let x = f64::from(ch.get(i).copied().unwrap_or(0.0));
@@ -661,9 +695,9 @@ impl Exporter<'_> {
     }
 }
 
-/// The shape of the crossfade that ends `e`: that of the later clip's fade-in, else of `e`'s fade-out.
-fn lane_shape(lane: &[Entry], e: &Entry) -> FadeShape {
-    let next = lane.iter().skip_while(|x| x.clip.id != e.clip.id).nth(1);
+/// The shape of the crossfade that ends `e` (`next` is the clip after it in its lane): that of the later
+/// clip's fade-in, else of `e`'s fade-out.
+fn lane_shape(next: Option<&Entry>, e: &Entry) -> FadeShape {
     match next {
         Some(n) if n.clip.fade_in.len > 0 => n.clip.fade_in.shape,
         _ => e.clip.fade_out.shape,
@@ -744,6 +778,7 @@ pub(crate) fn from_document(doc: Document, opts: &ImportOptions, report: &mut Re
     let mut map: HashMap<usize, Mapped> = HashMap::new();
     let mut extracted = Vec::new();
     let mut groups: Vec<((String, Option<String>), Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<(String, Option<String>), usize> = HashMap::new();
     let mut nested = 0usize;
     for (i, src) in doc.sources.iter().enumerate() {
         if src.nested.is_some() {
@@ -751,15 +786,28 @@ pub(crate) fn from_document(doc: Document, opts: &ImportOptions, report: &mut Re
             continue;
         }
         let k = (src.key.clone(), src.path.clone().or_else(|| src.embedded.is_some().then(|| format!("embedded:{i}"))));
-        match groups.iter_mut().find(|(g, _)| *g == k) {
-            Some((_, v)) => v.push(i),
-            None => groups.push((k, vec![i])),
+        match group_of.get(&k) {
+            Some(&g) => {
+                if let Some((_, v)) = groups.get_mut(g) {
+                    v.push(i);
+                }
+            }
+            None => {
+                if groups.len() >= MAX_SOURCES {
+                    return Err(Error::Other(format!("the file refers to more than {MAX_SOURCES} media items")));
+                }
+                group_of.insert(k.clone(), groups.len());
+                groups.push((k, vec![i]));
+            }
         }
     }
     if nested > 0 {
         report.warn("nested compositions are not imported (their clips were left as gaps)");
     }
     let mut used_paths = std::collections::HashSet::new();
+    // next number to try for each embedded file name, so many files of one name do not each
+    // search from 1
+    let mut next_number: HashMap<String, usize> = HashMap::new();
     for ((_, path), members) in &groups {
         let Some(&first_i) = members.first() else { continue };
         let Some(first) = doc.sources.get(first_i) else { continue };
@@ -789,22 +837,22 @@ pub(crate) fn from_document(doc: Document, opts: &ImportOptions, report: &mut Re
             continue;
         }
         let snd = members.iter().filter_map(|&m| doc.sources.get(m)).filter(|x| x.kind == CKind::Sound);
-        let channels = snd.clone().map(|x| x.file_channels.max(x.channel.map_or(0, |c| c + 1))).max().unwrap_or(1).max(1);
+        let channels = snd.clone().map(|x| x.file_channels.max(x.channel.map_or(0, |c| c.saturating_add(1)))).max().unwrap_or(1).max(1);
         let length = snd.clone().map(|x| x.length).max().unwrap_or(Tick::ZERO);
         let embedded = first.embedded.as_ref().map(|d| (first, d));
         let rel = if let Some((e, data)) = embedded {
             let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
             let base = format!("Audio Files/{}", safe.trim());
             let mut rel = format!("{base}.wav");
-            let mut n = 1;
+            let counter = next_number.entry(base.to_ascii_lowercase()).or_insert(1);
             while !used_paths.insert(rel.to_ascii_lowercase()) {
-                n += 1;
-                rel = format!("{base}-{n}.wav");
+                *counter = counter.saturating_add(1);
+                rel = format!("{base}-{counter}.wav");
             }
             extracted.push(ExtractedMedia {
                 source: id,
                 path: rel.clone(),
-                wav: crate::wav::wav_file(data, e.file_channels.max(1).min(u32::from(u16::MAX)) as u16, e.sample_rate, e.bits),
+                wav: crate::wav::wav_file(data, u16::try_from(e.file_channels.max(1)).unwrap_or(u16::MAX), e.sample_rate, e.bits),
             });
             rel
         } else {
@@ -813,14 +861,14 @@ pub(crate) fn from_document(doc: Document, opts: &ImportOptions, report: &mut Re
         if rel.is_empty() {
             report.warn(format!("\"{name}\" has no media location; imported offline"));
         }
-        let time_reference = first.start_tc.map(|f| to_samples(first.tc_rate.tick_of(f), sr)).filter(|&t| t > 0).map_or(0, |t| t as u64);
+        let time_reference = first.start_tc.map(|f| to_samples(first.tc_rate.tick_of(f), sr)).and_then(|t| u64::try_from(t).ok()).unwrap_or(0);
         s.sources.push(PtSource {
             id,
             name,
             format: if embedded.is_some() { FileFormat::Wav } else { file_format_of(&rel) },
             path: rel,
-            channels: channels.min(u32::from(u16::MAX)) as u16,
-            frames: to_samples(length, sr).max(0) as u64,
+            channels: u16::try_from(channels).unwrap_or(u16::MAX),
+            frames: u64::try_from(to_samples(length, sr)).unwrap_or(0),
             sample_rate: sr,
             time_reference,
             unsaved: false,
@@ -834,23 +882,43 @@ pub(crate) fn from_document(doc: Document, opts: &ImportOptions, report: &mut Re
         report.warn("a clip cannot select one channel of a multichannel file; clips of a broken-out channel play the first channel of their file");
     }
     // tracks
-    for t in &comp.tracks {
-        import_track(&mut s, t, &doc.sources, &map, sr, report);
+    if comp.tracks.len() > MAX_TRACKS {
+        report.warn(format!("the file has {} tracks; the first {MAX_TRACKS} were imported", comp.tracks.len()));
+    }
+    let mut clip_budget = MAX_CLIPS;
+    for t in comp.tracks.iter().take(MAX_TRACKS) {
+        import_track(&mut s, t, &doc.sources, &map, sr, &mut clip_budget, report);
+    }
+    if clip_budget == 0 {
+        report.warn(format!("the file has more than {MAX_CLIPS} clips; the rest were not imported"));
     }
     let media_markers: usize = doc.sources.iter().map(|x| x.markers.len()).sum();
     if media_markers > 0 {
         report.info(format!("{media_markers} marker(s) on media were not imported"));
     }
-    for m in &comp.markers {
-        let start = to_samples(m.start, sr);
-        let end = start.saturating_add(to_samples(m.duration, sr).max(0));
-        let kind = if end > start { MarkerKind::Selection } else { MarkerKind::Marker };
-        let id = s.add_marker(&m.name, kind, start, end);
-        if let Some(loc) = s.markers.iter_mut().find(|x| x.id == id) {
-            loc.comments = m.comment.clone();
-            loc.color = m.color.as_deref().and_then(parse_color);
-        }
+    if comp.markers.len() > MAX_MARKERS {
+        report.warn(format!("the file has {} markers; the first {MAX_MARKERS} were imported", comp.markers.len()));
     }
+    // (built directly: `Session::add_marker` renumbers and sorts the whole list on every call)
+    for (n, m) in (1u32..).zip(comp.markers.iter().take(MAX_MARKERS)) {
+        let start = to_samples(m.start, sr);
+        let end = start.saturating_add(to_samples(m.duration, sr).max(0)).min(MAX_POSITION);
+        let kind = if end > start { MarkerKind::Selection } else { MarkerKind::Marker };
+        let id = MarkerId(s.alloc());
+        s.markers.push(MemoryLocation {
+            id,
+            number: n,
+            name: m.name.clone(),
+            kind,
+            start,
+            end: end.max(start),
+            comments: m.comment.clone(),
+            color: m.color.as_deref().and_then(parse_color),
+            ruler: 1,
+            track: None,
+        });
+    }
+    s.markers.sort_by_key(|m| m.start);
     s.sanitize();
     Ok(Imported { session: s, extracted })
 }
@@ -861,7 +929,15 @@ enum Slot {
     Tr { len: Tick, effect: String },
 }
 
-fn import_track(s: &mut Session, t: &CTrack, sources: &[Source], map: &HashMap<usize, Mapped>, sr: u32, report: &mut Report) {
+fn import_track(
+    s: &mut Session,
+    t: &CTrack,
+    sources: &[Source],
+    map: &HashMap<usize, Mapped>,
+    sr: u32,
+    clip_budget: &mut usize,
+    report: &mut Report,
+) {
     let video = t.kind == CKind::Picture;
     let kind = if video { TrackKind::Video } else { TrackKind::Audio };
     let format = if video { ChannelFormat::Mono } else { channel_format(t.channels) };
@@ -874,7 +950,7 @@ fn import_track(s: &mut Session, t: &CTrack, sources: &[Source], map: &HashMap<u
     let mut slots: Vec<Slot> = Vec::new();
     let mut clips: Vec<(Tick, Tick, &CClip)> = Vec::new();
     for it in &t.items {
-        if pos.0.abs() > 4 * MAX_TIME.0 {
+        if pos.0.unsigned_abs() > 4 * MAX_TIME.0.unsigned_abs() {
             report.warn("a track longer than supported was cut short");
             break;
         }
@@ -888,7 +964,8 @@ fn import_track(s: &mut Session, t: &CTrack, sources: &[Source], map: &HashMap<u
                 slots.push(Slot::Tr { len: tr.len, effect: tr.effect.clone() });
             }
             CItem::Clip(c) => {
-                if matches!(map.get(&c.source), Some(Mapped::Audio(_) | Mapped::Video(_))) && c.len > Tick::ZERO {
+                if matches!(map.get(&c.source), Some(Mapped::Audio(_) | Mapped::Video(_))) && c.len > Tick::ZERO && *clip_budget > 0 {
+                    *clip_budget -= 1;
                     slots.push(Slot::Clip(clips.len()));
                     clips.push((pos, c.len, c));
                 } else {
@@ -905,7 +982,7 @@ fn import_track(s: &mut Session, t: &CTrack, sources: &[Source], map: &HashMap<u
         let Some(m) = map.get(&c.source) else { continue };
         let start = to_samples(at, sr).max(0);
         let end = to_samples(at + len, sr);
-        let length = (end - start).max(1);
+        let length = end.saturating_sub(start).max(1);
         let offset = to_samples(c.start, sr).max(0);
         let cid = ClipId(s.alloc());
         let fallback = sources.get(c.source).map(|x| x.name.as_str()).unwrap_or("");
@@ -1076,11 +1153,13 @@ pub(crate) fn merge(target: &mut Session, frag: Imported, at: Samples) -> Result
     out.sources = f.sources.iter().map(|s| s.id).chain(f.videos.iter().map(|v| v.id)).collect();
     target.sources.append(&mut f.sources);
     target.videos.append(&mut f.videos);
+    let mut number = target.markers.iter().map(|x| x.number).max().unwrap_or(0);
     for mut m in f.markers.drain(..) {
         m.id = soundcraft_model::MarkerId(target.alloc());
         m.start = m.start.saturating_add(at).clamp(-MAX_POSITION, MAX_POSITION);
         m.end = m.end.saturating_add(at).clamp(m.start, MAX_POSITION);
-        m.number = target.markers.iter().map(|x| x.number).max().unwrap_or(0).saturating_add(1);
+        number = number.saturating_add(1);
+        m.number = number;
         target.markers.push(m);
     }
     target.markers.sort_by_key(|m| m.start);

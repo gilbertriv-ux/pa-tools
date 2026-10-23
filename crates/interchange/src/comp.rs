@@ -9,6 +9,7 @@
 //! All times are [`Tick`]s.
 
 use crate::ticks::{FrameRate, TICKS_PER_SECOND, Tick};
+use crate::{Error, Result};
 
 /// Picture or sound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -26,6 +27,30 @@ pub(crate) struct Document {
     /// Compositions that are only used inside others (nested sequences); a [`Source`] refers to
     /// one by its index here. They may nest further.
     pub nested: Vec<Composition>,
+}
+
+impl Document {
+    /// Check that everything the document refers to is in it: every clip names a source, and every
+    /// nested-composition source names a composition. The writers rely on this (they also look
+    /// everything up with `get`, so a document that skips the check fails instead of panicking).
+    pub fn check(&self) -> Result<()> {
+        let bad = |what: &str| Err(Error::Other(format!("inconsistent document: {what}")));
+        for s in &self.sources {
+            if s.nested.is_some_and(|n| n >= self.nested.len()) {
+                return bad("a source names a nested composition that does not exist");
+            }
+        }
+        for comp in self.compositions.iter().chain(&self.nested) {
+            for item in comp.tracks.iter().flat_map(|t| &t.items) {
+                if let CItem::Clip(c) = item
+                    && c.source >= self.sources.len()
+                {
+                    return bad("a clip names a source that does not exist");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,11 +178,16 @@ pub(crate) fn units_to_ticks(n: i64, num: i64, den: i64) -> Tick {
     if num <= 0 || den <= 0 {
         return Tick::ZERO;
     }
-    let t = n as i128 * den as i128 * TICKS_PER_SECOND as i128;
-    let q = t.div_euclid(num as i128);
-    let r = t.rem_euclid(num as i128);
-    // documents are untrusted: keep every time far from overflow (±3 days)
-    Tick((q + if r * 2 >= num as i128 { 1 } else { 0 }).clamp(-MAX_TIME.0 as i128, MAX_TIME.0 as i128) as i64)
+    // documents are untrusted: a product too big for i128 is far outside ±MAX_TIME anyway
+    let Some(t) = i128::from(n).checked_mul(i128::from(den)).and_then(|x| x.checked_mul(i128::from(TICKS_PER_SECOND))) else {
+        return if n < 0 { Tick(-MAX_TIME.0) } else { MAX_TIME };
+    };
+    let num = i128::from(num);
+    let q = t.div_euclid(num);
+    let r = t.rem_euclid(num);
+    // keep every time far from overflow (±3 days)
+    let ticks = q.saturating_add(i128::from(r.saturating_mul(2) >= num)).clamp(i128::from(-MAX_TIME.0), i128::from(MAX_TIME.0));
+    Tick(i64::try_from(ticks).unwrap_or(0))
 }
 
 /// Edit units at rate `num/den` nearest to `t`; the flag is false when `t` is not on a unit.
@@ -165,10 +195,11 @@ pub(crate) fn ticks_to_units(t: Tick, num: i64, den: i64) -> (i64, bool) {
     if num <= 0 || den <= 0 {
         return (0, false);
     }
-    let x = t.0 as i128 * num as i128;
-    let d = den as i128 * TICKS_PER_SECOND as i128;
+    // i64 × i64 fits i128, and so does i64 × the tick rate
+    let x = i128::from(t.0) * i128::from(num);
+    let d = i128::from(den) * i128::from(TICKS_PER_SECOND);
     let q = x.div_euclid(d);
     let r = x.rem_euclid(d);
-    let n = q + if r * 2 >= d { 1 } else { 0 };
-    (n.clamp(i64::MIN as i128, i64::MAX as i128) as i64, r == 0)
+    let n = q.saturating_add(i128::from(r.saturating_mul(2) >= d));
+    (i64::try_from(n.clamp(i128::from(i64::MIN), i128::from(i64::MAX))).unwrap_or(0), r == 0)
 }

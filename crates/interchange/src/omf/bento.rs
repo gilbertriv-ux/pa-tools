@@ -33,7 +33,11 @@
 //! object's reference list (standard property 22: pairs of u32 key, u32 object id). This crate
 //! uses the referenced object's id as the key.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
+
+use crate::bytes::{array, be16, be32, slice};
 
 pub(crate) const MAGIC: [u8; 8] = [0xA4, b'C', b'M', 0xA5, b'H', b'd', b'r', 0xD7];
 pub(crate) const LABEL_SIZE: usize = 24;
@@ -79,11 +83,14 @@ pub(crate) struct Writer {
     next: u32,
     /// (object, property, type, segments)
     entries: Vec<(u32, u32, u32, Vec<Seg>)>,
+    /// The first limit the content ran into (a value or the file past what the format can hold);
+    /// reported by [`Writer::finish`].
+    error: Option<String>,
 }
 
 impl Writer {
     pub fn new() -> Writer {
-        Writer { data: Vec::new(), names: HashMap::new(), next: MIN_USER_ID, entries: Vec::new() }
+        Writer { data: Vec::new(), names: HashMap::new(), next: MIN_USER_ID, entries: Vec::new(), error: None }
     }
 
     fn named(&mut self, kind: u32, name: &str) -> u32 {
@@ -109,7 +116,7 @@ impl Writer {
 
     pub fn new_object(&mut self) -> u32 {
         let id = self.next;
-        self.next += 1;
+        self.next = self.next.saturating_add(1);
         id
     }
 
@@ -118,8 +125,12 @@ impl Writer {
             return Seg::Imm(v.to_vec());
         }
         let at = self.data.len() as u64;
+        let Ok(len) = u32::try_from(v.len()) else {
+            self.error.get_or_insert_with(|| "a value is larger than 4 GiB (the limit of OMF)".to_string());
+            return Seg::Imm(Vec::new());
+        };
         self.data.extend_from_slice(v);
-        Seg::At(at, v.len() as u32)
+        Seg::At(at, len)
     }
 
     /// Set a value of `obj` (values of more than 4 GiB are not supported by OMF).
@@ -141,7 +152,10 @@ impl Writer {
         self.entries.push((obj, OBJ_REFERENCES, TYPE_7BIT_ASCII, vec![seg]));
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> Result<Vec<u8>, String> {
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
         let seed = self.next;
         self.entries.push((TOC_OBJECT, TOC_SEED, TOC_TYPE, vec![Seg::Imm(seed.to_be_bytes().to_vec())]));
         self.entries.push((TOC_OBJECT, TOC_MIN_SEED, TOC_TYPE, vec![Seg::Imm(MIN_USER_ID.to_be_bytes().to_vec())]));
@@ -165,14 +179,18 @@ impl Writer {
             for (i, s) in segs.iter().enumerate() {
                 match s {
                     Seg::Imm(b) => {
-                        toc.push(if i > 0 { OP_CONTD_IMMEDIATE4 } else { OP_IMMEDIATE0 + b.len() as u8 });
+                        // an immediate holds up to 4 bytes (`store` makes only such values)
+                        let n = u8::try_from(b.len().min(4)).unwrap_or(4);
+                        toc.push(if i > 0 { OP_CONTD_IMMEDIATE4 } else { OP_IMMEDIATE0 + n });
                         let mut w = [0u8; 4];
-                        w[..b.len()].copy_from_slice(b);
+                        for (dst, src) in w.iter_mut().zip(b) {
+                            *dst = *src;
+                        }
                         toc.extend_from_slice(&w);
                     }
-                    Seg::At(off, len) if *off <= u32::MAX as u64 => {
+                    Seg::At(off, len) if u32::try_from(*off).is_ok() => {
                         toc.push(if i > 0 { OP_CONTD_OFFSET4_LEN4 } else { OP_OFFSET4_LEN4 });
-                        toc.extend_from_slice(&(*off as u32).to_be_bytes());
+                        toc.extend_from_slice(&u32::try_from(*off).unwrap_or(u32::MAX).to_be_bytes());
                         toc.extend_from_slice(&len.to_be_bytes());
                     }
                     Seg::At(off, len) => {
@@ -184,17 +202,18 @@ impl Writer {
             }
         }
         let mut out = self.data;
-        let toc_at = out.len() as u64;
+        let toc_at = u32::try_from(out.len()).map_err(|_| "the file is larger than 4 GiB (the limit of OMF)".to_string())?;
+        let toc_len = u32::try_from(toc.len()).map_err(|_| "the table of contents is too large".to_string())?;
         out.extend_from_slice(&toc);
         let mut label = MAGIC.to_vec();
         label.extend_from_slice(&0u16.to_be_bytes()); // flags
         label.extend_from_slice(&TOC_BUFFER_KIB.to_be_bytes());
         label.extend_from_slice(&1u16.to_be_bytes());
         label.extend_from_slice(&0u16.to_be_bytes());
-        label.extend_from_slice(&(toc_at.min(u32::MAX as u64) as u32).to_be_bytes());
-        label.extend_from_slice(&(toc.len() as u32).to_be_bytes());
+        label.extend_from_slice(&toc_at.to_be_bytes());
+        label.extend_from_slice(&toc_len.to_be_bytes());
         out.extend_from_slice(&label);
-        out
+        Ok(out)
     }
 }
 
@@ -207,21 +226,50 @@ pub(crate) struct Prop {
     segs: Vec<Seg>,
 }
 
+impl Prop {
+    /// The declared length of the value in bytes.
+    fn len(&self) -> usize {
+        self.segs
+            .iter()
+            .map(|s| match s {
+                Seg::Imm(b) => b.len(),
+                Seg::At(_, len) => usize::try_from(*len).unwrap_or(usize::MAX),
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
 /// A parsed Bento container.
 pub(crate) struct Container<'a> {
     data: &'a [u8],
     pub objects: BTreeMap<u32, Vec<Prop>>,
+    /// (object, property id) → position among the object's values: the first value with that id.
+    index: HashMap<(u32, u32), usize>,
     names: HashMap<u32, String>,
     by_name: HashMap<String, u32>,
+    /// Value bytes still allowed to be handed out (every [`Container::value`] charges its length,
+    /// so segments that all point at the same big range cannot multiply it).
+    budget: Cell<usize>,
+    exhausted: Cell<bool>,
+    /// Per object: reference key → object id, from its reference list (built on first use).
+    ref_maps: RefCell<HashMap<u32, Rc<HashMap<u32, u32>>>>,
 }
 
-fn be32(b: &[u8], at: usize) -> Option<u32> {
-    b.get(at..at + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-}
+/// The longest global name (of a property or type) read; real ones are about 30 bytes.
+const MAX_NAME_LEN: usize = 256;
+/// Most segments one value may be made of.
+const MAX_SEGMENTS: usize = 1 << 20;
 
 /// Whether `b` ends with a Bento label.
 pub(crate) fn sniff(b: &[u8]) -> bool {
-    b.len() >= LABEL_SIZE && b[b.len() - LABEL_SIZE..b.len() - LABEL_SIZE + 8] == MAGIC
+    b.len().checked_sub(LABEL_SIZE).and_then(|at| slice(b, at, MAGIC.len())).is_some_and(|m| m == MAGIC)
+}
+
+/// `n` bytes of the TOC at `*i`, advancing `*i`.
+fn take<'t>(toc: &'t [u8], i: &mut usize, n: usize) -> Result<&'t [u8], String> {
+    let b = slice(toc, *i, n).ok_or_else(|| "truncated TOC".to_string())?;
+    *i += n;
+    Ok(b)
 }
 
 impl<'a> Container<'a> {
@@ -229,54 +277,54 @@ impl<'a> Container<'a> {
         if !sniff(data) {
             return Err("no Bento label at the end of the file".into());
         }
-        let l = &data[data.len() - LABEL_SIZE..];
-        let buf = (u16::from_be_bytes([l[10], l[11]]) as usize).max(1) * 1024;
-        let toc_at = be32(l, 16).unwrap_or(0) as usize;
-        let toc_len = be32(l, 20).unwrap_or(0) as usize;
-        let toc = data.get(toc_at..toc_at.checked_add(toc_len).ok_or("bad TOC size")?).ok_or("the TOC lies outside the file")?;
-        let mut c = Container { data, objects: BTreeMap::new(), names: HashMap::new(), by_name: HashMap::new() };
+        let label = data.get(data.len().saturating_sub(LABEL_SIZE)..).ok_or("no Bento label at the end of the file")?;
+        let buf = usize::from(be16(label, 10).unwrap_or(0)).max(1) * 1024;
+        let toc_at = usize::try_from(be32(label, 16).unwrap_or(0)).map_err(|_| "bad TOC offset")?;
+        let toc_len = usize::try_from(be32(label, 20).unwrap_or(0)).map_err(|_| "bad TOC size")?;
+        let toc = slice(data, toc_at, toc_len).ok_or("the TOC lies outside the file")?;
+        let mut c = Container {
+            data,
+            objects: BTreeMap::new(),
+            index: HashMap::new(),
+            names: HashMap::new(),
+            by_name: HashMap::new(),
+            // a copy of the file per value read would be 1x; this allows the many small reads of
+            // a normal import and stops a TOC built to read the same bytes over and over
+            budget: Cell::new(data.len().saturating_mul(16).saturating_add(4 << 20)),
+            exhausted: Cell::new(false),
+            ref_maps: RefCell::new(HashMap::new()),
+        };
         let (mut obj, mut prop) = (0u32, 0u32);
-        let mut i = 0;
-        while i < toc.len() {
-            let op = toc[i];
+        let mut i = 0usize;
+        while let Some(&op) = toc.get(i) {
             i += 1;
-            let need = |n: usize| -> Result<&[u8], String> { toc.get(i..i + n).ok_or_else(|| "truncated TOC".to_string()) };
             match op {
-                OP_NEW_OBJECT => {
-                    obj = be32(need(4)?, 0).unwrap_or(0);
-                    i += 4;
-                }
-                OP_NEW_PROPERTY => {
-                    prop = be32(need(4)?, 0).unwrap_or(0);
-                    i += 4;
-                }
+                OP_NEW_OBJECT => obj = be32(take(toc, &mut i, 4)?, 0).unwrap_or(0),
+                OP_NEW_PROPERTY => prop = be32(take(toc, &mut i, 4)?, 0).unwrap_or(0),
                 OP_NEW_TYPE => {
-                    let ty = be32(need(4)?, 0).unwrap_or(0);
-                    i += 4;
-                    c.objects.entry(obj).or_default().push(Prop { prop, ty, segs: Vec::new() });
+                    let ty = be32(take(toc, &mut i, 4)?, 0).unwrap_or(0);
+                    let props = c.objects.entry(obj).or_default();
+                    c.index.entry((obj, prop)).or_insert(props.len());
+                    props.push(Prop { prop, ty, segs: Vec::new() });
                 }
                 OP_EXPLICIT_GEN | OP_REFERENCE_LIST_ID => {
-                    need(4)?;
-                    i += 4;
+                    take(toc, &mut i, 4)?;
                 }
                 OP_OFFSET4_LEN4 | OP_CONTD_OFFSET4_LEN4 => {
-                    let b = need(8)?;
-                    let seg = Seg::At(be32(b, 0).unwrap_or(0) as u64, be32(b, 4).unwrap_or(0));
-                    i += 8;
+                    let b = take(toc, &mut i, 8)?;
+                    let seg = Seg::At(u64::from(be32(b, 0).unwrap_or(0)), be32(b, 4).unwrap_or(0));
                     c.push_seg(obj, seg)?;
                 }
                 OP_OFFSET8_LEN4 | OP_CONTD_OFFSET8_LEN4 => {
-                    let b = need(12)?;
-                    let off = u64::from_be_bytes(b[..8].try_into().map_err(|_| "truncated TOC")?);
+                    let b = take(toc, &mut i, 12)?;
+                    let off = array::<8>(b, 0).map(u64::from_be_bytes).ok_or("truncated TOC")?;
                     let seg = Seg::At(off, be32(b, 8).unwrap_or(0));
-                    i += 12;
                     c.push_seg(obj, seg)?;
                 }
                 x @ (OP_IMMEDIATE0..=OP_IMMEDIATE4 | OP_CONTD_IMMEDIATE4) => {
-                    let b = need(4)?;
-                    let n = if x == OP_CONTD_IMMEDIATE4 { 4 } else { (x - OP_IMMEDIATE0) as usize };
-                    let seg = Seg::Imm(b[..n].to_vec());
-                    i += 4;
+                    let b = take(toc, &mut i, 4)?;
+                    let n = if x == OP_CONTD_IMMEDIATE4 { 4 } else { usize::from(x - OP_IMMEDIATE0) };
+                    let seg = Seg::Imm(b.get(..n).unwrap_or(b).to_vec());
                     c.push_seg(obj, seg)?;
                 }
                 OP_END_OF_BUFFER => {
@@ -287,39 +335,68 @@ impl<'a> Container<'a> {
                 other => return Err(format!("unknown TOC operation {other}")),
             }
         }
-        // global names
-        let ids: Vec<u32> = c.objects.keys().copied().collect();
-        for id in ids {
-            let name = c.objects[&id].iter().find(|p| p.prop == GLOBAL_PROP_NAME || p.prop == GLOBAL_TYPE_NAME).and_then(|p| c.value(p).ok());
-            if let Some(n) = name {
-                let s = String::from_utf8_lossy(&n).trim_end_matches('\0').to_string();
-                c.by_name.insert(s.clone(), id);
-                c.names.insert(id, s);
+        // global names (of properties and types): short values of the two naming properties
+        let mut found: Vec<(u32, Vec<u8>)> = Vec::new();
+        for (&id, props) in &c.objects {
+            let named = props.iter().find(|p| p.prop == GLOBAL_PROP_NAME || p.prop == GLOBAL_TYPE_NAME);
+            if let Some(p) = named
+                && p.len() <= MAX_NAME_LEN
+                && let Ok(v) = c.value(p)
+            {
+                found.push((id, v));
             }
+        }
+        for (id, v) in found {
+            let n = String::from_utf8_lossy(&v).trim_end_matches('\0').to_string();
+            c.by_name.entry(n.clone()).or_insert(id);
+            c.names.insert(id, n);
         }
         Ok(c)
     }
 
     fn push_seg(&mut self, obj: u32, seg: Seg) -> Result<(), String> {
         let p = self.objects.get_mut(&obj).and_then(|v| v.last_mut()).ok_or("a value without a type in the TOC")?;
-        if p.segs.len() > 1 << 20 {
+        if p.segs.len() >= MAX_SEGMENTS {
             return Err("too many value segments".into());
         }
         p.segs.push(seg);
         Ok(())
     }
 
+    /// Whether a read was refused because the budget for value bytes ran out. A reader checks this
+    /// when it is done: an import that hit it was missing values and must not be trusted.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
     /// The bytes of a value.
     pub fn value(&self, p: &Prop) -> Result<Vec<u8>, String> {
-        let mut out = Vec::new();
+        // validate, then charge, then copy: nothing is allocated for a value that is not whole
+        let mut total = 0usize;
+        for s in &p.segs {
+            let n = match s {
+                Seg::Imm(b) => b.len(),
+                Seg::At(off, len) => {
+                    let start = usize::try_from(*off).map_err(|_| "value offset too large")?;
+                    let len = usize::try_from(*len).map_err(|_| "bad value length")?;
+                    slice(self.data, start, len).ok_or("a value lies outside the file")?;
+                    len
+                }
+            };
+            total = total.checked_add(n).ok_or("bad value length")?;
+        }
+        if total > self.budget.get() {
+            self.exhausted.set(true);
+            return Err("the file asks for more data than it can hold".into());
+        }
+        self.budget.set(self.budget.get() - total);
+        let mut out = Vec::with_capacity(total);
         for s in &p.segs {
             match s {
                 Seg::Imm(b) => out.extend_from_slice(b),
                 Seg::At(off, len) => {
-                    let start = usize::try_from(*off).map_err(|_| "value offset too large")?;
-                    let b =
-                        self.data.get(start..start.checked_add(*len as usize).ok_or("bad value length")?).ok_or("a value lies outside the file")?;
-                    out.extend_from_slice(b);
+                    let b = usize::try_from(*off).ok().zip(usize::try_from(*len).ok()).and_then(|(start, len)| slice(self.data, start, len));
+                    out.extend_from_slice(b.ok_or("a value lies outside the file")?);
                 }
             }
         }
@@ -337,22 +414,34 @@ impl<'a> Container<'a> {
 
     /// The first value of property `name` of `obj`.
     pub fn get(&self, obj: u32, name: &str) -> Option<Vec<u8>> {
-        let pid = self.id_of(name)?;
-        let p = self.objects.get(&obj)?.iter().find(|p| p.prop == pid)?;
+        self.get_id(obj, self.id_of(name)?)
+    }
+
+    fn get_id(&self, obj: u32, pid: u32) -> Option<Vec<u8>> {
+        let at = *self.index.get(&(obj, pid))?;
+        let p = self.objects.get(&obj)?.get(at)?;
         self.value(p).ok()
     }
 
     /// Resolve an object reference key of `obj` through its reference list.
     pub fn resolve(&self, obj: u32, key: u32) -> u32 {
-        if let Some(p) = self.objects.get(&obj).and_then(|v| v.iter().find(|p| p.prop == OBJ_REFERENCES))
-            && let Ok(v) = self.value(p)
-        {
-            for pair in v.as_chunks::<8>().0 {
-                if be32(pair, 0) == Some(key) {
-                    return be32(pair, 4).unwrap_or(key);
+        let map = self.ref_maps.borrow().get(&obj).cloned();
+        let map = match map {
+            Some(m) => m,
+            None => {
+                let mut m = HashMap::new();
+                if let Some(v) = self.get_id(obj, OBJ_REFERENCES) {
+                    for pair in v.chunks_exact(8) {
+                        if let (Some(k), Some(t)) = (be32(pair, 0), be32(pair, 4)) {
+                            m.entry(k).or_insert(t);
+                        }
+                    }
                 }
+                let m = Rc::new(m);
+                self.ref_maps.borrow_mut().insert(obj, Rc::clone(&m));
+                m
             }
-        }
-        key
+        };
+        map.get(&key).copied().unwrap_or(key)
     }
 }

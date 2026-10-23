@@ -6,6 +6,7 @@ use crate::ticks::{FrameRate, Tick};
 
 use super::ids::{cls, ddef, def, pid};
 use super::store::{self, Auid, Obj, Value, rational_of, utf16_of};
+use crate::bytes::slice;
 use crate::comp::{CClip, CItem, CKind, CMarker, CTrack, CTransition, Composition, Document, Gain, Source, units_to_ticks};
 use crate::{Error, Report, Result};
 
@@ -35,13 +36,13 @@ fn len_of(o: &Obj) -> i64 {
 
 /// The value of an indirect property: (type id, bytes).
 fn indirect(d: &[u8]) -> Option<(Auid, &[u8])> {
-    if d.len() >= 17 && (d[0] == 0x4C || d[0] == 0x42) {
-        return Some((d[1..17].try_into().ok()?, &d[17..]));
+    // a byte-order mark, then the type id and the value; or (older writers) no mark
+    if matches!(d.first(), Some(0x4C | 0x42))
+        && let (Some(ty), Some(v)) = (slice(d, 1, 16), d.get(17..))
+    {
+        return Some((ty.try_into().ok()?, v));
     }
-    if d.len() >= 16 {
-        return Some((d[..16].try_into().ok()?, &d[16..]));
-    }
-    None
+    Some((slice(d, 0, 16)?.try_into().ok()?, d.get(16..)?))
 }
 
 fn tagged_values(o: &Obj, p: u16) -> Vec<(String, String)> {
@@ -76,7 +77,21 @@ struct R<'a> {
     nests: HashMap<MobId, usize>,
     /// The compositions being read, outermost first.
     open: Vec<MobId>,
+    /// (mob, slot id) → slot: the first slot of a mob with that id.
+    slots: HashMap<(MobId, u32), &'a Obj>,
+    /// What a clip's (mob, slot, kind) resolved to, as (source index, offset added to the clip's
+    /// start): a file mob is walked once however many clips use it.
+    resolved: HashMap<(MobId, u32, CKind), Option<(usize, Tick)>>,
+    /// The markers of each master mob, read once.
+    master_markers: HashMap<MobId, Vec<CMarker>>,
+    /// Markers still allowed into the document (each copy counts).
+    marker_budget: usize,
+    /// Embedded essence bytes still allowed into the document (each copy counts).
+    embed_budget: usize,
 }
+
+/// Most markers read from one file.
+const MAX_MARKERS: usize = 200_000;
 
 /// Compositions nested deeper than this are read as gaps.
 const MAX_NESTING: usize = 16;
@@ -97,7 +112,31 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
             essence.insert(id, d);
         }
     }
-    let mut r = R { report, mobs, essence, doc: Document::default(), sources: HashMap::new(), nests: HashMap::new(), open: Vec::new() };
+    let mut slots = HashMap::new();
+    for (id, m) in &mobs {
+        for s in m.objs(pid::SLOTS) {
+            if let Some(n) = s.u32(pid::SLOT_ID) {
+                slots.entry((*id, n)).or_insert(s);
+            }
+        }
+    }
+    // a copy of essence per exposed channel is normal (a stereo file broken out to two mono
+    // sources); the budget is what a hostile file could multiply that into
+    let embed_budget = bytes.len().saturating_mul(8).saturating_add(16 << 20);
+    let mut r = R {
+        report,
+        mobs,
+        essence,
+        doc: Document::default(),
+        sources: HashMap::new(),
+        nests: HashMap::new(),
+        open: Vec::new(),
+        slots,
+        resolved: HashMap::new(),
+        master_markers: HashMap::new(),
+        marker_budget: MAX_MARKERS,
+        embed_budget,
+    };
     // Top-level compositions: those no other composition uses, among the ones tagged top-level
     // when any are. (Premiere Pro tags a nested sequence's composition top-level too; it is still
     // only a nested sequence.) Compositions that only use each other in a circle all count.
@@ -137,8 +176,12 @@ fn collect_refs(o: &Obj, out: &mut HashSet<MobId>) {
     }
 }
 
+/// The most a rate's numerator or denominator may be (real rates are 24000/1001 or 48000/1).
+const MAX_RATE_PART: i64 = 10_000_000;
+
+/// A positive rate of sane size, else `None` (a damaged file's rate counts as absent).
 fn rate_of(o: &Obj, p: u16) -> Option<(i64, i64)> {
-    o.rational(p).filter(|r| r.0 > 0 && r.1 > 0)
+    o.rational(p).filter(|r| (1..=MAX_RATE_PART).contains(&r.0) && (1..=MAX_RATE_PART).contains(&r.1))
 }
 
 impl R<'_> {
@@ -175,7 +218,8 @@ impl R<'_> {
             let Some(seg) = s.strong(pid::SEGMENT) else { continue };
             if s.class == cls::EVENT_MOB_SLOT {
                 let er = rate_of(s, pid::EVENT_EDIT_RATE).unwrap_or(pic_rate);
-                comp.markers.extend(markers_of(seg, er));
+                let found = markers_of(seg, er);
+                comp.markers.extend(self.admit_markers(found));
                 continue;
             }
             let er = rate_of(s, pid::EDIT_RATE).unwrap_or(pic_rate);
@@ -190,7 +234,7 @@ impl R<'_> {
                 kind @ (DataKind::Picture | DataKind::Sound) => {
                     let ckind = if kind == DataKind::Picture { CKind::Picture } else { CKind::Sound };
                     if ckind == CKind::Sound && sample_rate == 0 && er.1 == 1 && er.0 >= 8000 {
-                        sample_rate = er.0 as u32;
+                        sample_rate = u32::try_from(er.0).unwrap_or(0);
                     }
                     // Premiere Pro writes every video track into one slot: a nested scope with a
                     // segment per track, the lowest track first. (A scope whose last segment
@@ -256,6 +300,16 @@ impl R<'_> {
         comp
     }
 
+    /// `found` cut to what the marker budget still allows.
+    fn admit_markers(&mut self, mut found: Vec<CMarker>) -> Vec<CMarker> {
+        if found.len() > self.marker_budget {
+            found.truncate(self.marker_budget);
+            self.report.warn("markers beyond the import limit were dropped");
+        }
+        self.marker_budget = self.marker_budget.saturating_sub(found.len());
+        found
+    }
+
     /// Items of a segment (a sequence or a single component).
     fn segment(&mut self, seg: &Obj, rate: (i64, i64), kind: CKind, depth: usize) -> Vec<CItem> {
         if depth > 32 {
@@ -276,7 +330,7 @@ impl R<'_> {
         let len = units_to_ticks(len_of(c), rate.0, rate.1);
         match c.class {
             x if x == cls::FILLER => vec![CItem::Filler(len)],
-            x if x == cls::SOURCE_CLIP => vec![self.clip(c, rate, kind, None)],
+            x if x == cls::SOURCE_CLIP => vec![self.clip(c, rate, kind)],
             x if x == cls::SEQUENCE => self.segment(c, rate, kind, depth),
             x if x == cls::TRANSITION => {
                 let cut = units_to_ticks(c.i64(pid::CUT_POINT).unwrap_or(0), rate.0, rate.1);
@@ -371,7 +425,7 @@ impl R<'_> {
         None
     }
 
-    fn clip(&mut self, c: &Obj, rate: (i64, i64), kind: CKind, master_key: Option<String>) -> CItem {
+    fn clip(&mut self, c: &Obj, rate: (i64, i64), kind: CKind) -> CItem {
         let len = units_to_ticks(len_of(c), rate.0, rate.1);
         let start = units_to_ticks(c.i64(pid::START_TIME).unwrap_or(0), rate.0, rate.1);
         let name = tagged_values(c, pid::COMPONENT_USER_COMMENTS).into_iter().find(|(k, _)| k == "Clip Name").map(|(_, v)| v).unwrap_or_default();
@@ -382,7 +436,7 @@ impl R<'_> {
         if let Some(mob) = self.mobs.get(&id).copied().filter(|m| m.class == cls::COMPOSITION_MOB) {
             return self.nest_clip(c, mob, id, slot, rate, kind, name);
         }
-        match self.resolve(id, slot, start, kind, master_key, 0) {
+        match self.resolve(id, slot, start, kind) {
             Some((source, t)) => CItem::Clip(CClip { len, source, start: t, gain: None, name }),
             None => CItem::Filler(len),
         }
@@ -409,8 +463,7 @@ impl R<'_> {
             }
         };
         // the start counts edit units of the slot the clip points at
-        let slot_rate =
-            mob.objs(pid::SLOTS).iter().find(|s| s.u32(pid::SLOT_ID) == Some(slot_id)).and_then(|s| rate_of(s, pid::EDIT_RATE)).unwrap_or(rate);
+        let slot_rate = self.slots.get(&(id, slot_id)).and_then(|s| rate_of(s, pid::EDIT_RATE)).unwrap_or(rate);
         let start = units_to_ticks(c.i64(pid::START_TIME).unwrap_or(0), slot_rate.0, slot_rate.1);
         let skey = (id, if kind == CKind::Picture { 0 } else { 1 }, "composition".to_string());
         let source = match self.sources.get(&skey) {
@@ -458,8 +511,39 @@ impl R<'_> {
         CItem::Clip(CClip { len, source, start, gain: None, name })
     }
 
-    /// Follow a source reference to a file source mob: (source index, file time).
-    fn resolve(&mut self, id: MobId, slot_id: u32, start: Tick, kind: CKind, master_key: Option<String>, depth: usize) -> Option<(usize, Tick)> {
+    /// Follow a source reference to a file source mob: (source index, file time). A (mob, slot)
+    /// is walked once, however many clips use it.
+    fn resolve(&mut self, id: MobId, slot_id: u32, start: Tick, kind: CKind) -> Option<(usize, Tick)> {
+        let key = (id, slot_id, kind);
+        let (source, delta) = match self.resolved.get(&key) {
+            Some(r) => (*r)?,
+            None => {
+                // the chain of mobs only adds offsets to the start, so it is walked from zero
+                let r = self.walk(id, slot_id, Tick::ZERO, kind, None, 0);
+                self.resolved.insert(key, r);
+                r?
+            }
+        };
+        Some((source, start + delta))
+    }
+
+    /// The markers of a master mob (read once).
+    fn markers_of_master(&mut self, id: MobId, mob: &Obj, rate: (i64, i64)) -> Vec<CMarker> {
+        if let Some(m) = self.master_markers.get(&id) {
+            return m.clone();
+        }
+        let found: Vec<CMarker> = mob
+            .objs(pid::SLOTS)
+            .iter()
+            .filter(|s| s.class == cls::EVENT_MOB_SLOT)
+            .flat_map(|s| s.strong(pid::SEGMENT).map(|g| markers_of(g, rate_of(s, pid::EVENT_EDIT_RATE).unwrap_or(rate))).unwrap_or_default())
+            .collect();
+        let found = self.admit_markers(found);
+        self.master_markers.insert(id, found.clone());
+        found
+    }
+
+    fn walk(&mut self, id: MobId, slot_id: u32, start: Tick, kind: CKind, master_key: Option<String>, depth: usize) -> Option<(usize, Tick)> {
         if depth > 16 {
             return None;
         }
@@ -467,7 +551,7 @@ impl R<'_> {
             self.report.warn("a clip references a mob that is not in the file (imported as a gap)");
             return None;
         };
-        let slot = mob.objs(pid::SLOTS).iter().find(|s| s.u32(pid::SLOT_ID) == Some(slot_id))?;
+        let slot = self.slots.get(&(id, slot_id)).copied()?;
         let rate = rate_of(slot, pid::EDIT_RATE).unwrap_or((25, 1));
         let seg = slot.strong(pid::SEGMENT)?;
         if mob.class == cls::COMPOSITION_MOB {
@@ -483,18 +567,16 @@ impl R<'_> {
             if next == [0; 32] {
                 return None;
             }
-            let markers = mob
-                .objs(pid::SLOTS)
-                .iter()
-                .filter(|s| s.class == cls::EVENT_MOB_SLOT)
-                .flat_map(|s| s.strong(pid::SEGMENT).map(|g| markers_of(g, rate_of(s, pid::EVENT_EDIT_RATE).unwrap_or(rate))).unwrap_or_default())
-                .collect::<Vec<_>>();
-            let r = self.resolve(next, next_slot, start + inner, kind, Some(key), depth + 1)?;
-            let src = &mut self.doc.sources[r.0];
-            if src.markers.is_empty() {
-                src.markers = markers;
+            let r = self.walk(next, next_slot, start + inner, kind, Some(key), depth + 1)?;
+            if self.doc.sources.get(r.0).is_some_and(|s| s.markers.is_empty()) {
+                let found = self.markers_of_master(id, mob, rate);
+                let found = self.admit_markers(found);
+                if let Some(src) = self.doc.sources.get_mut(r.0) {
+                    src.markers = found;
+                }
             }
-            if src.name.is_empty()
+            if let Some(src) = self.doc.sources.get_mut(r.0)
+                && src.name.is_empty()
                 && let Some(n) = mob.string(pid::MOB_NAME)
             {
                 src.name = n;
@@ -525,9 +607,9 @@ impl R<'_> {
             .map(|l| units_to_ticks(l, file_rate.0, file_rate.1))
             .unwrap_or_else(|| units_to_ticks(len_of(seg), rate.0, rate.1));
         let sound_slots = mob.objs(pid::SLOTS).iter().filter(|s| s.strong(pid::SEGMENT).is_some_and(|g| data_kind(g) == DataKind::Sound)).count();
-        let file_channels = d.u32(pid::CHANNELS).unwrap_or(1).max(1);
+        let file_channels = d.u32(pid::CHANNELS).unwrap_or(1).clamp(1, MAX_CHANNELS);
         let channel = (seg_kind == CKind::Sound && file_channels > 1 && sound_slots > 1)
-            .then(|| slot.u32(pid::PHYSICAL_TRACK_NUMBER).unwrap_or(slot_id).saturating_sub(1).min(file_channels - 1));
+            .then(|| slot.u32(pid::PHYSICAL_TRACK_NUMBER).unwrap_or(slot_id).saturating_sub(1).min(file_channels.saturating_sub(1)));
         let mut layout = d.u8(pid::FRAME_LAYOUT).unwrap_or(0);
         if layout > 4 {
             layout = 0;
@@ -541,11 +623,11 @@ impl R<'_> {
             let tslot = tape.objs(pid::SLOTS).iter().find_map(|s| {
                 let g = s.strong(pid::SEGMENT)?;
                 let t = find_class(g, cls::TIMECODE)?;
-                Some((t.i64(pid::TC_START).unwrap_or(0), t.u16(pid::TC_FPS).unwrap_or(25).max(1) as i64, rate_of(s, pid::EDIT_RATE)))
+                Some((t.i64(pid::TC_START).unwrap_or(0), i64::from(t.u16(pid::TC_FPS).unwrap_or(25).max(1)), rate_of(s, pid::EDIT_RATE)))
             })?;
             let off = units_to_ticks(clip.i64(pid::START_TIME).unwrap_or(0), rate.0, rate.1);
             let tcr = tslot.2.map(|r| FrameRate::new(r.0, r.1)).unwrap_or_else(|| FrameRate::new(tslot.1, 1));
-            Some((tslot.0 + tcr.frame_at(off), tcr))
+            Some((tslot.0.saturating_add(tcr.frame_at(off)), tcr))
         });
         let mut s = Source {
             key,
@@ -555,15 +637,15 @@ impl R<'_> {
             channel,
             channels: if channel.is_some() { 1 } else { file_channels },
             file_channels,
-            width: d.u32(pid::STORED_WIDTH).unwrap_or(0),
-            height: if matches!(layout, 1 | 3) { stored_h.saturating_mul(2) } else { stored_h },
+            width: d.u32(pid::STORED_WIDTH).unwrap_or(0).min(MAX_DIMENSION),
+            height: if matches!(layout, 1 | 3) { stored_h.saturating_mul(2) } else { stored_h }.min(MAX_DIMENSION),
             frame_rate: if seg_kind == CKind::Picture { fr } else { FrameRate::FPS_25 },
             sample_rate: d
                 .rational(pid::AUDIO_SAMPLING_RATE)
                 .filter(|r| r.1 > 0 && r.0 > 0)
-                .map(|r| (r.0 / r.1) as u32)
-                .unwrap_or(file_rate.0 as u32),
-            bits: d.u32(pid::QUANTIZATION_BITS).unwrap_or(16).clamp(8, 32) as u16,
+                .and_then(|r| u32::try_from(r.0 / r.1).ok())
+                .unwrap_or_else(|| u32::try_from(file_rate.0).unwrap_or(0)),
+            bits: u16::try_from(d.u32(pid::QUANTIZATION_BITS).unwrap_or(16).clamp(8, 32)).unwrap_or(16),
             length,
             offset: Tick::ZERO,
             start_tc: tc.map(|t| t.0),
@@ -574,15 +656,17 @@ impl R<'_> {
         };
         if s.kind == CKind::Sound {
             s.frame_rate = FrameRate::FPS_25;
-            if let Some(data) = self.essence.get(&id) {
-                s.embedded = Some(data.to_vec());
+            if let Some(data) = self.essence.get(&id).copied() {
                 // embedded essence may be a whole WAVE / AIFF file
-                if let Some((pcm, ch, sr, bits)) = crate::wav::parse_wav(data) {
-                    s.embedded = Some(pcm);
-                    s.file_channels = ch as u32;
-                    s.channels = if s.channel.is_some() { 1 } else { ch as u32 };
-                    s.sample_rate = sr;
-                    s.bits = bits;
+                match crate::wav::parse_wav(data) {
+                    Some((pcm, ch, sr, bits)) => {
+                        s.file_channels = u32::from(ch).clamp(1, MAX_CHANNELS);
+                        s.channels = if s.channel.is_some() { 1 } else { s.file_channels };
+                        s.sample_rate = sr;
+                        s.bits = bits;
+                        s.embedded = self.admit_embedded(pcm);
+                    }
+                    None => s.embedded = self.admit_embedded(data.to_vec()),
                 }
             }
         }
@@ -595,29 +679,47 @@ impl R<'_> {
         self.sources.insert(skey, i);
         Some((i, start))
     }
+
+    /// `data` as a source's embedded essence, if the document may still take that many bytes.
+    fn admit_embedded(&mut self, data: Vec<u8>) -> Option<Vec<u8>> {
+        if data.len() > self.embed_budget {
+            self.report.warn("embedded audio beyond the import limit was not read");
+            return None;
+        }
+        self.embed_budget -= data.len();
+        Some(data)
+    }
 }
+
+/// Most channels a file or track may declare.
+const MAX_CHANNELS: u32 = 64;
+/// Largest picture width or height read.
+const MAX_DIMENSION: u32 = 65_536;
 
 /// Drop `t` from the front of a track's items (slot origin).
 fn trim_front(items: &mut Vec<CItem>, mut t: Tick) {
-    while t > Tick::ZERO && !items.is_empty() {
-        let l = items[0].len();
-        if matches!(items[0], CItem::Transition(_)) {
-            items.remove(0);
-            continue;
-        }
-        if l <= t {
-            items.remove(0);
-            t -= l;
-        } else {
-            match &mut items[0] {
-                CItem::Filler(x) => *x -= t,
-                CItem::Clip(c) => {
-                    c.len -= t;
-                    c.start += t;
-                }
-                CItem::Transition(_) => {}
+    // whole items that lie before `t` (a transition there has nothing left to overlap)
+    let mut cut = 0;
+    while t > Tick::ZERO {
+        match items.get(cut) {
+            None => break,
+            Some(CItem::Transition(_)) => cut += 1,
+            Some(item) if item.len() <= t => {
+                t -= item.len();
+                cut += 1;
             }
-            t = Tick::ZERO;
+            Some(_) => break,
+        }
+    }
+    items.drain(..cut);
+    if t > Tick::ZERO {
+        match items.first_mut() {
+            Some(CItem::Filler(x)) => *x -= t,
+            Some(CItem::Clip(c)) => {
+                c.len -= t;
+                c.start += t;
+            }
+            _ => {}
         }
     }
 }

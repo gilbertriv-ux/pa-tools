@@ -1,9 +1,22 @@
 //! Minimal WAVE (RIFF) and AIFF containers for audio essence embedded in AAF / OMF documents.
 //! PCM inside the model is interleaved little-endian signed integers (8-bit unsigned for WAVE).
 
+use crate::bytes::{be16, be32, le16, le32, slice};
+
+/// Bit depths the containers here carry.
+fn bits_ok(bits: u16) -> bool {
+    matches!(bits, 8 | 16 | 24 | 32)
+}
+
+/// `n` as a `u32` field, saturating (a size field that cannot hold a huge source says so
+/// by being full, instead of wrapping).
+fn field(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// A complete WAVE file around little-endian PCM.
 pub fn wav_file(pcm: &[u8], channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
-    let mut v = wav_header(pcm.len() as u32, channels, sample_rate, bits);
+    let mut v = wav_header(field(pcm.len()), channels, sample_rate, bits);
     v.extend_from_slice(pcm);
     if pcm.len() % 2 == 1 {
         v.push(0);
@@ -13,7 +26,7 @@ pub fn wav_file(pcm: &[u8], channels: u16, sample_rate: u32, bits: u16) -> Vec<u
 
 /// The RIFF header of a WAVE file up to and including the `data` chunk header.
 pub fn wav_header(data_len: u32, channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
-    let block = channels.max(1) * bits.div_ceil(8);
+    let block = channels.max(1).saturating_mul(bits.div_ceil(8));
     let mut v = Vec::with_capacity(44);
     v.extend_from_slice(b"RIFF");
     // Saturating: a huge source (data_len saturated by the caller) must not overflow.
@@ -23,7 +36,7 @@ pub fn wav_header(data_len: u32, channels: u16, sample_rate: u32, bits: u16) -> 
     v.extend_from_slice(&1u16.to_le_bytes());
     v.extend_from_slice(&channels.max(1).to_le_bytes());
     v.extend_from_slice(&sample_rate.to_le_bytes());
-    v.extend_from_slice(&sample_rate.saturating_mul(block as u32).to_le_bytes());
+    v.extend_from_slice(&sample_rate.saturating_mul(u32::from(block)).to_le_bytes());
     v.extend_from_slice(&block.to_le_bytes());
     v.extend_from_slice(&bits.to_le_bytes());
     v.extend_from_slice(b"data");
@@ -31,23 +44,42 @@ pub fn wav_header(data_len: u32, channels: u16, sample_rate: u32, bits: u16) -> 
     v
 }
 
+/// The chunks of a RIFF / IFF body as (id, body) where the body is cut at the end of the file (a
+/// chunk whose declared size runs past it is truncated, as writers that were interrupted leave
+/// them). Iteration ends at the first header that does not fit.
+fn chunks(b: &[u8], start: usize, be: bool) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut at = Some(start);
+    std::iter::from_fn(move || {
+        let pos = at?;
+        let id = slice(b, pos, 4)?;
+        let len = usize::try_from(if be { be32(b, pos.checked_add(4)?)? } else { le32(b, pos.checked_add(4)?)? }).ok()?;
+        let body_at = pos.checked_add(8)?;
+        let body = b.get(body_at..body_at.saturating_add(len).min(b.len()))?;
+        // chunks are padded to an even length
+        at = body_at.checked_add(len).and_then(|n| n.checked_add(len & 1));
+        Some((id, body))
+    })
+}
+
 /// PCM, channels, sample rate and bits of a WAVE file (integer PCM only).
 pub fn parse_wav(b: &[u8]) -> Option<(Vec<u8>, u16, u32, u16)> {
-    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+    if slice(b, 0, 4)? != b"RIFF" || slice(b, 8, 4)? != b"WAVE" {
         return None;
     }
-    let mut at = 12;
     let mut fmt = None;
-    while at + 8 <= b.len() {
-        let id = &b[at..at + 4];
-        let len = u32::from_le_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
-        let body = &b[at + 8..(at + 8).saturating_add(len).min(b.len())];
+    for (id, body) in chunks(b, 12, false) {
         if id == b"fmt " && body.len() >= 16 {
-            let tag = u16::from_le_bytes([body[0], body[1]]);
-            let ch = u16::from_le_bytes([body[2], body[3]]);
-            let sr = u32::from_le_bytes(body[4..8].try_into().ok()?);
-            let bits = u16::from_le_bytes([body[14], body[15]]);
-            if tag != 1 && tag != 0xFFFE {
+            let tag = le16(body, 0)?;
+            let ch = le16(body, 2)?;
+            let sr = le32(body, 4)?;
+            let bits = le16(body, 14)?;
+            // an extensible format names its real format (PCM is 1) in the sub-format id
+            let integer = match tag {
+                1 => true,
+                0xFFFE => le16(body, 24).is_none_or(|sub| sub == 1),
+                _ => false,
+            };
+            if !integer || ch == 0 || !bits_ok(bits) {
                 return None;
             }
             fmt = Some((ch, sr, bits));
@@ -55,7 +87,6 @@ pub fn parse_wav(b: &[u8]) -> Option<(Vec<u8>, u16, u32, u16)> {
             let (ch, sr, bits) = fmt?;
             return Some((body.to_vec(), ch, sr, bits));
         }
-        at = at.checked_add(8 + len + (len & 1))?;
     }
     None
 }
@@ -81,18 +112,20 @@ pub fn aiff_file(pcm: &[u8], channels: u16, sample_rate: u32, bits: u16) -> Vec<
 
 /// The AIFF header up to the sound data (`FORM`, `COMM`, `SSND` with offset and block size).
 pub fn aiff_header(frames: u32, channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
-    let data_len = frames as usize * channels.max(1) as usize * bits.div_ceil(8) as usize;
+    // u64 so that no product overflows; the size fields then saturate
+    let data_len = u64::from(frames) * u64::from(channels.max(1)) * u64::from(bits.div_ceil(8));
+    let size = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
     let mut v = Vec::with_capacity(54);
     v.extend_from_slice(b"FORM");
-    v.extend_from_slice(&((4 + 26 + 16 + data_len + (data_len & 1)) as u32).to_be_bytes());
+    v.extend_from_slice(&size(4 + 26 + 16 + data_len + (data_len & 1)).to_be_bytes());
     v.extend_from_slice(b"AIFFCOMM");
     v.extend_from_slice(&18u32.to_be_bytes());
     v.extend_from_slice(&channels.max(1).to_be_bytes());
     v.extend_from_slice(&frames.to_be_bytes());
     v.extend_from_slice(&bits.to_be_bytes());
-    v.extend_from_slice(&extended(sample_rate as f64));
+    v.extend_from_slice(&extended(f64::from(sample_rate)));
     v.extend_from_slice(b"SSND");
-    v.extend_from_slice(&((8 + data_len) as u32).to_be_bytes());
+    v.extend_from_slice(&size(8 + data_len).to_be_bytes());
     v.extend_from_slice(&[0; 8]);
     v
 }
@@ -100,30 +133,29 @@ pub fn aiff_header(frames: u32, channels: u16, sample_rate: u32, bits: u16) -> V
 /// PCM (converted to little-endian), channels, sample rate and bits of an AIFF / AIFF-C (`NONE`
 /// / `twos` / `sowt`) file.
 pub fn parse_aiff(b: &[u8]) -> Option<(Vec<u8>, u16, u32, u16)> {
-    if b.len() < 12 || &b[..4] != b"FORM" || !(&b[8..12] == b"AIFF" || &b[8..12] == b"AIFC") {
+    if slice(b, 0, 4)? != b"FORM" || !matches!(slice(b, 8, 4)?, b"AIFF" | b"AIFC") {
         return None;
     }
-    let mut at = 12;
     let mut comm = None;
-    while at + 8 <= b.len() {
-        let id = &b[at..at + 4];
-        let len = u32::from_be_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
-        let body = &b[at + 8..(at + 8).saturating_add(len).min(b.len())];
+    for (id, body) in chunks(b, 12, true) {
         if id == b"COMM" && body.len() >= 18 {
-            let ch = u16::from_be_bytes([body[0], body[1]]);
-            let bits = u16::from_be_bytes([body[6], body[7]]);
-            let sr = from_extended(body[8..18].try_into().ok()?).round() as u32;
-            let little = body.len() >= 22 && &body[18..22] == b"sowt";
+            let ch = be16(body, 0)?;
+            let bits = be16(body, 6)?;
+            if ch == 0 || !bits_ok(bits) {
+                return None;
+            }
+            let sr = from_extended(crate::bytes::array::<10>(body, 8)?).round() as u32;
+            let little = slice(body, 18, 4).is_some_and(|c| c == b"sowt");
             comm = Some((ch, sr, bits, little));
         } else if id == b"SSND" && body.len() >= 8 {
             let (ch, sr, bits, little) = comm?;
-            let off = u32::from_be_bytes(body[..4].try_into().ok()?) as usize;
-            let data = body.get(8 + off..)?;
-            let bps = bits.div_ceil(8) as usize;
+            let off = usize::try_from(be32(body, 0)?).ok()?;
+            let data = body.get(off.checked_add(8)?..)?;
+            let bps = usize::from(bits.div_ceil(8)).max(1);
             let mut pcm = Vec::with_capacity(data.len());
-            for s in data.chunks_exact(bps.max(1)) {
+            for s in data.chunks_exact(bps) {
                 if bps == 1 {
-                    pcm.push(s[0] ^ 0x80);
+                    pcm.extend(s.iter().map(|x| x ^ 0x80));
                 } else if little {
                     pcm.extend_from_slice(s);
                 } else {
@@ -132,27 +164,26 @@ pub fn parse_aiff(b: &[u8]) -> Option<(Vec<u8>, u16, u32, u16)> {
             }
             return Some((pcm, ch, sr, bits));
         }
-        at = at.checked_add(8 + len + (len & 1))?;
     }
     None
 }
 
 /// 80-bit IEEE 754 extended (AIFF sample rates).
 fn extended(x: f64) -> [u8; 10] {
-    let mut out = [0u8; 10];
-    if x <= 0.0 {
-        return out;
+    if x <= 0.0 || !x.is_finite() {
+        return [0u8; 10];
     }
-    let e = x.log2().floor() as i32;
+    let e = x.log2().floor().clamp(-16383.0, 16383.0) as i32;
     let m = (x / 2f64.powi(e) * (1u64 << 63) as f64) as u64;
-    out[..2].copy_from_slice(&((e + 16383) as u16).to_be_bytes());
-    out[2..].copy_from_slice(&m.to_be_bytes());
-    out
+    let [e0, e1] = u16::try_from(e + 16383).unwrap_or(0).to_be_bytes();
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = m.to_be_bytes();
+    [e0, e1, m0, m1, m2, m3, m4, m5, m6, m7]
 }
 
 fn from_extended(b: [u8; 10]) -> f64 {
-    let e = (u16::from_be_bytes([b[0], b[1]]) & 0x7FFF) as i32;
-    let m = u64::from_be_bytes(b[2..10].try_into().unwrap_or([0; 8]));
+    let [e0, e1, m0, m1, m2, m3, m4, m5, m6, m7] = b;
+    let e = i32::from(u16::from_be_bytes([e0, e1]) & 0x7FFF);
+    let m = u64::from_be_bytes([m0, m1, m2, m3, m4, m5, m6, m7]);
     if e == 0 && m == 0 {
         return 0.0;
     }

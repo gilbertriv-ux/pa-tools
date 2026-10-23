@@ -12,11 +12,10 @@ use crate::{Error, Report, Result};
 pub(crate) type Uid = [u8; 12];
 
 pub(crate) fn uid(prefix: u32, major: u32, minor: u32) -> Uid {
-    let mut u = [0u8; 12];
-    u[..4].copy_from_slice(&prefix.to_be_bytes());
-    u[4..8].copy_from_slice(&major.to_be_bytes());
-    u[8..].copy_from_slice(&minor.to_be_bytes());
-    u
+    let [p0, p1, p2, p3] = prefix.to_be_bytes();
+    let [a0, a1, a2, a3] = major.to_be_bytes();
+    let [b0, b1, b2, b3] = minor.to_be_bytes();
+    [p0, p1, p2, p3, a0, a1, a2, a3, b0, b1, b2, b3]
 }
 
 struct W<'a> {
@@ -27,6 +26,8 @@ struct W<'a> {
     defs: Vec<u32>,
     report: &'a mut Report,
     inexact: bool,
+    /// The first limit the content ran into (reported when the file is finished).
+    error: Option<String>,
 }
 
 fn rational(n: i64, d: i64) -> Vec<u8> {
@@ -61,7 +62,11 @@ impl W<'_> {
         self.refs.entry(o).or_default().push(target);
     }
     fn refs(&mut self, o: u32, p: &str, targets: &[u32]) {
-        let mut v = (targets.len() as u16).to_be_bytes().to_vec();
+        let Ok(count) = u16::try_from(targets.len()) else {
+            self.error.get_or_insert_with(|| format!("{} objects in one OMF list (the limit is 65535)", targets.len()));
+            return;
+        };
+        let mut v = count.to_be_bytes().to_vec();
         for t in targets {
             v.extend_from_slice(&t.to_be_bytes());
         }
@@ -137,8 +142,9 @@ impl W<'_> {
         let t = self.obj(b"TCCP");
         self.cpnt(t, "omfi:data:Timecode", len);
         self.i32(t, "OMFI:TCCP:Start", "omfi:Position32", start);
-        self.b.set(t, "OMFI:TCCP:FPS", "omfi:UInt16", &(fps.clamp(1, u16::MAX as i64) as u16).to_be_bytes());
-        self.b.set(t, "OMFI:TCCP:Drop", "omfi:Boolean", &[drop as u8]);
+        let fps = u16::try_from(fps.clamp(1, i64::from(u16::MAX))).unwrap_or(25);
+        self.b.set(t, "OMFI:TCCP:FPS", "omfi:UInt16", &fps.to_be_bytes());
+        self.b.set(t, "OMFI:TCCP:Drop", "omfi:Boolean", &[u8::from(drop)]);
         t
     }
     fn value(&mut self, len: i64, g: &Gain, seg_len: i64, rate: (i64, i64), base: Tick) -> u32 {
@@ -170,7 +176,7 @@ impl W<'_> {
 }
 
 fn fnv(s: &[u8], h: u64) -> u64 {
-    s.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3))
+    s.iter().fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3))
 }
 
 fn amp(a: f64) -> Vec<u8> {
@@ -180,22 +186,41 @@ fn amp(a: f64) -> Vec<u8> {
 fn rate_of(s: &Source) -> (i64, i64) {
     match s.kind {
         CKind::Picture => (s.frame_rate.num, s.frame_rate.den),
-        CKind::Sound => (s.sample_rate.max(1) as i64, 1),
+        CKind::Sound => (i64::from(s.sample_rate.max(1)), 1),
     }
 }
 
+/// The error for a document that refers to something it does not contain (see `Document::check`).
+fn inconsistent() -> Error {
+    Error::Other("the document refers to something that is not in it".into())
+}
+
+/// The sound tracks' sample rate as an edit rate.
+fn sound_rate(comp: &crate::comp::Composition) -> (i64, i64) {
+    (i64::from(comp.sample_rate.max(1)), 1)
+}
+
 pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
+    doc.check()?;
     let comp = doc.compositions.first().ok_or(Error::Empty)?;
-    let mut w =
-        W { b: bento::Writer::new(), refs: HashMap::new(), ddefs: HashMap::new(), edefs: HashMap::new(), defs: Vec::new(), report, inexact: false };
+    let mut w = W {
+        b: bento::Writer::new(),
+        refs: HashMap::new(),
+        ddefs: HashMap::new(),
+        edefs: HashMap::new(),
+        defs: Vec::new(),
+        report,
+        inexact: false,
+        error: None,
+    };
     let mut seed = fnv(comp.name.as_bytes(), 0xCBF2_9CE4_8422_2325);
     for s in &doc.sources {
         seed = fnv(s.path.as_deref().unwrap_or("").as_bytes(), fnv(s.key.as_bytes(), seed));
     }
-    let major = (seed >> 32) as u32 ^ seed as u32;
+    let major = u32::try_from(seed >> 32).unwrap_or(0) ^ u32::try_from(seed & 0xFFFF_FFFF).unwrap_or(0);
     let mut minor = 0u32;
     let mut new_uid = || {
-        minor += 1;
+        minor = minor.wrapping_add(1);
         uid(0x5041_544C, major, minor)
     };
     let mut mobs = Vec::new();
@@ -213,26 +238,27 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
         }
     }
     for (_, members) in &groups {
-        let first = &doc.sources[members[0]];
+        let first = members.first().and_then(|&i| doc.sources.get(i)).ok_or_else(inconsistent)?;
+        let members_src: Vec<(usize, &Source)> = members.iter().filter_map(|&i| doc.sources.get(i).map(|s| (i, s))).collect();
         let master = new_uid();
-        let tc = members.iter().find_map(|&i| doc.sources[i].start_tc.map(|t| (t, doc.sources[i].tc_rate)));
+        let tc = members_src.iter().find_map(|(_, s)| s.start_tc.map(|t| (t, s.tc_rate)));
         let tape = new_uid();
         let mut tape_slots = Vec::new();
         if let Some((start, r)) = tc {
-            let len = members.iter().map(|&i| doc.sources[i].length).max().unwrap_or(Tick::ZERO);
+            let len = members_src.iter().map(|(_, s)| s.length).max().unwrap_or(Tick::ZERO);
             let l = w.u(len, (r.num, r.den));
             let t = w.tccp(l, start, r.timecode_base(), false);
             tape_slots.push(w.slot((r.num, r.den), t, 1, "TC1", 0));
         }
         let mut master_slots = Vec::new();
-        for (k, &si) in members.iter().enumerate() {
-            let s = &doc.sources[si];
+        for (k, &(si, s)) in members_src.iter().enumerate() {
+            let k32 = u32::try_from(k).map_err(|_| inconsistent())?;
             let rate = rate_of(s);
             let len = w.u(s.length, rate);
             // file mob
             let file = new_uid();
             let file_track = s.channel.map_or(1, |c| c + 1);
-            let tape_track = 2 + k as u32;
+            let tape_track = k32.saturating_add(2);
             let to_tape =
                 if tc.is_some() { w.sclp("omfi:data:Sound", len, tape, tape_track, 0) } else { w.sclp("omfi:data:Sound", len, uid(0, 0, 0), 0, 0) };
             let fslot = w.slot(rate, to_tape, file_track, &format!("A{file_track}"), file_track);
@@ -243,16 +269,16 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
             if let Some(pcm) = &s.embedded {
                 let md = w.obj(b"WAVE");
                 w.b.set(md, "OMFI:MDAT:MobID", "omfi:UID", &file);
-                w.b.set(md, "OMFI:WAVE:Data", "omfi:DataValue", &crate::wav::wav_file(pcm, s.file_channels.max(1) as u16, s.sample_rate, s.bits));
+                w.b.set(md, "OMFI:WAVE:Data", "omfi:DataValue", &crate::wav::wav_file(pcm, channels_u16(s), s.sample_rate, s.bits));
                 media_data.push(md);
             }
             if tc.is_some() {
                 let c = w.sclp("omfi:data:Sound", len, uid(0, 0, 0), 0, 0);
-                tape_slots.push(w.slot(rate, c, tape_track, &format!("A{}", k + 1), k as u32 + 1));
+                tape_slots.push(w.slot(rate, c, tape_track, &format!("A{}", k32.saturating_add(1)), k32.saturating_add(1)));
             }
             let mclip = w.sclp("omfi:data:Sound", len, file, file_track, 0);
-            master_slots.push(w.slot(rate, mclip, k as u32 + 1, &format!("A{}", k + 1), k as u32 + 1));
-            master_ref.insert(si, (master, k as u32 + 1));
+            master_slots.push(w.slot(rate, mclip, k32.saturating_add(1), &format!("A{}", k32.saturating_add(1)), k32.saturating_add(1)));
+            master_ref.insert(si, (master, k32.saturating_add(1)));
         }
         mobs.push(w.mob(b"MMOB", master, &first.name, &master_slots));
         if tc.is_some() {
@@ -276,7 +302,7 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
     let tcc = w.tccp(tl, comp.start_tc, comp.rate.timecode_base(), comp.drop);
     slots.push(w.slot(crate_rate, tcc, 1, "TC1", 0));
     for (track_id, t) in (2..).zip(comp.tracks.iter().filter(|t| t.kind == CKind::Sound)) {
-        let rate = (comp.sample_rate.max(1) as i64, 1);
+        let rate = sound_rate(comp);
         let mut comps = Vec::new();
         let mut cursor = Tick::ZERO;
         for it in &t.items {
@@ -364,39 +390,46 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
     w.refs(head, "OMFI:HEAD:DefinitionObjects", &defs);
     w.refs(head, "OMFI:HEAD:IdentificationList", &[ident]);
     let refs = std::mem::take(&mut w.refs);
-    let mut keys: Vec<_> = refs.keys().copied().collect();
-    keys.sort_unstable();
-    for k in keys {
-        let mut t = refs[&k].clone();
+    let mut lists: Vec<(u32, Vec<u32>)> = refs.into_iter().collect();
+    lists.sort_unstable_by_key(|(k, _)| *k);
+    for (k, mut t) in lists {
         t.sort_unstable();
         t.dedup();
         w.b.set_references(k, &t);
     }
-    Ok(w.b.finish())
+    if let Some(e) = w.error.take() {
+        return Err(Error::Other(e));
+    }
+    w.b.finish().map_err(Error::Other)
+}
+
+/// A file's channel count as the `u16` the container formats hold.
+fn channels_u16(s: &Source) -> u16 {
+    u16::try_from(s.file_channels.max(1)).unwrap_or(u16::MAX)
 }
 
 fn descriptor(w: &mut W, s: &Source, len: i64) -> u32 {
     let aiff = s.embedded.is_none() && s.path.as_deref().is_some_and(|p| matches!(crate::common::extension(p).as_str(), "aif" | "aiff" | "aifc"));
     let d = w.obj(if aiff { b"AIFD" } else { b"WAVD" });
-    w.b.set(d, "OMFI:MDFL:IsOMFI", "omfi:Boolean", &[s.embedded.is_some() as u8]);
+    w.b.set(d, "OMFI:MDFL:IsOMFI", "omfi:Boolean", &[u8::from(s.embedded.is_some())]);
     let r = rate_of(s);
     w.b.set(d, "OMFI:MDFL:SampleRate", "omfi:Rational", &rational(r.0, r.1));
     w.i32(d, "OMFI:MDFL:Length", "omfi:Length32", len);
-    let frames = len.max(0) as u32;
-    let bytes_per_frame = s.file_channels.max(1) * (s.bits as u32).div_ceil(8);
+    let frames = u32::try_from(len.max(0)).unwrap_or(u32::MAX);
+    let bytes_per_frame = s.file_channels.max(1).saturating_mul(u32::from(s.bits).div_ceil(8));
     if aiff {
-        w.b.set(d, "OMFI:AIFD:Summary", "omfi:DataValue", &crate::wav::aiff_header(frames, s.file_channels.max(1) as u16, s.sample_rate, s.bits));
+        w.b.set(d, "OMFI:AIFD:Summary", "omfi:DataValue", &crate::wav::aiff_header(frames, channels_u16(s), s.sample_rate, s.bits));
     } else {
         w.b.set(
             d,
             "OMFI:WAVD:Summary",
             "omfi:DataValue",
-            &crate::wav::wav_header(frames.saturating_mul(bytes_per_frame), s.file_channels.max(1) as u16, s.sample_rate, s.bits),
+            &crate::wav::wav_header(frames.saturating_mul(bytes_per_frame), channels_u16(s), s.sample_rate, s.bits),
         );
     }
     if let Some(p) = &s.path {
         let mut locs = Vec::new();
-        let dos = p.len() > 2 && p.as_bytes()[1] == b':';
+        let dos = p.len() > 2 && p.as_bytes().get(1) == Some(&b':');
         let l = w.obj(if dos { b"DOSL" } else { b"UNXL" });
         w.str(l, if dos { "OMFI:DOSL:PathName" } else { "OMFI:UNXL:PathName" }, p);
         locs.push(l);

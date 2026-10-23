@@ -23,6 +23,7 @@
 //! `referenced properties` (root stream): u8 byte order, u16 path count, u32 pid count, then the
 //! pids of each path (from the root object) terminated by a 0 pid.
 
+use crate::bytes::{le_i32, le_i64, le16, le32, slice};
 use soundcraft_cfb::{CompoundFile, EntryKind, NodeId, Version, Writer};
 
 pub(crate) type Auid = [u8; 16];
@@ -117,18 +118,14 @@ impl Obj {
         self.data(pid).and_then(|d| d.first().copied())
     }
     pub fn u16(&self, pid: u16) -> Option<u16> {
-        self.data(pid).filter(|d| d.len() >= 2).map(|d| u16::from_le_bytes([d[0], d[1]]))
+        self.data(pid).and_then(|d| le16(d, 0))
     }
     pub fn u32(&self, pid: u16) -> Option<u32> {
-        self.data(pid).filter(|d| d.len() >= 4).map(|d| u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
+        self.data(pid).and_then(|d| le32(d, 0))
     }
     pub fn i64(&self, pid: u16) -> Option<i64> {
         let d = self.data(pid)?;
-        match d.len() {
-            8.. => Some(i64::from_le_bytes(d[..8].try_into().ok()?)),
-            4..=7 => Some(i32::from_le_bytes(d[..4].try_into().ok()?) as i64),
-            _ => None,
-        }
+        le_i64(d, 0).or_else(|| le_i32(d, 0).map(i64::from))
     }
     pub fn rational(&self, pid: u16) -> Option<(i64, i64)> {
         self.data(pid).and_then(rational_of)
@@ -145,7 +142,7 @@ impl Obj {
 }
 
 pub(crate) fn rational_of(d: &[u8]) -> Option<(i64, i64)> {
-    (d.len() >= 8).then(|| (i32::from_le_bytes([d[0], d[1], d[2], d[3]]) as i64, i32::from_le_bytes([d[4], d[5], d[6], d[7]]) as i64))
+    Some((i64::from(le_i32(d, 0)?), i64::from(le_i32(d, 4)?)))
 }
 
 pub(crate) fn rational(num: i64, den: i64) -> Vec<u8> {
@@ -162,7 +159,12 @@ pub(crate) fn utf16z(s: &str) -> Vec<u8> {
 }
 
 pub(crate) fn utf16_of(d: &[u8]) -> String {
-    let u: Vec<u16> = d.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+    let u: Vec<u16> = d
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c.first().copied().unwrap_or(0), c.get(1).copied().unwrap_or(0)]))
+        .take_while(|&c| c != 0)
+        .take(crate::bytes::MAX_STRING)
+        .collect();
     String::from_utf16_lossy(&u)
 }
 
@@ -214,7 +216,7 @@ fn set_key_size(key_pid: u16) -> usize {
 
 fn storage_name(pid: u16) -> String {
     let suffix = format!("-{pid:x}");
-    let name: String = prop_name(pid).chars().take(22 - suffix.len()).collect();
+    let name: String = prop_name(pid).chars().take(22usize.saturating_sub(suffix.len())).collect();
     format!("{name}{suffix}")
 }
 
@@ -237,9 +239,9 @@ pub(crate) fn write(root: &Obj, version: Version) -> Result<Vec<u8>, String> {
     let mut w = W { cfb: Writer::new(version), paths: Vec::new() };
     w.obj(Writer::ROOT, root)?;
     let mut rp = vec![BYTE_ORDER_LE];
-    rp.extend_from_slice(&(w.paths.len() as u16).to_le_bytes());
-    let n: usize = w.paths.iter().map(|p| p.len() + 1).sum();
-    rp.extend_from_slice(&(n as u32).to_le_bytes());
+    rp.extend_from_slice(&u16::try_from(w.paths.len()).map_err(|_| "too many weak-reference paths".to_string())?.to_le_bytes());
+    let n: usize = w.paths.iter().map(|p| p.len().saturating_add(1)).fold(0usize, usize::saturating_add);
+    rp.extend_from_slice(&u32::try_from(n).map_err(|_| "weak-reference paths too long".to_string())?.to_le_bytes());
     for p in &w.paths {
         for pid in p {
             rp.extend_from_slice(&pid.to_le_bytes());
@@ -251,14 +253,15 @@ pub(crate) fn write(root: &Obj, version: Version) -> Result<Vec<u8>, String> {
 }
 
 impl W {
-    fn tag(&mut self, path: &[u16]) -> u16 {
-        match self.paths.iter().position(|p| p == path) {
-            Some(i) => i as u16,
+    fn tag(&mut self, path: &[u16]) -> Result<u16, String> {
+        let i = match self.paths.iter().position(|p| p == path) {
+            Some(i) => i,
             None => {
                 self.paths.push(path.to_vec());
-                (self.paths.len() - 1) as u16
+                self.paths.len() - 1
             }
-        }
+        };
+        u16::try_from(i).map_err(|_| "too many weak-reference paths".to_string())
     }
 
     fn obj(&mut self, node: NodeId, o: &Obj) -> Result<(), String> {
@@ -276,20 +279,21 @@ impl W {
                 }
                 Value::StrongVec(items) | Value::StrongSet(items, _) => {
                     let name = storage_name(pid);
+                    let count = u32::try_from(items.len()).map_err(|_| "collection too large".to_string())?;
                     let mut index = Vec::new();
-                    index.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                    index.extend_from_slice(&(items.len() as u32).to_le_bytes()); // first free key
+                    index.extend_from_slice(&count.to_le_bytes());
+                    index.extend_from_slice(&count.to_le_bytes()); // first free key
                     index.extend_from_slice(&u32::MAX.to_le_bytes()); // last free key
                     let set_key = if let Value::StrongSet(_, k) = v { Some(*k) } else { None };
                     let key_size = set_key.map(|k| items.first().and_then(|i| i.data(k)).map_or_else(|| set_key_size(k), <[u8]>::len)).unwrap_or(0);
                     if let Some(k) = set_key {
                         index.extend_from_slice(&k.to_le_bytes());
-                        index.push(key_size as u8);
+                        index.push(u8::try_from(key_size).map_err(|_| format!("set key of {key_size} bytes"))?);
                     }
                     for (i, item) in items.iter().enumerate() {
                         let s = self.cfb.storage(node, &format!("{name}{{{i:x}}}"), item.class).map_err(|e| e.to_string())?;
                         self.obj(s, item)?;
-                        index.extend_from_slice(&(i as u32).to_le_bytes());
+                        index.extend_from_slice(&u32::try_from(i).map_err(|_| "collection too large".to_string())?.to_le_bytes());
                         if let Some(k) = set_key {
                             index.extend_from_slice(&1u32.to_le_bytes());
                             let mut key = item.data(k).unwrap_or(&[]).to_vec();
@@ -301,20 +305,21 @@ impl W {
                     (if set_key.is_some() { SF_STRONG_SET } else { SF_STRONG_VECTOR }, utf16z(&name))
                 }
                 Value::Weak(path, key_pid, key) => {
-                    let mut d = self.tag(path).to_le_bytes().to_vec();
+                    let mut d = self.tag(path)?.to_le_bytes().to_vec();
                     d.extend_from_slice(&key_pid.to_le_bytes());
-                    d.push(key.len() as u8);
+                    d.push(u8::try_from(key.len()).map_err(|_| format!("weak key of {} bytes", key.len()))?);
                     d.extend_from_slice(key);
                     (SF_WEAK, d)
                 }
                 Value::WeakVec(path, key_pid, keys) => {
                     let name = storage_name(pid);
-                    let tag = self.tag(path);
+                    let tag = self.tag(path)?;
                     let size = keys.first().map_or(0, Vec::len);
-                    let mut index = (keys.len() as u32).to_le_bytes().to_vec();
+                    let count = u32::try_from(keys.len()).map_err(|_| "collection too large".to_string())?;
+                    let mut index = count.to_le_bytes().to_vec();
                     index.extend_from_slice(&tag.to_le_bytes());
                     index.extend_from_slice(&key_pid.to_le_bytes());
-                    index.push(size as u8);
+                    index.push(u8::try_from(size).map_err(|_| format!("weak key of {size} bytes"))?);
                     for k in keys {
                         let mut k = k.clone();
                         k.resize(size, 0);
@@ -337,11 +342,12 @@ impl W {
             entries.push((pid, sf, value));
         }
         let mut props = vec![BYTE_ORDER_LE, FORMAT_VERSION];
-        props.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        props.extend_from_slice(&u16::try_from(entries.len()).map_err(|_| "object with more than 65535 properties".to_string())?.to_le_bytes());
         for (pid, sf, v) in &entries {
             props.extend_from_slice(&pid.to_le_bytes());
             props.extend_from_slice(&sf.to_le_bytes());
-            props.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            // every value was checked against u16::MAX above
+            props.extend_from_slice(&u16::try_from(v.len()).map_err(|_| "property value too long".to_string())?.to_le_bytes());
         }
         for (_, _, v) in &entries {
             props.extend_from_slice(v);
@@ -355,64 +361,122 @@ impl W {
 // Reading
 // ---------------------------------------------------------------------------------------------
 
+/// What the reader will build from one file. The defaults come from the container itself (an
+/// object needs a directory entry of its own, so the entry count bounds the object count), with
+/// absolute ceilings for anything the file can still claim freely.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadLimits {
+    /// Deepest strong-reference nesting (real files stay under about 40).
+    pub max_depth: usize,
+    /// Most objects built.
+    pub max_objects: usize,
+    /// Most weak-reference paths in the `referenced properties` table.
+    pub max_paths: usize,
+    /// Longest weak-reference path, in property ids (real paths are about 4 deep).
+    pub max_path_len: usize,
+}
+
+/// Absolute ceilings, whatever the file size.
+pub(crate) const MAX_DEPTH: usize = 128;
+pub(crate) const MAX_OBJECTS: usize = 2_000_000;
+const MAX_PATHS: usize = 4096;
+const MAX_PATH_LEN: usize = 32;
+
+impl ReadLimits {
+    /// Limits for a container with `entries` directory entries.
+    pub fn for_entries(entries: usize) -> ReadLimits {
+        ReadLimits { max_depth: MAX_DEPTH, max_objects: entries.min(MAX_OBJECTS), max_paths: MAX_PATHS, max_path_len: MAX_PATH_LEN }
+    }
+}
+
 struct R<'a> {
     cf: CompoundFile<'a>,
     paths: Vec<Vec<u16>>,
+    /// Directory entries already used (storages and streams are each used once: an entry named by
+    /// two properties would otherwise be built twice, and a chain of such aliases multiplies).
+    claimed: Vec<bool>,
     objects: usize,
+    limits: ReadLimits,
 }
-
-const MAX_DEPTH: usize = 200;
-const MAX_OBJECTS: usize = 2_000_000;
 
 /// Parse the object tree of an AAF compound file (the root object).
 pub(crate) fn read(bytes: &[u8]) -> Result<Obj, String> {
     let cf = CompoundFile::open(bytes).map_err(|e| e.to_string())?;
-    let mut paths = Vec::new();
-    if let Ok(rp) = cf.read_path("referenced properties")
-        && rp.len() >= 7
-    {
-        let count = u16::from_le_bytes([rp[1], rp[2]]) as usize;
-        let mut cur = Vec::new();
-        for c in rp[7..].as_chunks::<2>().0 {
-            let pid = u16::from_le_bytes([c[0], c[1]]);
-            if pid == 0 {
-                paths.push(std::mem::take(&mut cur));
-                if paths.len() == count {
-                    break;
-                }
-            } else {
-                cur.push(pid);
-            }
-        }
-    }
-    let mut r = R { cf, paths, objects: 0 };
+    let limits = ReadLimits::for_entries(cf.entries.len());
+    let paths = read_paths(&cf, &limits)?;
+    let claimed = vec![false; cf.entries.len()];
+    let mut r = R { cf, paths, claimed, objects: 0, limits };
     r.obj(0, 0)
 }
 
-fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
-    b.get(at..at + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
-}
-fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
-    b.get(at..at + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+/// The `referenced properties` table: the path of property ids from the root to each weakly
+/// referenced collection. A missing or short table gives no paths (weak references then resolve
+/// to nothing); an oversized one is an error.
+fn read_paths(cf: &CompoundFile<'_>, limits: &ReadLimits) -> Result<Vec<Vec<u16>>, String> {
+    let mut paths = Vec::new();
+    let Ok(rp) = cf.read_path("referenced properties") else {
+        return Ok(paths);
+    };
+    let (Some(count), Some(body)) = (le16(&rp, 1), rp.get(7..)) else {
+        return Ok(paths);
+    };
+    let count = usize::from(count);
+    if count > limits.max_paths {
+        return Err(bad(format!("{count} weak-reference paths (the limit is {})", limits.max_paths)));
+    }
+    let mut cur = Vec::new();
+    for c in body.chunks_exact(2) {
+        let pid = u16::from_le_bytes([c.first().copied().unwrap_or(0), c.get(1).copied().unwrap_or(0)]);
+        if pid == 0 {
+            paths.push(std::mem::take(&mut cur));
+            if paths.len() == count {
+                break;
+            }
+        } else {
+            if cur.len() >= limits.max_path_len {
+                return Err(bad(format!("a weak-reference path longer than {} properties", limits.max_path_len)));
+            }
+            cur.push(pid);
+        }
+    }
+    Ok(paths)
 }
 
 impl R<'_> {
-    fn child(&self, parent: usize, name: &str) -> Result<usize, String> {
-        self.cf.child(parent, name).ok_or_else(|| bad(format!("missing storage or stream \"{name}\"")))
+    /// Use directory entry `id` (once).
+    fn claim(&mut self, id: usize) -> Result<(), String> {
+        match self.claimed.get_mut(id) {
+            Some(c) if !*c => {
+                *c = true;
+                Ok(())
+            }
+            Some(_) => Err(bad("a storage or stream is referenced twice")),
+            None => Err(bad("bad directory entry")),
+        }
     }
 
-    fn stream(&self, parent: usize, name: &str) -> Result<Vec<u8>, String> {
+    /// The (unused) child entry of `parent` called `name`.
+    fn child(&mut self, parent: usize, name: &str) -> Result<usize, String> {
+        let id = self.cf.child(parent, name).ok_or_else(|| bad(format!("missing storage or stream \"{name}\"")))?;
+        self.claim(id)?;
+        Ok(id)
+    }
+
+    fn stream(&mut self, parent: usize, name: &str) -> Result<Vec<u8>, String> {
         let id = self.child(parent, name)?;
         self.cf.read(id).map_err(|e| e.to_string())
     }
 
     fn obj(&mut self, entry: usize, depth: usize) -> Result<Obj, String> {
-        if depth > MAX_DEPTH {
+        if depth > self.limits.max_depth {
             return Err(bad("objects nested too deeply"));
         }
-        self.objects += 1;
-        if self.objects > MAX_OBJECTS {
+        self.objects = self.objects.saturating_add(1);
+        if self.objects > self.limits.max_objects {
             return Err(bad("too many objects"));
+        }
+        if depth == 0 {
+            self.claim(entry)?;
         }
         let e = self.cf.entry(entry).ok_or_else(|| bad("bad directory entry"))?;
         if !matches!(e.kind, EntryKind::Root | EntryKind::Storage) {
@@ -420,87 +484,103 @@ impl R<'_> {
         }
         let mut o = Obj::new(e.clsid);
         let props = self.stream(entry, "properties")?;
-        if props.len() < 4 {
-            return Err(bad("short properties stream"));
+        if props.first() != Some(&BYTE_ORDER_LE) {
+            return Err(bad("not a little-endian properties stream (big-endian AAF files are not supported)"));
         }
-        if props[0] != BYTE_ORDER_LE {
-            return Err(bad("big-endian AAF files are not supported"));
-        }
-        let n = rd_u16(&props, 2).unwrap_or(0) as usize;
-        let mut at = 4 + n * 6;
-        if at > props.len() {
-            return Err(bad("truncated property index"));
-        }
-        for i in 0..n {
-            let (Some(pid), Some(sf), Some(len)) = (rd_u16(&props, 4 + i * 6), rd_u16(&props, 6 + i * 6), rd_u16(&props, 8 + i * 6)) else {
+        let n = usize::from(le16(&props, 2).ok_or_else(|| bad("short properties stream"))?);
+        // the index is `n` six-byte entries, and the values follow it
+        let table_end = n.checked_mul(6).and_then(|t| t.checked_add(4)).ok_or_else(|| bad("truncated property index"))?;
+        let table = props.get(4..table_end).ok_or_else(|| bad("truncated property index"))?;
+        let mut at = table_end;
+        for ent in table.chunks_exact(6) {
+            let (Some(pid), Some(sf), Some(len)) = (le16(ent, 0), le16(ent, 2), le16(ent, 4)) else {
                 return Err(bad("truncated property index"));
             };
-            let v = props.get(at..at + len as usize).ok_or_else(|| bad("truncated property value"))?;
-            at += len as usize;
-            let value = match sf {
-                SF_STRONG => {
-                    let c = self.child(entry, &utf16_of(v))?;
-                    Value::Strong(Box::new(self.obj(c, depth + 1)?))
-                }
-                SF_STRONG_VECTOR | SF_STRONG_SET => {
-                    let name = utf16_of(v);
-                    let idx = self.stream(entry, &format!("{name} index"))?;
-                    let count = rd_u32(&idx, 0).ok_or_else(|| bad("short collection index"))? as usize;
-                    let mut items = Vec::new();
-                    if sf == SF_STRONG_VECTOR {
-                        for k in 0..count {
-                            let key = rd_u32(&idx, 12 + k * 4).ok_or_else(|| bad("short vector index"))?;
-                            let c = self.child(entry, &format!("{name}{{{key:x}}}"))?;
-                            items.push(self.obj(c, depth + 1)?);
-                        }
-                        Value::StrongVec(items)
-                    } else {
-                        let key_pid = rd_u16(&idx, 12).ok_or_else(|| bad("short set index"))?;
-                        let key_size = *idx.get(14).ok_or_else(|| bad("short set index"))? as usize;
-                        let stride = 8 + key_size;
-                        for k in 0..count {
-                            let key = rd_u32(&idx, 15 + k * stride).ok_or_else(|| bad("short set index"))?;
-                            let c = self.child(entry, &format!("{name}{{{key:x}}}"))?;
-                            items.push(self.obj(c, depth + 1)?);
-                        }
-                        Value::StrongSet(items, key_pid)
-                    }
-                }
-                SF_WEAK => {
-                    let (Some(tag), Some(key_pid), Some(&size)) = (rd_u16(v, 0), rd_u16(v, 2), v.get(4)) else {
-                        return Err(bad("short weak reference"));
-                    };
-                    let key = v.get(5..5 + size as usize).ok_or_else(|| bad("short weak reference"))?.to_vec();
-                    Value::Weak(self.paths.get(tag as usize).cloned().unwrap_or_default(), key_pid, key)
-                }
-                SF_WEAK_VECTOR | SF_WEAK_SET => {
-                    let name = utf16_of(v);
-                    let idx = self.stream(entry, &format!("{name} index"))?;
-                    let (Some(count), Some(tag), Some(key_pid), Some(&size)) = (rd_u32(&idx, 0), rd_u16(&idx, 4), rd_u16(&idx, 6), idx.get(8)) else {
-                        return Err(bad("short weak collection index"));
-                    };
-                    let size = size as usize;
-                    if count > 0 && size == 0 {
-                        return Err(bad("zero-size weak collection key"));
-                    }
-                    // every key must lie in the index, so its length (not the count) bounds the loop
-                    if (count as usize).checked_mul(size).and_then(|n| n.checked_add(9)).is_none_or(|end| end > idx.len()) {
-                        return Err(bad("short weak collection index"));
-                    }
-                    let mut keys = Vec::new();
-                    for k in 0..count as usize {
-                        keys.push(idx.get(9 + k * size..9 + (k + 1) * size).ok_or_else(|| bad("short weak collection index"))?.to_vec());
-                    }
-                    Value::WeakVec(self.paths.get(tag as usize).cloned().unwrap_or_default(), key_pid, keys)
-                }
-                SF_DATA_STREAM => {
-                    let name = utf16_of(v.get(1..).unwrap_or(&[]));
-                    Value::Stream(self.stream(entry, &name)?)
-                }
-                _ => Value::Data(v.to_vec()),
-            };
+            let end = at.checked_add(usize::from(len)).ok_or_else(|| bad("truncated property value"))?;
+            let v = props.get(at..end).ok_or_else(|| bad("truncated property value"))?;
+            at = end;
+            let value = self.value(entry, depth, sf, v)?;
             o.props.push((pid, value));
         }
         Ok(o)
+    }
+
+    /// One property's value, given its stored form `sf` and stored bytes `v`.
+    fn value(&mut self, entry: usize, depth: usize, sf: u16, v: &[u8]) -> Result<Value, String> {
+        Ok(match sf {
+            SF_STRONG => {
+                let c = self.child(entry, &utf16_of(v))?;
+                Value::Strong(Box::new(self.obj(c, depth + 1)?))
+            }
+            SF_STRONG_VECTOR | SF_STRONG_SET => {
+                let name = utf16_of(v);
+                let idx = self.stream(entry, &format!("{name} index"))?;
+                let count =
+                    usize::try_from(le32(&idx, 0).ok_or_else(|| bad("short collection index"))?).map_err(|_| bad("short collection index"))?;
+                let mut items = Vec::new();
+                if sf == SF_STRONG_VECTOR {
+                    // `count` local keys follow the 12-byte header; the stream's length bounds the loop
+                    let keys = idx.get(12..).ok_or_else(|| bad("short vector index"))?;
+                    if count > keys.len() / 4 {
+                        return Err(bad("short vector index"));
+                    }
+                    for k in 0..count {
+                        let key = le32(keys, k.saturating_mul(4)).ok_or_else(|| bad("short vector index"))?;
+                        let c = self.child(entry, &format!("{name}{{{key:x}}}"))?;
+                        items.push(self.obj(c, depth + 1)?);
+                    }
+                    Value::StrongVec(items)
+                } else {
+                    let key_pid = le16(&idx, 12).ok_or_else(|| bad("short set index"))?;
+                    let key_size = usize::from(*idx.get(14).ok_or_else(|| bad("short set index"))?);
+                    // each entry is a u32 local key, a u32 reference count and the key bytes
+                    let stride = 8 + key_size;
+                    let body = idx.get(15..).ok_or_else(|| bad("short set index"))?;
+                    if count > body.len() / stride {
+                        return Err(bad("short set index"));
+                    }
+                    for k in 0..count {
+                        let key = le32(body, k.saturating_mul(stride)).ok_or_else(|| bad("short set index"))?;
+                        let c = self.child(entry, &format!("{name}{{{key:x}}}"))?;
+                        items.push(self.obj(c, depth + 1)?);
+                    }
+                    Value::StrongSet(items, key_pid)
+                }
+            }
+            SF_WEAK => {
+                let (Some(tag), Some(key_pid), Some(&size)) = (le16(v, 0), le16(v, 2), v.get(4)) else {
+                    return Err(bad("short weak reference"));
+                };
+                let key = slice(v, 5, usize::from(size)).ok_or_else(|| bad("short weak reference"))?.to_vec();
+                Value::Weak(self.paths.get(usize::from(tag)).cloned().unwrap_or_default(), key_pid, key)
+            }
+            SF_WEAK_VECTOR | SF_WEAK_SET => {
+                let name = utf16_of(v);
+                let idx = self.stream(entry, &format!("{name} index"))?;
+                let (Some(count), Some(tag), Some(key_pid), Some(&size)) = (le32(&idx, 0), le16(&idx, 4), le16(&idx, 6), idx.get(8)) else {
+                    return Err(bad("short weak collection index"));
+                };
+                let size = usize::from(size);
+                let count = usize::try_from(count).map_err(|_| bad("short weak collection index"))?;
+                if count > 0 && size == 0 {
+                    return Err(bad("zero-size weak collection key"));
+                }
+                // every key must lie in the index, so its length (not the count) bounds the loop
+                let body = idx.get(9..).ok_or_else(|| bad("short weak collection index"))?;
+                if size > 0 && count > body.len() / size {
+                    return Err(bad("short weak collection index"));
+                }
+                let mut keys = Vec::new();
+                for k in 0..count {
+                    keys.push(slice(body, k.saturating_mul(size), size).ok_or_else(|| bad("short weak collection index"))?.to_vec());
+                }
+                Value::WeakVec(self.paths.get(usize::from(tag)).cloned().unwrap_or_default(), key_pid, keys)
+            }
+            SF_DATA_STREAM => {
+                let name = utf16_of(v.get(1..).unwrap_or(&[]));
+                Value::Stream(self.stream(entry, &name)?)
+            }
+            _ => Value::Data(v.to_vec()),
+        })
     }
 }

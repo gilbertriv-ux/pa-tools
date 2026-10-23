@@ -103,9 +103,12 @@ impl FrameRate {
     /// Start tick of frame `f` (ceiling division, so `frame_at(tick_of(f)) == f`).
     pub fn tick_of(self, f: i64) -> Tick {
         let r = self.sane();
-        let n = i128::from(f) * i128::from(TICKS_PER_SECOND) * i128::from(r.den);
+        // i64 × 2^38 × i64 can pass i128: saturate (such a time is meaningless anyway)
+        let Some(n) = i128::from(f).checked_mul(i128::from(TICKS_PER_SECOND)).and_then(|x| x.checked_mul(i128::from(r.den))) else {
+            return Tick(if f < 0 { i64::MIN } else { i64::MAX });
+        };
         let d = i128::from(r.num);
-        Tick(clamp_i64(n.div_euclid(d) + i128::from(n.rem_euclid(d) != 0)))
+        Tick(clamp_i64(n.div_euclid(d).saturating_add(i128::from(n.rem_euclid(d) != 0))))
     }
 
     /// Timecode base (frames counted per timecode second): 30 for 29.97, 24 for 23.976.
