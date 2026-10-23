@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use filmcraft_time::{FrameRate, Tick};
+use crate::ticks::{FrameRate, Tick};
 
 use super::ids::{cls, ddef, def, pid};
 use super::store::{self, Auid, Obj, Value, rational_of, utf16_of};
@@ -154,13 +154,22 @@ impl R<'_> {
             .unwrap_or((25, 1));
         let rate = FrameRate::new(pic_rate.0, pic_rate.1);
         let tags = tagged_values(c, pid::MOB_USER_COMMENTS);
-        let tag = |n: &str| tags.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        let (mut width, mut height) = tag("FilmCraft Frame Size")
+        let tag = |n: &str| tags.iter().find(|(k, _)| crate::tags::aaf_is(k, n)).map(|(_, v)| v.clone());
+        let (mut width, mut height) = tag(crate::tags::FRAME_SIZE)
             .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))))
             .unwrap_or((0, 0));
-        let mut sample_rate = tag("FilmCraft Audio Sample Rate").and_then(|s| s.parse().ok()).unwrap_or(0u32);
-        let mut comp =
-            Composition { name, rate, sample_rate: 48_000, width: 1920, height: 1080, start_tc: 0, drop: false, tracks: Vec::new(), markers: Vec::new() };
+        let mut sample_rate = tag(crate::tags::AUDIO_SAMPLE_RATE).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+        let mut comp = Composition {
+            name,
+            rate,
+            sample_rate: 48_000,
+            width: 1920,
+            height: 1080,
+            start_tc: 0,
+            drop: false,
+            tracks: Vec::new(),
+            markers: Vec::new(),
+        };
         let (mut nv, mut na) = (0, 0);
         for s in slots {
             let Some(seg) = s.strong(pid::SEGMENT) else { continue };
@@ -273,11 +282,16 @@ impl R<'_> {
                 let cut = units_to_ticks(c.i64(pid::CUT_POINT).unwrap_or(0), rate.0, rate.1);
                 let og = c.strong(pid::OPERATION_GROUP);
                 let effect = og
-                    .and_then(|o| tagged_values(o, pid::COMPONENT_USER_COMMENTS).into_iter().find(|(k, _)| k == "FilmCraft Effect").map(|(_, v)| v))
+                    .and_then(|o| {
+                        tagged_values(o, pid::COMPONENT_USER_COMMENTS)
+                            .into_iter()
+                            .find(|(k, _)| crate::tags::aaf_is(k, crate::tags::EFFECT))
+                            .map(|(_, v)| v)
+                    })
                     .unwrap_or_else(|| {
                         let op = og.and_then(|o| o.weak_key(pid::OPERATION)).and_then(|k| <Auid>::try_from(k).ok());
                         match (kind, op) {
-                            (CKind::Sound, _) => "constant_power".into(),
+                            (CKind::Sound, _) => "equal_power".into(),
                             (_, Some(o)) if o == def::VIDEO_FADE_TO_BLACK => "dip_to_black".into(),
                             (_, Some(o)) if o == def::SMPTE_VIDEO_WIPE => "wipe".into(),
                             _ => "cross_dissolve".into(),
@@ -395,52 +409,52 @@ impl R<'_> {
             }
         };
         // the start counts edit units of the slot the clip points at
-        let slot_rate = mob.objs(pid::SLOTS).iter().find(|s| s.u32(pid::SLOT_ID) == Some(slot_id)).and_then(|s| rate_of(s, pid::EDIT_RATE)).unwrap_or(rate);
+        let slot_rate =
+            mob.objs(pid::SLOTS).iter().find(|s| s.u32(pid::SLOT_ID) == Some(slot_id)).and_then(|s| rate_of(s, pid::EDIT_RATE)).unwrap_or(rate);
         let start = units_to_ticks(c.i64(pid::START_TIME).unwrap_or(0), slot_rate.0, slot_rate.1);
         let skey = (id, if kind == CKind::Picture { 0 } else { 1 }, "composition".to_string());
-        let source =
-            match self.sources.get(&skey) {
-                Some(&i) => i,
-                None => {
-                    let Some(comp) = self.doc.nested.get(index) else { return CItem::Filler(len) };
-                    let length =
-                        comp.tracks
-                            .iter()
-                            .map(|t| {
-                                Tick(t.items.iter().fold(0i64, |a, i| {
-                                    if matches!(i, CItem::Transition(_)) { a.saturating_sub(i.len().0) } else { a.saturating_add(i.len().0) }
-                                }))
-                            })
-                            .max()
-                            .unwrap_or(Tick::ZERO);
-                    let channels = if kind == CKind::Sound { 2 } else { 0 };
-                    let s = Source {
-                        key: format!("composition:{}", hex(&id)),
-                        name: comp.name.clone(),
-                        kind,
-                        path: None,
-                        channel: None,
-                        channels,
-                        file_channels: channels,
-                        width: comp.width,
-                        height: comp.height,
-                        frame_rate: comp.rate,
-                        sample_rate: comp.sample_rate,
-                        bits: 16,
-                        length,
-                        offset: Tick::ZERO,
-                        start_tc: None,
-                        tc_rate: comp.rate,
-                        embedded: None,
-                        markers: Vec::new(),
-                        nested: Some(index),
-                    };
-                    let i = self.doc.sources.len();
-                    self.doc.sources.push(s);
-                    self.sources.insert(skey, i);
-                    i
-                }
-            };
+        let source = match self.sources.get(&skey) {
+            Some(&i) => i,
+            None => {
+                let Some(comp) = self.doc.nested.get(index) else { return CItem::Filler(len) };
+                let length = comp
+                    .tracks
+                    .iter()
+                    .map(|t| {
+                        Tick(t.items.iter().fold(0i64, |a, i| {
+                            if matches!(i, CItem::Transition(_)) { a.saturating_sub(i.len().0) } else { a.saturating_add(i.len().0) }
+                        }))
+                    })
+                    .max()
+                    .unwrap_or(Tick::ZERO);
+                let channels = if kind == CKind::Sound { 2 } else { 0 };
+                let s = Source {
+                    key: format!("composition:{}", hex(&id)),
+                    name: comp.name.clone(),
+                    kind,
+                    path: None,
+                    channel: None,
+                    channels,
+                    file_channels: channels,
+                    width: comp.width,
+                    height: comp.height,
+                    frame_rate: comp.rate,
+                    sample_rate: comp.sample_rate,
+                    bits: 16,
+                    length,
+                    offset: Tick::ZERO,
+                    start_tc: None,
+                    tc_rate: comp.rate,
+                    embedded: None,
+                    markers: Vec::new(),
+                    nested: Some(index),
+                };
+                let i = self.doc.sources.len();
+                self.doc.sources.push(s);
+                self.sources.insert(skey, i);
+                i
+            }
+        };
         CItem::Clip(CClip { len, source, start, gain: None, name })
     }
 
@@ -506,8 +520,10 @@ impl R<'_> {
         };
         let path = d.objs(pid::LOCATOR).iter().find_map(|l| l.string(pid::URL_STRING)).map(|u| crate::common::file_url_to_path(&u));
         let file_rate = rate_of(d, pid::SAMPLE_RATE).unwrap_or(rate);
-        let length =
-            d.i64(pid::FILE_LENGTH).map(|l| units_to_ticks(l, file_rate.0, file_rate.1)).unwrap_or_else(|| units_to_ticks(len_of(seg), rate.0, rate.1));
+        let length = d
+            .i64(pid::FILE_LENGTH)
+            .map(|l| units_to_ticks(l, file_rate.0, file_rate.1))
+            .unwrap_or_else(|| units_to_ticks(len_of(seg), rate.0, rate.1));
         let sound_slots = mob.objs(pid::SLOTS).iter().filter(|s| s.strong(pid::SEGMENT).is_some_and(|g| data_kind(g) == DataKind::Sound)).count();
         let file_channels = d.u32(pid::CHANNELS).unwrap_or(1).max(1);
         let channel = (seg_kind == CKind::Sound && file_channels > 1 && sound_slots > 1)
@@ -542,7 +558,11 @@ impl R<'_> {
             width: d.u32(pid::STORED_WIDTH).unwrap_or(0),
             height: if matches!(layout, 1 | 3) { stored_h.saturating_mul(2) } else { stored_h },
             frame_rate: if seg_kind == CKind::Picture { fr } else { FrameRate::FPS_25 },
-            sample_rate: d.rational(pid::AUDIO_SAMPLING_RATE).filter(|r| r.1 > 0 && r.0 > 0).map(|r| (r.0 / r.1) as u32).unwrap_or(file_rate.0 as u32),
+            sample_rate: d
+                .rational(pid::AUDIO_SAMPLING_RATE)
+                .filter(|r| r.1 > 0 && r.0 > 0)
+                .map(|r| (r.0 / r.1) as u32)
+                .unwrap_or(file_rate.0 as u32),
             bits: d.u32(pid::QUANTIZATION_BITS).unwrap_or(16).clamp(8, 32) as u16,
             length,
             offset: Tick::ZERO,
@@ -604,7 +624,9 @@ fn trim_front(items: &mut Vec<CItem>, mut t: Tick) {
 
 /// Make the items exactly `len` long (an operation group / selector is as long as itself).
 fn fit(items: &mut Vec<CItem>, len: Tick) {
-    let total = Tick(items.iter().fold(0i64, |a, i| if matches!(i, CItem::Transition(_)) { a.saturating_sub(i.len().0) } else { a.saturating_add(i.len().0) }));
+    let total = Tick(
+        items.iter().fold(0i64, |a, i| if matches!(i, CItem::Transition(_)) { a.saturating_sub(i.len().0) } else { a.saturating_add(i.len().0) }),
+    );
     if total == len || items.is_empty() {
         if items.is_empty() {
             items.push(CItem::Filler(len));

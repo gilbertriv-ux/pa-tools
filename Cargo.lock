@@ -3695,6 +3695,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-interchange"
+version = "0.11.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "soundcraft-audio-io",
+ "soundcraft-brand",
+ "soundcraft-cfb",
+ "soundcraft-model",
+ "soundcraft-time",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.11.0"
 dependencies = [

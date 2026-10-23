@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use filmcraft_time::Tick;
+use crate::ticks::Tick;
 
 use super::ids::{META_DICTIONARY, ROOT, cls, ddef, def, path, pid};
 use super::store::{self, Auid, Obj, Value, rational, utf16z};
@@ -35,7 +35,7 @@ pub(crate) fn fnv(s: &[u8], h: u64) -> u64 {
 }
 
 fn timestamp() -> Vec<u8> {
-    // 1970-01-01 00:00:00.00: FilmCraft writes reproducible files
+    // 1970-01-01 00:00:00.00: the same session always writes the same bytes
     let mut v = 1970i16.to_le_bytes().to_vec();
     v.extend_from_slice(&[1, 1, 0, 0, 0, 0]);
     v
@@ -172,7 +172,8 @@ pub(crate) fn write(doc: &Document, version: soundcraft_cfb::Version, report: &m
             // the file slot → tape mob
             let tape_slot_id = 2 + k as u32;
             let tc_units = 0i64;
-            let clip = source_clip(s.kind, len_units, if tc.is_some() { tape_id } else { [0; 32] }, if tc.is_some() { tape_slot_id } else { 0 }, tc_units);
+            let clip =
+                source_clip(s.kind, len_units, if tc.is_some() { tape_id } else { [0; 32] }, if tc.is_some() { tape_slot_id } else { 0 }, tc_units);
             if !files[fi].2.iter().any(|o| o.u32(pid::SLOT_ID) == Some(file_slot)) {
                 files[fi].2.push(timeline_slot(file_slot, &slot_name(s.kind, file_slot), file_slot, rate, clip));
             }
@@ -196,7 +197,8 @@ pub(crate) fn write(doc: &Document, version: soundcraft_cfb::Version, report: &m
             master_ref.insert(si, (master_id, master_slot));
         }
         // markers on the master mob (at the picture rate, else the first source's)
-        let marker_rate = members.iter().map(|&i| &doc.sources[i]).find(|s| s.kind == CKind::Picture).map(source_rate).unwrap_or_else(|| source_rate(first));
+        let marker_rate =
+            members.iter().map(|&i| &doc.sources[i]).find(|s| s.kind == CKind::Picture).map(source_rate).unwrap_or_else(|| source_rate(first));
         let markers: Vec<&CMarker> = members.iter().flat_map(|&i| doc.sources[i].markers.iter()).collect();
         if !markers.is_empty() {
             let mut uniq: Vec<CMarker> = markers.into_iter().cloned().collect();
@@ -225,8 +227,11 @@ pub(crate) fn write(doc: &Document, version: soundcraft_cfb::Version, report: &m
                     .with(pid::ESSENCE_DESCRIPTION, Value::Strong(Box::new(desc))),
             );
             if let Some(data) = &s.embedded {
-                essence
-                    .push(Obj::new(cls::ESSENCE_DATA).data_prop(pid::ESSENCE_MOB_ID, file_id.to_vec()).with(pid::ESSENCE_STREAM, Value::Stream(data.clone())));
+                essence.push(
+                    Obj::new(cls::ESSENCE_DATA)
+                        .data_prop(pid::ESSENCE_MOB_ID, file_id.to_vec())
+                        .with(pid::ESSENCE_STREAM, Value::Stream(data.clone())),
+                );
             }
         }
         if tc.is_some() {
@@ -273,7 +278,9 @@ pub(crate) fn write(doc: &Document, version: soundcraft_cfb::Version, report: &m
 
     // ---- dictionary
     let mut ddefs = Vec::new();
-    for (id, name) in [(ddef::PICTURE, "Picture"), (ddef::SOUND, "Sound"), (ddef::TIMECODE, "Timecode"), (ddef::DESCRIPTIVE_METADATA, "DescriptiveMetadata")] {
+    for (id, name) in
+        [(ddef::PICTURE, "Picture"), (ddef::SOUND, "Sound"), (ddef::TIMECODE, "Timecode"), (ddef::DESCRIPTIVE_METADATA, "DescriptiveMetadata")]
+    {
         ddefs.push(definition(cls::DATA_DEFINITION, id, name));
     }
     let mut opdefs = Vec::new();
@@ -333,12 +340,12 @@ pub(crate) fn write(doc: &Document, version: soundcraft_cfb::Version, report: &m
         content.set(pid::ESSENCE_DATA, Value::StrongSet(essence, pid::ESSENCE_MOB_ID));
     }
     let ident = Obj::new(cls::IDENTIFICATION)
-        .data_prop(pid::COMPANY_NAME, utf16z("FilmCraft"))
-        .data_prop(pid::PRODUCT_NAME, utf16z("FilmCraft"))
+        .data_prop(pid::COMPANY_NAME, utf16z(soundcraft_brand::VENDOR))
+        .data_prop(pid::PRODUCT_NAME, utf16z(soundcraft_brand::APP_NAME))
         .data_prop(pid::PRODUCT_VERSION_STRING, utf16z(env!("CARGO_PKG_VERSION")))
-        .data_prop(pid::PRODUCT_ID, super::ids::guid(0x46494C4D, 0x4352, 0x4146, *b"T-AAF-EP").to_vec())
+        .data_prop(pid::PRODUCT_ID, super::ids::guid(0x5041_544F, 0x4F4C, 0x532D, *b"AAF-EP\0\0").to_vec())
         .data_prop(pid::DATE, timestamp())
-        .data_prop(pid::PLATFORM, utf16z("FilmCraft"))
+        .data_prop(pid::PLATFORM, utf16z(soundcraft_brand::APP_NAME))
         .data_prop(pid::GENERATION_AUID, mob_id(seed, 0)[16..].to_vec());
     let header = Obj::new(cls::HEADER)
         .data_prop(pid::BYTE_ORDER, 0x4949i16.to_le_bytes().to_vec())
@@ -423,7 +430,9 @@ fn composition_mob(
                 CItem::Filler(l) => {
                     let n = w.u(cursor + *l, rate) - w.u(cursor, rate);
                     cursor += *l;
-                    comps.push(Obj::new(cls::FILLER).with(pid::DATA_DEFINITION, weak(path::DATA_DEFS, dd)).data_prop(pid::LENGTH, n.to_le_bytes().to_vec()));
+                    comps.push(
+                        Obj::new(cls::FILLER).with(pid::DATA_DEFINITION, weak(path::DATA_DEFS, dd)).data_prop(pid::LENGTH, n.to_le_bytes().to_vec()),
+                    );
                 }
                 CItem::Clip(c) => {
                     let n = w.u(cursor + c.len, rate) - w.u(cursor, rate);
@@ -490,7 +499,7 @@ fn composition_mob(
                         .with(pid::DATA_DEFINITION, weak(path::DATA_DEFS, dd))
                         .data_prop(pid::LENGTH, n.to_le_bytes().to_vec())
                         .with(pid::OPERATION, weak(path::OPERATION_DEFS, op))
-                        .with(pid::COMPONENT_USER_COMMENTS, Value::StrongVec(vec![tagged("FilmCraft Effect", &x.effect)]));
+                        .with(pid::COMPONENT_USER_COMMENTS, Value::StrongVec(vec![tagged(&crate::tags::aaf(crate::tags::EFFECT), &x.effect)]));
                     if op == def::VIDEO_DISSOLVE {
                         *uses_varying = true;
                         let pts = [(0, 0), (1, 1)]
@@ -552,8 +561,8 @@ fn composition_mob(
     mob.with(pid::SLOTS, Value::StrongVec(slots)).with(
         pid::MOB_USER_COMMENTS,
         Value::StrongVec(vec![
-            tagged("FilmCraft Frame Size", &format!("{}x{}", comp.width, comp.height)),
-            tagged("FilmCraft Audio Sample Rate", &comp.sample_rate.to_string()),
+            tagged(&crate::tags::aaf(crate::tags::FRAME_SIZE), &format!("{}x{}", comp.width, comp.height)),
+            tagged(&crate::tags::aaf(crate::tags::AUDIO_SAMPLE_RATE), &comp.sample_rate.to_string()),
         ]),
     )
 }

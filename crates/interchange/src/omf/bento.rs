@@ -30,7 +30,7 @@
 //! | 0xFF Padding | — | ignored |
 //!
 //! Object references (OMF's `omfi:ObjRef`) are 4-byte keys resolved through the referencing
-//! object's reference list (standard property 22: pairs of u32 key, u32 object id). FilmCraft
+//! object's reference list (standard property 22: pairs of u32 key, u32 object id). This crate
 //! uses the referenced object's id as the key.
 
 use std::collections::{BTreeMap, HashMap};
@@ -317,7 +317,8 @@ impl<'a> Container<'a> {
                 Seg::Imm(b) => out.extend_from_slice(b),
                 Seg::At(off, len) => {
                     let start = usize::try_from(*off).map_err(|_| "value offset too large")?;
-                    let b = self.data.get(start..start.checked_add(*len as usize).ok_or("bad value length")?).ok_or("a value lies outside the file")?;
+                    let b =
+                        self.data.get(start..start.checked_add(*len as usize).ok_or("bad value length")?).ok_or("a value lies outside the file")?;
                     out.extend_from_slice(b);
                 }
             }

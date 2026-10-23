@@ -60,7 +60,8 @@ pub fn parse_wav(b: &[u8]) -> Option<(Vec<u8>, u16, u32, u16)> {
     None
 }
 
-/// A complete AIFF file (big-endian PCM) from little-endian PCM.
+/// A complete AIFF file (big-endian PCM) from little-endian PCM (tests build files with it).
+#[cfg(test)]
 pub fn aiff_file(pcm: &[u8], channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
     let bps = bits.div_ceil(8) as usize;
     let frames = pcm.len() / (bps * channels.max(1) as usize).max(1);

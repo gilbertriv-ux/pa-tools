@@ -247,7 +247,7 @@ pub(crate) fn write(root: &Obj, version: Version) -> Result<Vec<u8>, String> {
         rp.extend_from_slice(&0u16.to_le_bytes());
     }
     w.cfb.stream(Writer::ROOT, "referenced properties", rp).map_err(|e| e.to_string())?;
-    Ok(w.cfb.finish())
+    w.cfb.finish().map_err(|e| e.to_string())
 }
 
 impl W {

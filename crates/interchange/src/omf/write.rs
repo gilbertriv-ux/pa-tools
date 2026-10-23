@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use filmcraft_time::Tick;
+use crate::ticks::Tick;
 
 use super::bento;
 use crate::comp::{CItem, CKind, Document, Gain, Source, ticks_to_units};
@@ -186,7 +186,8 @@ fn rate_of(s: &Source) -> (i64, i64) {
 
 pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
     let comp = doc.compositions.first().ok_or(Error::Empty)?;
-    let mut w = W { b: bento::Writer::new(), refs: HashMap::new(), ddefs: HashMap::new(), edefs: HashMap::new(), defs: Vec::new(), report, inexact: false };
+    let mut w =
+        W { b: bento::Writer::new(), refs: HashMap::new(), ddefs: HashMap::new(), edefs: HashMap::new(), defs: Vec::new(), report, inexact: false };
     let mut seed = fnv(comp.name.as_bytes(), 0xCBF2_9CE4_8422_2325);
     for s in &doc.sources {
         seed = fnv(s.path.as_deref().unwrap_or("").as_bytes(), fnv(s.key.as_bytes(), seed));
@@ -195,7 +196,7 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
     let mut minor = 0u32;
     let mut new_uid = || {
         minor += 1;
-        uid(0x464C_4D43, major, minor)
+        uid(0x5041_544C, major, minor)
     };
     let mut mobs = Vec::new();
     let mut media_data = Vec::new();
@@ -232,7 +233,8 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
             let file = new_uid();
             let file_track = s.channel.map_or(1, |c| c + 1);
             let tape_track = 2 + k as u32;
-            let to_tape = if tc.is_some() { w.sclp("omfi:data:Sound", len, tape, tape_track, 0) } else { w.sclp("omfi:data:Sound", len, uid(0, 0, 0), 0, 0) };
+            let to_tape =
+                if tc.is_some() { w.sclp("omfi:data:Sound", len, tape, tape_track, 0) } else { w.sclp("omfi:data:Sound", len, uid(0, 0, 0), 0, 0) };
             let fslot = w.slot(rate, to_tape, file_track, &format!("A{file_track}"), file_track);
             let desc = descriptor(&mut w, s, len);
             let fm = w.mob(b"SMOB", file, &s.name, &[fslot]);
@@ -292,7 +294,7 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
                     let start = w.u(c.start, rate);
                     let sc = w.sclp("omfi:data:Sound", n, mid, mtrack, start);
                     if !c.name.is_empty() {
-                        w.str(sc, "FilmCraft:SCLP:ClipName", &c.name);
+                        w.str(sc, &crate::tags::omf("SCLP", "ClipName"), &c.name);
                     }
                     let seg = match &c.gain {
                         Some(g) => {
@@ -325,7 +327,7 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
                     w.cpnt(e, "omfi:data:Sound", n);
                     w.r#ref(e, "OMFI:EFFE:EffectKind", kind);
                     w.refs(e, "OMFI:EFFE:EffectSlots", &[]);
-                    w.str(e, "FilmCraft:EFFE:EffectID", &x.effect);
+                    w.str(e, &crate::tags::omf("EFFE", "EffectID"), &x.effect);
                     let tr = w.obj(b"TRAN");
                     w.cpnt(tr, "omfi:data:Sound", n);
                     w.i32(tr, "OMFI:TRAN:CutPoint", "omfi:Position32", cut);
@@ -346,10 +348,10 @@ pub(crate) fn write(doc: &Document, report: &mut Report) -> Result<Vec<u8>> {
         w.report.info("some times are not on whole samples / frames and were rounded");
     }
     let ident = w.obj(b"IDNT");
-    w.str(ident, "OMFI:IDNT:CompanyName", "FilmCraft");
-    w.str(ident, "OMFI:IDNT:ProductName", "FilmCraft");
+    w.str(ident, "OMFI:IDNT:CompanyName", soundcraft_brand::VENDOR);
+    w.str(ident, "OMFI:IDNT:ProductName", soundcraft_brand::APP_NAME);
     w.str(ident, "OMFI:IDNT:ProductVersionString", env!("CARGO_PKG_VERSION"));
-    w.str(ident, "OMFI:IDNT:Platform", "FilmCraft");
+    w.str(ident, "OMFI:IDNT:Platform", soundcraft_brand::APP_NAME);
     w.b.set(ident, "OMFI:IDNT:Date", "omfi:TimeStamp", &[0, 0, 0, 0, 1]);
     let head = w.obj(b"HEAD");
     w.b.set(head, "OMFI:HEAD:ByteOrder", "omfi:Int16", &0x4D4Di16.to_be_bytes());

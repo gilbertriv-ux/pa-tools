@@ -1,25 +1,23 @@
 [package]
 name = "soundcraft-interchange"
-description = "FilmCraft interchange: CMX 3600 EDL, Final Cut Pro 7 XML (xmeml), FCPXML and OpenTimelineIO import/export"
+description = "AAF and OMF interchange: sessions in and out of post-production hand-offs (clean-room, no file I/O)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-filmcraft-time = { workspace = true }
-filmcraft-geom = { workspace = true }
-filmcraft-color = { workspace = true }
-filmcraft-media = { workspace = true }
-filmcraft-project = { workspace = true }
+soundcraft-audio-io = { workspace = true }
+soundcraft-brand = { workspace = true }
 soundcraft-cfb = { workspace = true }
+soundcraft-model = { workspace = true }
+soundcraft-time = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-roxmltree = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

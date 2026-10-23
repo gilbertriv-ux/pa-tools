@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use filmcraft_time::{FrameRate, Tick};
+use crate::ticks::{FrameRate, Tick};
 
 use super::bento::Container;
 use crate::comp::{CClip, CItem, CKind, CTrack, CTransition, Composition, Document, Gain, Source, units_to_ticks};
@@ -40,7 +40,8 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
         }
     }
     let md = r.refs(head, "OMFI:HEAD:MediaData");
-    let md = if md.is_empty() { c.objects.keys().copied().filter(|&o| matches!(class_of(o).as_ref(), Some(b"WAVE" | b"AIFC"))).collect() } else { md };
+    let md =
+        if md.is_empty() { c.objects.keys().copied().filter(|&o| matches!(class_of(o).as_ref(), Some(b"WAVE" | b"AIFC"))).collect() } else { md };
     for m in md {
         let Some(id) = r.uid(m, "OMFI:MDAT:MobID") else { continue };
         if let Some(d) = c.get(m, "OMFI:WAVE:Data") {
@@ -98,6 +99,10 @@ impl R<'_, '_> {
     }
     fn string(&self, o: u32, p: &str) -> Option<String> {
         self.c.get(o, p).map(|v| String::from_utf8_lossy(&v).trim_end_matches('\0').to_string())
+    }
+    /// A private property of this crate (`<prefix>:<class>:<field>`), else the same under the legacy prefix.
+    fn private_string(&self, o: u32, class: &str, field: &str) -> Option<String> {
+        self.string(o, &crate::tags::omf(class, field)).or_else(|| self.string(o, &crate::tags::omf_legacy(class, field)))
     }
     fn uid(&self, o: u32, p: &str) -> Option<Uid> {
         self.c.get(o, p).and_then(|v| v.get(..12).and_then(|b| b.try_into().ok()))
@@ -221,15 +226,18 @@ impl R<'_, '_> {
             b"SCLP" => vec![self.clip(seg, rate)],
             b"TRAN" => {
                 let cut = units_to_ticks(self.i32(seg, "OMFI:TRAN:CutPoint").unwrap_or(0), rate.0, rate.1);
-                let effect =
-                    self.r#ref(seg, "OMFI:TRAN:Effect").and_then(|e| self.string(e, "FilmCraft:EFFE:EffectID")).unwrap_or_else(|| "constant_power".into());
+                let effect = self
+                    .r#ref(seg, "OMFI:TRAN:Effect")
+                    .and_then(|e| self.private_string(e, "EFFE", "EffectID"))
+                    .unwrap_or_else(|| "equal_power".into());
                 vec![CItem::Transition(CTransition { len, cut: cut.clamp(Tick::ZERO, len), effect })]
             }
             b"EFFE" => {
                 let kind = self.r#ref(seg, "OMFI:EFFE:EffectKind").and_then(|k| self.string(k, "OMFI:EDEF:EffectID")).unwrap_or_default();
                 let slots = self.refs(seg, "OMFI:EFFE:EffectSlots");
-                let arg =
-                    |r: &Self, id: i64| slots.iter().copied().find(|&s| r.i32(s, "OMFI:ESLT:ArgID") == Some(id)).and_then(|s| r.r#ref(s, "OMFI:ESLT:ArgValue"));
+                let arg = |r: &Self, id: i64| {
+                    slots.iter().copied().find(|&s| r.i32(s, "OMFI:ESLT:ArgID") == Some(id)).and_then(|s| r.r#ref(s, "OMFI:ESLT:ArgValue"))
+                };
                 let Some(input) = arg(self, -1).or_else(|| arg(self, 1).filter(|_| kind != "omfi:effect:MonoAudioGain")) else {
                     return vec![CItem::Filler(len)];
                 };
@@ -279,7 +287,7 @@ impl R<'_, '_> {
     fn clip(&mut self, c: u32, rate: (i64, i64)) -> CItem {
         let len = units_to_ticks(self.len(c), rate.0, rate.1);
         let start = units_to_ticks(self.i32(c, "OMFI:SCLP:StartTime").unwrap_or(0), rate.0, rate.1);
-        let name = self.string(c, "FilmCraft:SCLP:ClipName").unwrap_or_default();
+        let name = self.private_string(c, "SCLP", "ClipName").unwrap_or_default();
         let (Some(id), Some(track)) = (self.uid(c, "OMFI:SCLP:SourceID"), self.u32(c, "OMFI:SCLP:SourceTrackID")) else { return CItem::Filler(len) };
         if id == [0; 12] {
             return CItem::Filler(len);
@@ -369,10 +377,17 @@ impl R<'_, '_> {
                     let (start_tc, fps, trate) = self.refs(tape, "OMFI:MOBJ:Slots").into_iter().find_map(|s| {
                         let g = self.r#ref(s, "OMFI:MSLT:Segment")?;
                         (self.class(g) == *b"TCCP").then(|| {
-                            (self.i32(g, "OMFI:TCCP:Start").unwrap_or(0), self.u16(g, "OMFI:TCCP:FPS").unwrap_or(25), self.rational(s, "OMFI:MSLT:EditRate"))
+                            (
+                                self.i32(g, "OMFI:TCCP:Start").unwrap_or(0),
+                                self.u16(g, "OMFI:TCCP:FPS").unwrap_or(25),
+                                self.rational(s, "OMFI:MSLT:EditRate"),
+                            )
                         })
                     })?;
-                    let tcr = trate.filter(|r| r.0 > 0 && r.1 > 0).map(|r| FrameRate::new(r.0, r.1)).unwrap_or_else(|| FrameRate::new(fps.max(1) as i64, 1));
+                    let tcr = trate
+                        .filter(|r| r.0 > 0 && r.1 > 0)
+                        .map(|r| FrameRate::new(r.0, r.1))
+                        .unwrap_or_else(|| FrameRate::new(fps.max(1) as i64, 1));
                     let off = units_to_ticks(self.i32(clip, "OMFI:SCLP:StartTime").unwrap_or(0), rate.0, rate.1);
                     Some((start_tc + tcr.frame_at(off), tcr))
                 });

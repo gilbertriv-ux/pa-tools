@@ -66,6 +66,11 @@ pub const UPSTREAM_URL: &str = "https://github.com/storytold/soundcraft";
 /// Copyright line for Windows file properties and package metadata.
 pub const LEGAL_COPYRIGHT: &str = "Copyright (c) GR8 ID YUZ.AI. Pa Tools is based on SoundCraft by the ArtCraft team (MIT OR Apache-2.0).";
 
+/// Prefix of the private tags and properties Pa Tools writes into AAF and OMF files (`"<prefix> Fade
+/// Shape"`, `"<prefix>:SCLP:ClipName"`). Other applications show them as plain metadata, and readers
+/// of our own files look for them by this name, so it stays fixed once files exist.
+pub const INTERCHANGE_PREFIX: &str = "PaTools";
+
 /// Windows window class of the CLAP plugin editor host window.
 pub const CLAP_EDITOR_CLASS: &str = "PaToolsClapEditor";
 /// Windows window class of the VST3 plugin editor host window.
@@ -143,6 +148,7 @@ mod tests {
             HOST_VENDOR,
             CLAP_EDITOR_CLASS,
             VST3_EDITOR_CLASS,
+            INTERCHANGE_PREFIX,
         ];
         for s in visible {
             let lower = s.to_lowercase();

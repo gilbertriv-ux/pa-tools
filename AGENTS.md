@@ -50,7 +50,7 @@ The crate names are upstream's and stay (`UPSTREAM.md`).
 |---|---|---|
 | L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi`, `soundcraft-cfb` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops; compound-file container (the AAF wrapper) |
 | L1 | `soundcraft-dsp` | Plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utility, instruments), offline processing, meters, FFT |
-| L2 | `soundcraft-model` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups) |
+| L2 | `soundcraft-model`, `soundcraft-interchange` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups); AAF/OMF hand-off files to and from it (no file I/O) |
 | L3 | `soundcraft-mix` | Mix engine shared by realtime playback and offline bounce |
 | L4 | `soundcraft-engine`, `soundcraft-playback` | Command registry, undo, editing, import/export/bounce, parity catalog; audio device I/O (cpal) |
 | L5 | `soundcraft-automation` | MCP server + control-channel client |
