@@ -3760,6 +3760,9 @@ version = "0.11.0"
 name = "soundcraft-opus"
 version = "0.11.0"
 dependencies = [
+ "proptest",
+ "soundcraft-dsp",
+ "soundcraft-ogg",
  "soundcraft-opus-decode",
 ]
 
