@@ -115,7 +115,7 @@ jobs:
 
       # TEMP (to be removed before merge): probe which recovery tests flake on Linux and why.
       - name: TEMP recovery flake probe
-        if: failure()
+        if: always()
         run: |
           set +e
           sed -i 's|next.recover(&left\[0\]);|next.recover(\&left[0]); eprintln!("PROBE status={}", next.ui.status);|' crates/ui-egui/tests/recovery.rs
@@ -126,7 +126,7 @@ jobs:
           echo "binary: $BIN"
           {
             for mode in parallel one-cpu; do
-              for i in $(seq 1 12); do
+              for i in $(seq 1 10); do
                 rm -rf /tmp/soundcraft-recovery-*
                 if [ "$mode" = one-cpu ]; then out=$(taskset -c 0 "$BIN" --nocapture 2>&1); else out=$("$BIN" --nocapture 2>&1); fi
                 rc=$?
