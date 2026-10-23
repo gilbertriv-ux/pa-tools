@@ -95,6 +95,24 @@ jobs:
         if: failure()
         run: bash .github/scripts/ci-digest.sh ci-step.log "cargo xtask ci failed"
 
+      # `cargo xtask ci` stops at its first failing step, and `cargo test` at the first failing test
+      # binary. When the tests were what failed, list every failing test and run the gates that never
+      # got to run, so one red run shows everything that is red. Only runs on failure.
+      - name: Everything else that is red
+        if: failure()
+        run: |
+          if ! grep -q '^FAIL  test' ci-step.log; then
+            echo "xtask did not fail in its test step: nothing more to list"
+            exit 0
+          fi
+          {
+            cargo test --workspace --no-fail-fast 2>&1
+            cargo xtask assets 2>&1
+            cargo xtask layers 2>&1
+            cargo xtask wasm 2>&1
+          } | tee ci-all.log || true
+          bash .github/scripts/ci-digest.sh ci-all.log "all failing tests and remaining gates"
+
   build-test:
     name: build and test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -129,10 +147,11 @@ jobs:
           set -o pipefail
           cargo build --workspace 2>&1 | tee ci-step.log
 
+      # --no-fail-fast: run every test binary even after one fails, so one red run lists every failure.
       - name: Test (cargo test --workspace)
         run: |
           set -o pipefail
-          cargo test --workspace 2>&1 | tee ci-step.log
+          cargo test --workspace --no-fail-fast 2>&1 | tee ci-step.log
 
       - name: Failure digest
         if: failure()
