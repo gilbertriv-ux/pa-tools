@@ -135,8 +135,7 @@ round.
 
 ## Build from source
 
-Requirements: **Rust 1.95 or newer** for the desktop and web UI (the core workspace's declared
-minimum is 1.90), and network access: Cargo fetches two small git dependencies, `craft-ui` and
+Requirements: **Rust 1.95 or newer** (the workspace's declared minimum), and network access: Cargo fetches two small git dependencies, `craft-ui` and
 `craft-docpath`, from `github.com/storytold/craft-libs` (both MIT OR Apache-2.0; see `UPSTREAM.md`).
 
 ```sh

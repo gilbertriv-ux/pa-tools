@@ -10,7 +10,7 @@ Pa Tools supplies each state's colors, border, radius and icon painter; selectio
 dispatch remain in the toolbar and track controls. The single-shape frame option preserves the
 existing fill/border blending when controls are disabled. Specialized transport Play/Stop/Record styling,
 nonlinear meters, faders, pan gestures, fonts and the live theme resolver remain local. Shared adapters read the current palette. The UI
-requires Rust 1.95 or later without raising the core workspace's Rust 1.90 declaration.
+requires Rust 1.95 or later, which is also the core workspace's declared minimum.
 
 ```
 L0  time        audio-io        midi        video   (standalone: no workspace deps)
