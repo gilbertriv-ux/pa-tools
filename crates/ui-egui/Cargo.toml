@@ -7,6 +7,12 @@ license.workspace = true
 rust-version = "1.95"
 repository.workspace = true
 
+[features]
+default = []
+# Local speech-to-text and the verified model downloader, forwarded to the engine; off by default.
+whisper = ["soundcraft-engine/whisper"]
+download = ["soundcraft-engine/download"]
+
 [dependencies]
 soundcraft-brand.workspace = true
 craft-ui.workspace = true
@@ -30,6 +36,8 @@ image.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+# The fixed recogniser that tests of the menu, palette and Transcript window inject.
+soundcraft-pa-speech.workspace = true
 
 [lints]
 workspace = true

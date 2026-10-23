@@ -31,6 +31,8 @@ mod surround;
 mod tab;
 mod track;
 mod track_more;
+mod transcribe;
+mod transcript_edit;
 mod transport;
 mod video;
 mod view;
@@ -39,6 +41,10 @@ mod vst3;
 mod zoom_toggle;
 
 pub use file::bounce_job;
+pub use transcribe::{
+    MAX_MONO_SAMPLES, MAX_TRANSCRIPT_WORDS, SharedTranscriber, TranscribeJob, TranscribeOutcome, source_label, transcribe_job,
+    transcribe_job_with_transcriber,
+};
 
 pub(crate) use edit::remember_selection;
 
@@ -135,6 +141,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(instrument::specs());
         v.extend(sampler::specs());
         v.extend(video::specs());
+        v.extend(transcribe::specs());
+        v.extend(transcript_edit::specs());
         v.extend(zoom_toggle::specs());
         v
     })

@@ -23,6 +23,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("audio-io", 0),
     ("midi", 0),
     ("video", 0),
+    ("pa-speech", 0),
     ("dsp", 1),
     ("clap-host", 1),
     ("vst3-host", 1),
@@ -35,7 +36,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("ui-egui", 6),
 ];
 /// Standalone format crates: no workspace dependencies at all (publishable on their own).
-const STANDALONE: &[&str] = &["brand", "time", "audio-io", "midi", "video", "dsp"];
+const STANDALONE: &[&str] = &["brand", "time", "audio-io", "midi", "video", "dsp", "pa-speech"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "xtask"];
 
@@ -150,7 +151,15 @@ fn ci() -> Result<(), String> {
     let steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = vec![
         ("fmt", Box::new(|| cargo(&["fmt", "--all", "--", "--check"]))),
         ("clippy", Box::new(|| cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
+        // The speech crate's recogniser and downloader are behind features the workspace build leaves
+        // off, so they are linted and tested here with them on. The real-model test skips without
+        // `PA_SPEECH_FIXTURE`, so this stays model-free.
+        (
+            "clippy-speech",
+            Box::new(|| cargo(&["clippy", "-p", "soundcraft-pa-speech", "--all-targets", "--features", "whisper,download", "--", "-D", "warnings"])),
+        ),
         ("test", Box::new(|| cargo(&["test", "--workspace"]))),
+        ("test-speech", Box::new(|| cargo(&["test", "-p", "soundcraft-pa-speech", "--features", "whisper,download"]))),
         ("assets", Box::new(assets)),
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),

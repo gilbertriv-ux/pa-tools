@@ -18,6 +18,9 @@ workspace = true
 [features]
 # ASIO audio devices on Windows (see soundcraft-playback's `asio` feature).
 asio = ["soundcraft-playback/asio"]
+# Local speech-to-text (`track.transcribe`) and the verified model downloader; off by default.
+whisper = ["soundcraft-ui-egui/whisper"]
+download = ["soundcraft-ui-egui/download"]
 
 [dependencies]
 soundcraft-brand.workspace = true
