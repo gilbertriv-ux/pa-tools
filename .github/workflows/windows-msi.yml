@@ -5,8 +5,10 @@
 # storytold/craft-common-actions (no licence file; see docs/ci-notes-patools.md). The `wix extension
 # add` step and the action SHAs are facts about public tools, not copied code.
 #
-# * x64 is built and then installed, run and uninstalled on the same runner (a smoke test of the
-#   MSI itself).
+# * x64 is built and then smoke-tested on the same runner: packaging/windows/smoke-test.ps1 checks
+#   the MSI's ProductVersion, installs it, runs `pa-tools.exe --version` and `pa-tools-cli.exe
+#   --version`, uninstalls it and checks nothing is left. The expected version is read from
+#   `[workspace.package] version` in Cargo.toml, the one place it is set.
 # * arm64 is cross-compiled on this x64 runner (needs the MSVC ARM64 build tools, which the
 #   windows-latest image has). It cannot run here; the existing windows-arm64.yml installs and
 #   runs it on a Windows 11 ARM64 runner.
@@ -101,4 +103,36 @@ jobs:
           name: patools-windows-${{ matrix.arch }}-msi
           path: dist/${{ matrix.arch }}/*.msi
           if-no-files-found: error
+          retention-days: 14
+
+      # Install the x64 MSI on this runner, run what it installed and uninstall it again
+      # (packaging/windows/smoke-test.ps1). The version it expects comes from Cargo, not from this
+      # file: `cargo metadata --no-deps` lists the workspace packages, which all inherit
+      # `[workspace.package] version`, and the step fails if they ever disagree. The MSI is uploaded
+      # first, so a failing smoke test still leaves the installer to download. The runner is a
+      # throwaway VM (administrator, no Pa Tools installed), so installing is safe.
+      - name: Smoke test the MSI (install, run, uninstall)
+        id: smoke
+        if: matrix.arch == 'x64'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $json = cargo metadata --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata exited with $LASTEXITCODE" }
+          $versions = @(($json | ConvertFrom-Json).packages.version | Sort-Object -Unique)
+          if ($versions.Count -ne 1) { throw "the workspace packages disagree on the version: $($versions -join ', ')" }
+          $msi = @(Get-ChildItem -LiteralPath $env:DIST -Filter '*.msi')
+          if ($msi.Count -ne 1) { throw "expected one MSI in $env:DIST, found $($msi.Count)" }
+          ./packaging/windows/smoke-test.ps1 -Msi $msi[0].FullName -ExpectedVersion $versions[0] `
+            -LogDir (Join-Path $env:RUNNER_TEMP 'msi-smoke')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The msiexec logs and the captured program output, only when the smoke test failed.
+      - name: Upload the smoke-test logs (on failure)
+        if: ${{ !cancelled() && steps.smoke.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patools-windows-x64-msi-smoke-logs
+          path: ${{ runner.temp }}\msi-smoke
+          if-no-files-found: warn
           retention-days: 14
