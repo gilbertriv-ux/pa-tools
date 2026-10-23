@@ -32,33 +32,65 @@ pub fn decode_frame(data: &[u8]) -> Result<Frame> {
     decode_frame_with(data, &DecodeOptions::default())
 }
 
+/// Most memory, in bytes, that decoding one frame may allocate (the coded planes of every coding
+/// unit plus the cropped frame). A header that asks for more is refused before anything is
+/// allocated.
+pub const MAX_DECODE_BYTES: u64 = 1 << 30;
+
+/// Bytes decoding `h` allocates: `u16` samples, the macroblock-aligned planes of each coding unit
+/// and the frame cropped from them.
+pub(super) fn decode_bytes(h: &FrameHeader) -> u64 {
+    let units = if h.interlaced && !h.frame_encoding { 2 } else { 1 };
+    let mbs = u64::from(h.mb_width()) * u64::from(h.mb_rows) * units;
+    let chroma = match h.chroma {
+        ChromaFormat::Yuv420 => 128,
+        ChromaFormat::Yuv422 => 256,
+        ChromaFormat::Yuv444 => 512,
+    };
+    let per_mb = 256 + chroma + if h.alpha { 256 } else { 0 };
+    mbs.saturating_mul(per_mb).saturating_mul(4)
+}
+
 /// Decode one compressed frame with options.
 pub fn decode_frame_with(data: &[u8], opts: &DecodeOptions) -> Result<Frame> {
     let h1 = header::parse(data)?;
+    if decode_bytes(&h1) > MAX_DECODE_BYTES {
+        return Err(Error::Invalid("picture needs more memory than a decode may use"));
+    }
     let field_coded = h1.interlaced && !h1.frame_encoding;
     if !field_coded {
         let planes = decode_unit(&h1, data, opts)?;
-        let mut f = Frame::new_like(&h1, h1.width, h1.lines);
+        let mut f = Frame::new_like(&h1, h1.width, h1.lines)?;
         f.interlace = if h1.interlaced { Interlace::TopFieldFirst } else { Interlace::Progressive };
-        planes.copy_into(&mut f, 0, 1);
+        planes.copy_into(&mut f, 0, 1)?;
         return Ok(f);
     }
     // field encoding: two coding units, field 1 (top) then field 2
     let off = second_unit_offset(&h1, data)?;
-    let h2 = header::parse(&data[off..])?;
-    if h2.cid != h1.cid || h2.width != h1.width || h2.lines != h1.lines || h2.chroma != h1.chroma || h2.alpha != h1.alpha {
+    let (Some(first), Some(second)) = (data.get(..off), data.get(off..)) else {
+        return Err(Error::Truncated);
+    };
+    let h2 = header::parse(second)?;
+    if h2.cid != h1.cid
+        || h2.width != h1.width
+        || h2.lines != h1.lines
+        || h2.chroma != h1.chroma
+        || h2.alpha != h1.alpha
+        || h2.bit_depth != h1.bit_depth
+        || h2.rgb_planes() != h1.rgb_planes()
+    {
         return Err(Error::Invalid("field coding units differ"));
     }
     let (p1, p2) = if opts.threads {
-        join(|| decode_unit(&h1, &data[..off], opts), || decode_unit(&h2, &data[off..], opts))
+        join(|| decode_unit(&h1, first, opts), || decode_unit(&h2, second, opts))
     } else {
-        (decode_unit(&h1, &data[..off], opts), decode_unit(&h2, &data[off..], opts))
+        (decode_unit(&h1, first, opts), decode_unit(&h2, second, opts))
     };
-    let mut f = Frame::new_like(&h1, h1.width, h1.lines * 2);
+    let mut f = Frame::new_like(&h1, h1.width, h1.lines * 2)?;
     f.interlace = Interlace::TopFieldFirst;
     let (top, bottom) = if h1.field == FieldCode::Field2 { (p2?, p1?) } else { (p1?, p2?) };
-    top.copy_into(&mut f, 0, 2);
-    bottom.copy_into(&mut f, 1, 2);
+    top.copy_into(&mut f, 0, 2)?;
+    bottom.copy_into(&mut f, 1, 2)?;
     Ok(f)
 }
 
@@ -76,18 +108,21 @@ fn join<A, B>(a: impl FnOnce() -> A, b: impl FnOnce() -> B) -> (A, B) {
 fn second_unit_offset(h: &FrameHeader, data: &[u8]) -> Result<usize> {
     if let Some(sz) = h.coding_unit_size() {
         let sz = sz as usize;
-        if data.len() >= sz + 0x280 && data[sz..sz + 4] == data[0..4] && data[sz + 4] == data[4] {
+        let next = sz.checked_add(0x280).and_then(|end| data.get(sz..end));
+        if let (Some(next), Some(first)) = (next, data.get(..5))
+            && next.get(..5) == Some(first)
+        {
             return Ok(sz);
         }
     }
     // VBR (or unexpected size): find the next header prefix after the first unit's scan lines
-    let prefix = &data[0..5];
+    let prefix = data.get(..5).ok_or(Error::Truncated)?;
     let start = h.header_size as usize;
-    data[start..]
-        .windows(5)
+    let tail = data.get(start..).ok_or(Error::Truncated)?;
+    tail.windows(5)
         .position(|w| w == prefix)
         .map(|p| p + start)
-        .filter(|&p| header::parse(&data[p..]).is_ok())
+        .filter(|&p| data.get(p..).is_some_and(|d| header::parse(d).is_ok()))
         .ok_or(Error::Invalid("second field coding unit not found"))
 }
 
@@ -102,7 +137,7 @@ struct CodedPlanes {
 
 impl CodedPlanes {
     /// Crop into `f`, writing coded line `i` to frame line `first + i·step`.
-    fn copy_into(&self, f: &mut Frame, first: usize, step: usize) {
+    fn copy_into(&self, f: &mut Frame, first: usize, step: usize) -> Result<()> {
         if self.ycbcr {
             f.rgb = false;
         }
@@ -116,18 +151,21 @@ impl CodedPlanes {
         if let Some(a) = f.alpha.as_mut() {
             targets.push((a, w, h, first, 3));
         }
+        let geometry = Error::Invalid("plane geometry");
         for (dst, pw, ph, first, pi) in targets {
-            let src = &self.planes[pi];
-            let ss = self.strides[pi];
+            let src = self.planes.get(pi).ok_or(geometry.clone())?;
+            let ss = self.strides.get(pi).copied().ok_or(geometry.clone())?;
             let mut line = 0;
             let mut y = first;
             while y < ph {
-                let s = &src[line * ss..line * ss + pw];
-                dst[y * pw..y * pw + pw].copy_from_slice(s);
+                let from = src.get(line * ss..).and_then(|r| r.get(..pw)).ok_or(geometry.clone())?;
+                let to = dst.get_mut(y * pw..).and_then(|r| r.get_mut(..pw)).ok_or(geometry.clone())?;
+                to.copy_from_slice(from);
                 line += 1;
                 y += step;
             }
         }
+        Ok(())
     }
 }
 
@@ -195,17 +233,19 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
     let mut starts = Vec::with_capacity(ns);
     for s in 0..ns {
         let o = SCAN_INDEX_OFFSET + 4 * s;
-        let idx = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
+        let idx = data.get(o..).and_then(|d| d.first_chunk::<4>()).map(|c| u32::from_be_bytes(*c)).ok_or(Error::Truncated)? as usize;
         let st = hs.checked_add(idx).filter(|&v| v < data.len()).ok_or(Error::Truncated)?;
         starts.push(st);
     }
-    let ranges: Vec<(usize, usize)> = (0..ns)
-        .map(|s| {
-            let st = starts[s];
-            let end = starts.get(s + 1).copied().filter(|&e| e > st).unwrap_or(data.len());
-            (st, end)
-        })
-        .collect();
+    let ranges: Vec<(usize, usize)> =
+        starts.iter().enumerate().map(|(s, &st)| (st, starts.get(s + 1).copied().filter(|&e| e > st).unwrap_or(data.len()))).collect();
+    // The planes are sized from the header, so refuse a scan line too short to hold its macroblocks
+    // before allocating them: a few header bytes cannot buy a large picture. (A row that short could
+    // only fail to decode anyway.)
+    let min_bits = min_mb_bits(&ctx) * nw as u64;
+    if ranges.iter().any(|&(st, end)| (end.saturating_sub(st) as u64) * 8 < min_bits) {
+        return Err(Error::Truncated);
+    }
 
     let alpha = h.alpha;
     let mut planes: [Vec<u16>; 4] = [
@@ -226,8 +266,9 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
         .map(|(i, (((y, cb), cr), a))| (i, y, cb, cr, a))
         .collect();
     let run = |(i, y, cb, cr, a): (usize, &mut [u16], &mut [u16], &mut [u16], &mut [u16])| -> Result<Vec<bool>> {
-        let (st, end) = ranges[i];
-        decode_row(&ctx, &data[st..end], [y, cb, cr, a]).map_err(|e| match e {
+        let (st, end) = ranges.get(i).copied().ok_or(Error::Truncated)?;
+        let row = data.get(st..end).ok_or(Error::Truncated)?;
+        decode_row(&ctx, row, [y, cb, cr, a]).map_err(|e| match e {
             Error::Row(_) => Error::Row(i),
             e => e,
         })
@@ -255,12 +296,23 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
             for (mb, &a) in row.iter().enumerate() {
                 if a {
                     let o = s * band[0];
-                    convert_mb_to_rgb(&ctx, [&mut py[o..o + band[0]], &mut pcb[o..o + band[0]], &mut pcr[o..o + band[0]]], mb);
+                    let rows = (py.get_mut(o..o + band[0]), pcb.get_mut(o..o + band[0]), pcr.get_mut(o..o + band[0]));
+                    let (Some(y), Some(cb), Some(cr)) = rows else {
+                        return Err(Error::Invalid("plane geometry"));
+                    };
+                    convert_mb_to_rgb(&ctx, [y, cb, cr], mb)?;
                 }
             }
         }
     }
     Ok(CodedPlanes { planes, strides, ycbcr })
+}
+
+/// Fewest bits one macroblock of a scan line occupies: the 12 bits of its header, then for each
+/// block at least one DC codeword and the end-of-block codeword.
+fn min_mb_bits(ctx: &Ctx) -> u64 {
+    let dc = ctx.vlc.dc_code.iter().map(|c| u64::from(c.1)).min().unwrap_or(0);
+    12 + ctx.layout.len() as u64 * (dc + u64::from(ctx.vlc.eob.1))
 }
 
 /// Decode one macroblock scan line into the 16-line bands of each plane.
@@ -287,7 +339,7 @@ fn decode_row(ctx: &Ctx, data: &[u8], bands: [&mut [u16]; 4]) -> Result<Vec<bool
             let slot = if rgb && !acf { 3 + comp } else { comp };
             let w = &wq[(comp != 0) as usize];
             decode_block(ctx, &mut r, &mut pred[slot], w, &mut block)?;
-            store(ctx, bands[comp], comp, mb, xo as usize, yo as usize, mff, &mut block);
+            store(ctx, bands[comp], comp, mb, xo as usize, yo as usize, mff, &mut block)?;
         }
         if rgb {
             acfs.push(acf);
@@ -316,7 +368,7 @@ fn decode_row(ctx: &Ctx, data: &[u8], bands: [&mut [u16]; 4]) -> Result<Vec<bool
                 let wq = scaled_weights(ctx.info.weights, qsf);
                 for &(plane, xo, yo) in &LAYOUT_ALPHA {
                     decode_block(ctx, &mut r, &mut pred[6], &wq[0], &mut block)?;
-                    store(ctx, bands[3], plane as usize, mb, xo as usize, yo as usize, false, &mut block);
+                    store(ctx, bands[3], plane as usize, mb, xo as usize, yo as usize, false, &mut block)?;
                 }
             }
         }
@@ -346,7 +398,7 @@ fn decode_block(ctx: &Ctx, r: &mut Reader, pred: &mut i32, wq: &[(u32, u32); 64]
     let v = ctx.vlc;
     *block = [0.0; 64];
     // DC (8.2.4)
-    let eta = r.vlc(&v.dc);
+    let eta = r.vlc(&v.dc).min(15);
     let eps = if eta == 0 {
         0
     } else {
@@ -391,26 +443,29 @@ fn decode_block(ctx: &Ctx, r: &mut Reader, pred: &mut i32, wq: &[(u32, u32); 64]
     Ok(())
 }
 
-/// IDCT a block and store it (with level adjustment and clipping) into a plane band.
+/// IDCT a block and store it (with level adjustment and clipping) into a plane band. A block that
+/// would fall outside the band (a header whose layout the bands do not cover) is an error.
 #[inline]
-fn store(ctx: &Ctx, band: &mut [u16], plane: usize, mb: usize, xo: usize, yo: usize, field: bool, block: &mut [f32; 64]) {
+fn store(ctx: &Ctx, band: &mut [u16], plane: usize, mb: usize, xo: usize, yo: usize, field: bool, block: &mut [f32; 64]) -> Result<()> {
     idct8x8(block);
-    let stride = ctx.strides[plane];
-    let x0 = mb * ctx.mb_size[plane].0 + xo;
+    let stride = ctx.strides.get(plane).copied().ok_or(Error::Invalid("plane geometry"))?;
+    let x0 = mb * ctx.mb_size.get(plane).map_or(0, |m| m.0) + xo;
     let (first, step) = if field { (yo / 8, 2) } else { (yo, 1) };
     let (scale, mid, max) = (ctx.scale, ctx.mid + 0.5, ctx.max);
     for j in 0..8 {
-        let row = &mut band[(first + j * step) * stride + x0..][..8];
+        let at = (first + j * step) * stride + x0;
+        let row = band.get_mut(at..at + 8).ok_or(Error::Invalid("macroblock outside its plane"))?;
         let src = &block[j * 8..j * 8 + 8];
         for i in 0..8 {
             row[i] = (src[i] * scale + mid).floor().clamp(0.0, max) as u16;
         }
     }
+    Ok(())
 }
 
 /// `ConvertMacroblockColor` (8.1.1): BT.709 Y′CbCr → R′G′B′ on the quantised (video-range)
 /// signals, in place over the macroblock's three planes.
-fn convert_mb_to_rgb(ctx: &Ctx, bands: [&mut [u16]; 3], mb: usize) {
+fn convert_mb_to_rgb(ctx: &Ctx, bands: [&mut [u16]; 3], mb: usize) -> Result<()> {
     let stride = ctx.strides[0];
     let s = (1u32 << (ctx.h.bit_depth - 8)) as f32;
     let (kr, kb) = match ctx.h.color_volume {
@@ -419,21 +474,26 @@ fn convert_mb_to_rgb(ctx: &Ctx, bands: [&mut [u16]; 3], mb: usize) {
     };
     let kg = 1.0 - kr - kb;
     let c = 219.0 / 224.0;
+    let [b0, b1, b2] = bands;
     for y in 0..16 {
         for x in 0..16 {
             let i = y * stride + mb * 16 + x;
-            let yy = bands[0][i] as f32;
-            let cb = bands[1][i] as f32 - 128.0 * s;
-            let cr = bands[2][i] as f32 - 128.0 * s;
+            let (Some(p0), Some(p1), Some(p2)) = (b0.get_mut(i), b1.get_mut(i), b2.get_mut(i)) else {
+                return Err(Error::Invalid("macroblock outside its plane"));
+            };
+            let yy = *p0 as f32;
+            let cb = *p1 as f32 - 128.0 * s;
+            let cr = *p2 as f32 - 128.0 * s;
             let r = yy + 2.0 * (1.0 - kr) * c * cr;
             let b = yy + 2.0 * (1.0 - kb) * c * cb;
             let g = (yy - kr * r - kb * b) / kg;
             // RGB planes are stored in coded channel order G, B, R
-            bands[0][i] = (g + 0.5).floor().clamp(0.0, ctx.max) as u16;
-            bands[1][i] = (b + 0.5).floor().clamp(0.0, ctx.max) as u16;
-            bands[2][i] = (r + 0.5).floor().clamp(0.0, ctx.max) as u16;
+            *p0 = (g + 0.5).floor().clamp(0.0, ctx.max) as u16;
+            *p1 = (b + 0.5).floor().clamp(0.0, ctx.max) as u16;
+            *p2 = (r + 0.5).floor().clamp(0.0, ctx.max) as u16;
         }
     }
+    Ok(())
 }
 
 /// Lossless (differential RLE) alpha macroblock (§7.3.1.2, §8.3).
@@ -450,7 +510,7 @@ fn decode_rle_alpha(ctx: &Ctx, r: &mut Reader, band: &mut [u16], mb: usize) -> R
     let rl = r.read(4) & 1;
     if rl == 0 {
         for count in 0..256 {
-            band[pos(count)] = r.read(d) as u16;
+            *band.get_mut(pos(count)).ok_or(Error::Row(0))? = r.read(d) as u16;
         }
         return Ok(());
     }
@@ -486,7 +546,7 @@ fn decode_rle_alpha(ctx: &Ctx, r: &mut Reader, band: &mut [u16], mb: usize) -> R
         }
         for _ in 0..nrl {
             let v = if p == 1 { (2 * d1).wrapping_sub(d2).wrapping_add(diff) & mask } else { d1.wrapping_add(diff) & mask };
-            band[pos(count)] = v as u16;
+            *band.get_mut(pos(count)).ok_or(Error::Row(0))? = v as u16;
             d2 = d1;
             d1 = v;
             count += 1;

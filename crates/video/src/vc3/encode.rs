@@ -67,7 +67,12 @@ impl Encoder {
     }
 
     pub fn with_config(cfg: EncoderConfig) -> Result<Encoder> {
-        if cfg.width == 0 || cfg.height == 0 || cfg.width > 16384 || cfg.height > 16384 {
+        if cfg.width == 0
+            || cfg.height == 0
+            || cfg.width > header::MAX_DIMENSION
+            || cfg.height > header::MAX_DIMENSION
+            || u64::from(cfg.width) * u64::from(cfg.height) > crate::movie::MAX_PIXELS
+        {
             return Err(Error::Input(format!("unsupported raster {}x{}", cfg.width, cfg.height)));
         }
         if cfg.chroma() == ChromaFormat::Yuv422 && !cfg.width.is_multiple_of(2) {
@@ -115,7 +120,7 @@ impl Encoder {
         }
         let prep = self.prepare(f);
         let vlc = vlc(self.info.vlc);
-        let budget_bits = (self.frame_size as u64 - self.header_size as u64 - 4) * 8;
+        let budget_bits = u64::from(self.frame_size).saturating_sub(u64::from(self.header_size) + 4) * 8;
         let q = self.rate_control(&prep, vlc, budget_bits);
         self.write(&prep, vlc, &q, f.rgb)
     }
@@ -346,17 +351,17 @@ impl Encoder {
             mb_rows: prep.ns as u32,
         };
         let mut out = header::write(&h);
-        out.reserve(self.frame_size as usize - out.len());
+        out.reserve((self.frame_size as usize).saturating_sub(out.len()));
         let mut off = 0u32;
         for (s, r) in rows.iter().enumerate() {
             let o = SCAN_INDEX_OFFSET + 4 * s;
-            out[o..o + 4].copy_from_slice(&off.to_be_bytes());
-            off += r.len() as u32;
+            out.get_mut(o..o + 4).ok_or_else(|| Error::Input("scan line index outside the header".into()))?.copy_from_slice(&off.to_be_bytes());
+            off = off.saturating_add(u32::try_from(r.len()).unwrap_or(u32::MAX));
         }
         for r in rows {
             out.extend_from_slice(&r);
         }
-        let end = self.frame_size as usize - 4;
+        let end = (self.frame_size as usize).saturating_sub(4);
         if out.len() > end {
             return Err(Error::Input("rate control overflow".into()));
         }

@@ -25,8 +25,8 @@ impl<'a> Reader<'a> {
         if self.avail >= 56 {
             return;
         }
-        if let Some(s) = self.data.get(self.next..self.next + 8) {
-            let w = u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+        if let Some(chunk) = self.data.get(self.next..).and_then(|s| s.first_chunk::<8>()) {
+            let w = u64::from_be_bytes(*chunk);
             self.cache |= w >> self.avail;
             self.next += ((63 - self.avail) >> 3) as usize;
             self.avail |= 56;
@@ -42,8 +42,8 @@ impl<'a> Reader<'a> {
 
     #[inline(always)]
     fn consume(&mut self, n: u32) {
-        self.cache <<= n;
-        self.avail -= n;
+        self.cache = self.cache.checked_shl(n).unwrap_or(0);
+        self.avail = self.avail.saturating_sub(n);
     }
 
     #[inline]
@@ -62,6 +62,7 @@ impl<'a> Reader<'a> {
         if n == 0 {
             return 0;
         }
+        let n = n.min(32);
         self.refill();
         let v = (self.cache >> (64 - n)) as u32;
         self.consume(n);
@@ -73,13 +74,15 @@ impl<'a> Reader<'a> {
     pub fn vlc(&mut self, t: &Lut) -> u32 {
         self.refill();
         let w = self.cache;
-        let mut e = t.primary[(w >> (64 - t.bits)) as usize];
+        let mut e = t.primary.get((w >> (64 - t.bits)) as usize).copied().unwrap_or(0);
         if e & LINK != 0 {
-            let sb = (e >> 24) & 0x7f;
+            let sb = ((e >> 24) & 0x7f).max(1);
             let off = (e & 0xff_ffff) as usize;
-            e = t.secondary[off + ((w << t.bits) >> (64 - sb)) as usize];
+            e = t.secondary.get(off.saturating_add(((w << t.bits) >> (64 - sb)) as usize)).copied().unwrap_or(0);
         }
-        // entries are always filled for complete prefix codes
+        // Entries are always filled for the complete prefix codes of the standard (a unit test
+        // checks every table); an empty one would consume nothing, and the caller's loops end
+        // anyway because each pass advances the coefficient position.
         self.consume(e >> 16);
         e & 0xffff
     }

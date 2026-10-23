@@ -105,7 +105,7 @@ pub fn ri_frame_size(width: u32, height: u32, c0: u32, alpha: bool) -> u32 {
     } else {
         size -= rem;
     }
-    size.max(8192) as u32
+    u32::try_from(size.max(8192)).unwrap_or(u32::MAX)
 }
 
 /// Two-level VLC lookup table. `primary` is indexed by the next `PRIMARY_BITS` bits; an entry is
@@ -278,6 +278,21 @@ mod tests {
                 let (c, l) = s.run_code[r];
                 assert_eq!(lookup(&s.run, c as u32, l as u32), r as u32);
             }
+        }
+    }
+
+    /// Every lookup entry holds a codeword (the tables are complete prefix codes), so the decoder
+    /// never meets an empty entry that consumes no bits, whatever bits it is fed.
+    #[test]
+    fn luts_are_complete_prefix_codes() {
+        for i in 0..6 {
+            let s = vlc(i);
+            for t in [&s.amp, &s.run, &s.dc] {
+                assert!(t.primary.iter().all(|&e| e & LINK != 0 || e >> 16 > 0), "set {i}: empty primary entry");
+                assert!(t.secondary.iter().all(|&e| e >> 16 > 0), "set {i}: empty secondary entry");
+            }
+            // a block needs a DC codeword and an end-of-block codeword: the bound `min_mb_bits` relies on
+            assert!(s.dc_code.iter().all(|c| c.1 > 0) && s.eob.1 > 0);
         }
     }
 

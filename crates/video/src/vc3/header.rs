@@ -71,6 +71,11 @@ impl FrameHeader {
         self.rgb || self.chroma == ChromaFormat::Yuv444
     }
 
+    /// Lines of the whole picture: `lines`, doubled when the two fields are separate coding units.
+    pub fn frame_lines(&self) -> u32 {
+        if self.interlaced && !self.frame_encoding { self.lines * 2 } else { self.lines }
+    }
+
     /// Macroblocks per scan line `NW`.
     pub fn mb_width(&self) -> u32 {
         self.width.div_ceil(16)
@@ -93,26 +98,50 @@ impl FrameHeader {
     }
 }
 
-fn be16(d: &[u8], o: usize) -> u32 {
-    u32::from(d[o]) << 8 | u32::from(d[o + 1])
+/// Largest width or height (in samples) of a picture this decoder accepts; the area is also held
+/// to the crate's picture-size limit (`crate::movie::MAX_PIXELS`). Hostile headers can claim up
+/// to 65535, so the planes are never sized from a header before this check.
+pub const MAX_DIMENSION: u32 = 8192;
+
+/// The fixed part of a coding-unit header (`HS` is at least this long).
+const FIXED_SIZE: usize = 0x280;
+
+fn be16(d: &[u8; FIXED_SIZE], o: usize) -> u32 {
+    let at = |i: usize| d.get(i).copied().map_or(0, u32::from);
+    at(o) << 8 | at(o + 1)
 }
 
-fn be32(d: &[u8], o: usize) -> u32 {
-    u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+fn be32(d: &[u8; FIXED_SIZE], o: usize) -> u32 {
+    be16(d, o) << 16 | be16(d, o + 2)
 }
 
-/// Parse a coding-unit header at the start of `d`.
+/// Parse a coding-unit header at the start of `d`. The whole header (`HS` bytes, which holds the
+/// scan-line indices) must be present.
 pub fn parse(d: &[u8]) -> Result<FrameHeader> {
-    if d.len() < 0x280 {
+    parse_inner(d, true)
+}
+
+/// Parse only the fixed first 640 bytes of a header, as when just the start of a sample has been
+/// read: the scan-line indices (which a raster above 1088 lines pushes past 640 bytes) need not be
+/// present. Every other check of [`parse`] applies, so the picture format it reports is valid.
+pub fn parse_prefix(d: &[u8]) -> Result<FrameHeader> {
+    parse_inner(d, false)
+}
+
+fn parse_inner(whole: &[u8], complete: bool) -> Result<FrameHeader> {
+    let Some(d) = whole.first_chunk::<FIXED_SIZE>() else {
         return Err(Error::Truncated);
-    }
+    };
     let header_size = be32(d, 0);
     let version = d[4];
     if !(1..=4).contains(&version) {
         return Err(Error::Invalid("unknown header version"));
     }
-    if header_size < 0x280 || header_size as usize > d.len() {
-        return Err(if header_size as usize > d.len() { Error::Truncated } else { Error::Invalid("header size") });
+    if (header_size as usize) < FIXED_SIZE {
+        return Err(Error::Invalid("header size"));
+    }
+    if complete && header_size as usize > whole.len() {
+        return Err(Error::Truncated);
     }
     let cid = be32(d, 0x28);
     let info = cid_info(cid).ok_or(Error::UnknownCid(cid))?;
@@ -154,13 +183,22 @@ pub fn parse(d: &[u8]) -> Result<FrameHeader> {
     };
     let timecode = if d[0x30] & 0x80 != 0 { d.get(0x31..).and_then(|t| t.first_chunk::<8>()).copied() } else { None };
     let mb_rows = be16(d, 0x16C);
-    if width == 0 || lines == 0 || width > 16384 || lines > 16384 {
+    if width == 0 || lines == 0 || width > MAX_DIMENSION || lines > MAX_DIMENSION {
         return Err(Error::Invalid("raster size"));
     }
-    if let Kind::Hd { width: w, depth, .. } = info.kind
-        && (w as u32 != width || depth != bit_depth)
-    {
-        return Err(Error::Invalid("raster does not match the compression ID"));
+    // A field-coded interlaced frame is two units of `lines` each: hold the woven picture to the limit.
+    let frame_lines = if interlaced && !frame_encoding { lines * 2 } else { lines };
+    if u64::from(width) * u64::from(frame_lines) > crate::movie::MAX_PIXELS {
+        return Err(Error::Invalid("raster size"));
+    }
+    if let Kind::Hd { width: w, depth, .. } = info.kind {
+        if u32::from(w) != width || depth != bit_depth {
+            return Err(Error::Invalid("raster does not match the compression ID"));
+        }
+        // The HD profile is 4:2:2 (or, for CID 1256, 4:4:4): its macroblock layout has no 4:2:0.
+        if chroma == ChromaFormat::Yuv420 {
+            return Err(Error::Invalid("sub sampling does not match the compression ID"));
+        }
     }
     if rgb && chroma != ChromaFormat::Yuv444 {
         return Err(Error::Invalid("RGB requires 4:4:4"));
@@ -169,7 +207,7 @@ pub fn parse(d: &[u8]) -> Result<FrameHeader> {
         return Err(Error::Invalid("4:4:4 requires CID 1256 or 1270"));
     }
     // macroblock scan lines must cover the coded raster, and their indices must fit the header
-    if mb_rows == 0 || SCAN_INDEX_OFFSET + 4 * mb_rows as usize > header_size as usize {
+    if mb_rows == 0 || (mb_rows as usize).saturating_mul(4).saturating_add(SCAN_INDEX_OFFSET) > header_size as usize {
         return Err(Error::Invalid("macroblock scan line count"));
     }
     if mb_rows != lines.div_ceil(16) {
@@ -208,7 +246,9 @@ pub fn header_size_for(lines: u32) -> u32 {
 
 /// Write a header (without scan indices) for `h` into a zeroed buffer of `h.header_size` bytes.
 pub fn write(h: &FrameHeader) -> Vec<u8> {
-    let mut d = vec![0u8; h.header_size as usize];
+    // A header is 640 bytes plus 4 per scan line above 1088 lines: never fewer than the fixed part,
+    // and never more than a raster of the largest accepted height needs.
+    let mut d = vec![0u8; (h.header_size as usize).clamp(FIXED_SIZE, header_size_for(MAX_DIMENSION) as usize)];
     d[0..4].copy_from_slice(&h.header_size.to_be_bytes());
     d[4] = h.version;
     d[5] = (h.vbr as u8) << 4
@@ -251,7 +291,7 @@ pub fn write(h: &FrameHeader) -> Vec<u8> {
     }
     d[0x5F] = 0x01;
     d[0x167] = 0x02;
-    let msips = (4 * h.mb_rows + 4) as u16;
+    let msips = h.mb_rows.saturating_mul(4).saturating_add(4) as u16;
     d[0x16A..0x16C].copy_from_slice(&msips.to_be_bytes());
     d[0x16C..0x16E].copy_from_slice(&(h.mb_rows as u16).to_be_bytes());
     d[0x16F] = 0x10;

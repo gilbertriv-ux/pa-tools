@@ -119,11 +119,22 @@ impl Profile {
     }
     pub fn name(self) -> &'static str {
         match self {
-            Profile::Lb => "DNxHR LB",
-            Profile::Sq => "DNxHR SQ",
-            Profile::Hq => "DNxHR HQ",
-            Profile::Hqx => "DNxHR HQX",
-            Profile::R444 => "DNxHR 444",
+            Profile::Lb => "VC-3 LB",
+            Profile::Sq => "VC-3 SQ",
+            Profile::Hq => "VC-3 HQ",
+            Profile::Hqx => "VC-3 HQX",
+            Profile::R444 => "VC-3 444",
+        }
+    }
+
+    /// The profile's short variant name ("LB", "SQ", "HQ", "HQX", "444").
+    pub fn variant(self) -> &'static str {
+        match self {
+            Profile::Lb => "LB",
+            Profile::Sq => "SQ",
+            Profile::Hq => "HQ",
+            Profile::Hqx => "HQX",
+            Profile::R444 => "444",
         }
     }
     /// CBR frame size for a raster (equation 7.1).
@@ -138,29 +149,27 @@ impl Profile {
     }
 }
 
-/// A human-readable name for a compression ID ("DNxHD 1080p 145/120 8-bit", "DNxHR HQ"…).
-pub fn cid_name(cid: u32) -> String {
+/// The variant of a compression ID as on-screen labels name it: "LB", "SQ", "HQ", "HQX" or "444" for
+/// the resolution-independent profiles; for a fixed-raster compression ID the picture's lines and
+/// scan with its number ("1080p CID 1237", "1080i CID 1242").
+pub fn cid_variant(cid: u32) -> String {
     if let Some(p) = Profile::from_cid(cid) {
-        return p.name().into();
+        return p.variant().into();
     }
-    match cid {
-        1235 => "DNxHD 1080p 10-bit (CID 1235)".into(),
-        1237 => "DNxHD 1080p 8-bit (CID 1237)".into(),
-        1238 => "DNxHD 1080p 8-bit (CID 1238)".into(),
-        1241 => "DNxHD 1080i 10-bit (CID 1241)".into(),
-        1242 => "DNxHD 1080i 8-bit (CID 1242)".into(),
-        1243 => "DNxHD 1080i 8-bit (CID 1243)".into(),
-        1244 => "DNxHD 1080i thin raster (CID 1244)".into(),
-        1250 => "DNxHD 720p 10-bit (CID 1250)".into(),
-        1251 => "DNxHD 720p 8-bit (CID 1251)".into(),
-        1252 => "DNxHD 720p 8-bit (CID 1252)".into(),
-        1253 => "DNxHD 1080p 36 (CID 1253)".into(),
-        1256 => "DNxHD 444 10-bit (CID 1256)".into(),
-        1258 => "DNxHD 720p thin raster (CID 1258)".into(),
-        1259 => "DNxHD 1080p thin raster (CID 1259)".into(),
-        1260 => "DNxHD 1080i thin raster (CID 1260)".into(),
-        _ => format!("VC-3 (CID {cid})"),
+    match tables::cid_info(cid).map(|i| i.kind) {
+        Some(tables::Kind::Hd { height, interlaced, .. }) => format!("{height}{} CID {cid}", if interlaced { 'i' } else { 'p' }),
+        _ => format!("CID {cid}"),
     }
+}
+
+/// A human-readable name for a compression ID ("VC-3 HQX", "VC-3 1080i CID 1242").
+pub fn cid_name(cid: u32) -> String {
+    format!("VC-3 {}", cid_variant(cid))
+}
+
+/// The on-screen label of a stream: "VC-3 (HQX, 10-bit)". Names the standard and the variant only.
+pub fn label(cid: u32, bit_depth: u8) -> String {
+    format!("VC-3 ({}, {bit_depth}-bit)", cid_variant(cid))
 }
 
 /// A decoded (or to-be-encoded) picture: planar `u16` samples, rows packed without padding.
@@ -190,8 +199,26 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// A black (video-range) frame.
+    /// A black (video-range) frame. A raster of no pixels or more than the decoder accepts (the
+    /// header limits, [`header::MAX_DIMENSION`] and the crate's picture-size limit) gives an empty
+    /// 0 x 0 frame, so no caller can request a huge allocation; [`Frame::try_new`] reports it.
     pub fn new(width: u32, height: u32, chroma: ChromaFormat, bit_depth: u8, with_alpha: bool) -> Frame {
+        Frame::try_new(width, height, chroma, bit_depth, with_alpha).unwrap_or_else(|_| Frame::build(0, 0, chroma, bit_depth.clamp(8, 16), false))
+    }
+
+    /// Like [`Frame::new`], but an out-of-range raster or bit depth is an error.
+    pub fn try_new(width: u32, height: u32, chroma: ChromaFormat, bit_depth: u8, with_alpha: bool) -> Result<Frame> {
+        if width == 0 || height == 0 || width > header::MAX_DIMENSION || u64::from(width) * u64::from(height) > crate::movie::MAX_PIXELS {
+            return Err(Error::Invalid("raster size"));
+        }
+        if !(8..=16).contains(&bit_depth) {
+            return Err(Error::Invalid("sample bit depth"));
+        }
+        Ok(Frame::build(width, height, chroma, bit_depth, with_alpha))
+    }
+
+    /// Allocate the planes of an already validated raster.
+    fn build(width: u32, height: u32, chroma: ChromaFormat, bit_depth: u8, with_alpha: bool) -> Frame {
         let n = width as usize * height as usize;
         let cn = chroma.chroma_width(width) as usize * chroma.chroma_height(height) as usize;
         let s = bit_depth.saturating_sub(8) as u32;
@@ -212,13 +239,13 @@ impl Frame {
         }
     }
 
-    pub(crate) fn new_like(h: &FrameHeader, width: u32, height: u32) -> Frame {
-        let mut f = Frame::new(width, height, h.chroma, h.bit_depth, h.alpha);
+    pub(crate) fn new_like(h: &FrameHeader, width: u32, height: u32) -> Result<Frame> {
+        let mut f = Frame::try_new(width, height, h.chroma, h.bit_depth, h.alpha)?;
         f.rgb = h.rgb_planes();
         f.color_volume = h.color_volume;
         f.cid = h.cid;
         f.par = h.par;
-        f
+        Ok(f)
     }
 
     pub fn chroma_width(&self) -> u32 {
@@ -229,3 +256,6 @@ impl Frame {
         self.chroma.chroma_height(self.height)
     }
 }
+
+#[cfg(test)]
+mod tests;
