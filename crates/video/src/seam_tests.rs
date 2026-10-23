@@ -359,6 +359,20 @@ fn the_frame_cache_is_bounded_by_bytes() {
     assert_eq!(crate::DEFAULT_CACHE_BYTES, 1 << 30);
 }
 
+/// By default the cache is an LRU by bytes (Gil, decision 5): small frames are not held to a dozen.
+#[test]
+fn by_default_the_frame_cache_keeps_many_small_frames() {
+    let layout = long_run();
+    let (mut m, _) = scripted(&layout, Script::default());
+    let n = 40;
+    for i in 0..n {
+        assert_shows(&m.frame(i).unwrap(), &layout, i as i64);
+    }
+    assert_eq!(m.cached_bytes(), n * 16, "all {n} frames (16 bytes each) are still cached");
+    assert!((0..n).all(|i| m.is_cached(i)));
+    assert!(crate::DEFAULT_CACHE_FRAMES >= 512);
+}
+
 #[test]
 fn an_unsupported_stream_stops_decoding_at_once() {
     let layout = open_gop();

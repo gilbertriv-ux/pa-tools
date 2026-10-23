@@ -176,10 +176,15 @@ struct GopState {
     ready: BTreeMap<usize, Yuv>,
 }
 
-/// Most bytes of decoded RGBA pictures the full-size frame cache keeps by default (1 GiB). The frame
-/// count cap alone is not a memory bound: 12 frames are 400 MB at 4K but 1.7 GB at 8K UHD and 3.2 GB
-/// at 8192 x 8192. See [`Movie::set_cache_bytes`].
+/// Most bytes of decoded RGBA pictures the full-size frame cache keeps (1 GiB: Gil, decision 5,
+/// 2026-10-23). The cache is an LRU by bytes: about 129 frames at 1080p, 32 at 4K UHD, 8 at 8K UHD
+/// and 4 at 8192 x 8192. It is separate from the decoder's own working-memory budget. See
+/// [`Movie::set_cache_bytes`].
 pub const DEFAULT_CACHE_BYTES: usize = 1 << 30;
+
+/// Most frames the full-size cache keeps. This is a ceiling for tiny pictures (the lookup is a linear
+/// scan), not the bound: the byte budget is, from 480p up. [`Movie::set_cache_frames`] lowers it.
+pub const DEFAULT_CACHE_FRAMES: usize = 512;
 
 /// Most bytes the thumbnail cache keeps (a timeline thumbnail is a few tens of kilobytes, so this
 /// only bites if someone asks for very tall ones).
@@ -402,7 +407,7 @@ impl Movie {
             rank,
             times,
             gop: None,
-            cache: Lru::new(12, DEFAULT_CACHE_BYTES),
+            cache: Lru::new(DEFAULT_CACHE_FRAMES, DEFAULT_CACHE_BYTES),
             thumbs: Lru::new(256, THUMB_CACHE_BYTES),
             decoded: 0,
         })
@@ -794,13 +799,13 @@ mod tests {
     #[test]
     fn the_default_budget_is_one_gibibyte_and_holds_eight_k_frames() {
         assert_eq!(DEFAULT_CACHE_BYTES, 1 << 30);
-        // 12 RGBA frames: 400 MB at 4K but 1.7 GB at 8K UHD and 3.2 GB at 8192 x 8192, so the count
-        // alone is no bound; the byte budget holds 6 frames of 8K UHD and 4 of 8192 x 8192.
-        let uhd8k = 7680usize * 4320 * 4;
-        let square = 8192usize * 8192 * 4;
-        assert!(12 * uhd8k > DEFAULT_CACHE_BYTES && 12 * square > DEFAULT_CACHE_BYTES);
-        assert_eq!((DEFAULT_CACHE_BYTES / uhd8k, DEFAULT_CACHE_BYTES / square), (8, 4));
-        assert!(12 * 3840 * 2160 * 4 < DEFAULT_CACHE_BYTES);
+        // RGBA frames the byte budget holds (the count ceiling is far above all of these)
+        let held = |w: usize, h: usize| (DEFAULT_CACHE_BYTES / (w * h * 4)).min(DEFAULT_CACHE_FRAMES);
+        assert_eq!(held(1920, 1080), 129);
+        assert_eq!(held(3840, 2160), 32);
+        assert_eq!(held(7680, 4320), 8);
+        assert_eq!(held(8192, 8192), 4);
+        assert_eq!(held(64, 64), DEFAULT_CACHE_FRAMES, "tiny pictures meet the count ceiling first");
     }
 
     #[test]
