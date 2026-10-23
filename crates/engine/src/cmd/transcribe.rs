@@ -307,7 +307,12 @@ fn render_mono_until(
         RANGES_RENDERED.with(|n| n.set(n.get() + 1));
         let part = soundcraft_pa_speech::downmix(&soundcraft_mix::render_clips_settled(s, track, range));
         if part.len() != len {
-            return Err(bad(TRANSCRIBE, format!("rendering stopped early ({} of {len} samples at {start}); nothing was transcribed", part.len())));
+            // Not the caller's parameters (they were fine, and the job may be on the worker by now):
+            // the render itself came up short, so say that.
+            return Err(crate::EngineError::Io(format!(
+                "Transcription failed: the track's audio could not be rendered in full (got {} of {len} samples at {start}); nothing was transcribed",
+                part.len()
+            )));
         }
         mono.extend_from_slice(&part);
         start += len;
@@ -1008,8 +1013,30 @@ mod tests {
     fn a_render_that_comes_back_short_is_an_error_not_an_ok() {
         let e = demo_engine();
         // A track that does not exist renders nothing; asking for 1000 samples must not give 0 back.
-        let err = render_mono(e.session(), TrackId(987_654), 1_000, 400).unwrap_err().to_string();
-        assert!(err.contains("rendering stopped early"), "{err}");
+        let err = render_mono(e.session(), TrackId(987_654), 1_000, 400).unwrap_err();
+        assert!(err.to_string().contains("could not be rendered in full"), "{err}");
+        assert!(matches!(err, crate::EngineError::Io(_)), "a short render is a failure of the render, not of the parameters: {err:?}");
+    }
+
+    /// The report: a render that came back short on the worker still read "bad parameters for
+    /// `track.transcribe`", though the parameters were fine. Through a whole job, with the track gone
+    /// from the snapshot's session so that nothing renders, the error is an `Io` one that says what
+    /// happened, and the recogniser never runs.
+    #[test]
+    fn a_short_render_in_a_job_is_a_failure_not_bad_parameters() {
+        let e = demo_engine();
+        let t = first_audio(&e);
+        let recorder = Recorder::new(&[("x", 0.0, 0.1)]);
+        let mut job = transcribe_job_with_transcriber(&e, &json!({"track": t.0}), recorder.clone()).unwrap();
+        // The request was fine and the snapshot taken; now the worker is asked to render a track the
+        // snapshot does not hold, which renders nothing.
+        job.track = TrackId(987_654);
+        let err = job.run(&mut |_, _| true).unwrap_err();
+        assert!(matches!(err, crate::EngineError::Io(_)), "{err:?}");
+        let said = err.to_string();
+        assert!(said.starts_with("Transcription failed: ") && said.contains("could not be rendered in full"), "{said}");
+        assert!(!said.contains("bad parameters") && !said.contains("track.transcribe"), "{said}");
+        assert!(recorder.heard().is_empty(), "nothing was recognised");
     }
 
     #[test]
