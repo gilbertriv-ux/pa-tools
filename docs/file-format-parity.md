@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (video: VC-3 decode; HEVC and AV1 decode behind compile-time features; previously trivial: WAV empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (video: VC-3 decode; HEVC and AV1 decode behind compile-time features, AV1 8K UHD at 4:2:0, one shared frame cache; previously trivial: WAV empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -71,8 +71,9 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | Bounce with video | export | — | ❌ | G-17 |
 
 HDR pictures are shown without tone mapping, and VC-3 alpha is not used (pictures are opaque).
-Pictures are limited to 8192 × 8192 pixels (67 million) and each decoder to a 1 GiB working budget; these
-are defaults, not a recorded decision. The 🟡 on HEVC and AV1 is only the build switch: the code is done and tested
+Pictures are limited to 8192 × 8192 pixels (67 million), each decoder to a working budget (AV1 1.6 GiB, which
+admits full 8K UHD at 4:2:0; HEVC and VC-3 1 GiB) and the decoded frames of all open movies to one 1 GiB cache
+(Gil's decisions 5, 5b and 6, [video-codecs.md](video-codecs.md)). The 🟡 on HEVC and AV1 is only the build switch: the code is done and tested
 (CI runs it with both features on). The ~40 % file-formats estimate above does not move.
 
 ## Plugin and preset files
@@ -88,6 +89,7 @@ are defaults, not a recorded decision. The 🟡 on HEVC and AV1 is only the buil
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-23 | minor | Video (G-17): VC-3 import ✅ in MOV; HEVC and AV1 import written and tested but behind the compile-time features `hevc-decode` / `av1-decode`, off in shipped builds (patent posture, [video-codecs.md](video-codecs.md)) so shown 🟡; MXF / Matroska / WebM / IVF readers still missing. Readiness estimate unchanged |
+| 2026-10-23 | trivial | Video limits restated with Gil's recorded decisions: AV1 decoder budget 1.6 GiB (full 8K UHD at 4:2:0), one 1 GiB frame cache for the whole app. Readiness estimate unchanged |
 | 2026-10-13 | trivial | WAV: empty data chunk with trailing metadata (#466) |
 | 2026-10-13 | minor | Fade curvature round-trips in sessions with a zero default for older files. Format version and readiness estimate unchanged |
 | 2026-10-10 | major | Created: format inventory against Pro Tools 2026.4.1's declared document types and import/bounce options |
