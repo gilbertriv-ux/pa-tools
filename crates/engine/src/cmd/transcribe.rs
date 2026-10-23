@@ -19,11 +19,16 @@ use crate::cmd;
 use serde_json::json;
 use soundcraft_model::{TrackKind, Transcript, TranscriptWord};
 use soundcraft_pa_speech::{ModelSearch, resolve_models_dir};
-use soundcraft_time::{Range, SampleRate};
+use soundcraft_time::{Range, SampleRate, Samples};
 use std::path::PathBuf;
 
 const TRANSCRIBE: &str = "track.transcribe";
 const SET_TRANSCRIPT: &str = "track.set_transcript";
+
+/// Longest stretch of a track, in seconds, that is rendered for transcription: the recogniser's own
+/// limit ([`soundcraft_pa_speech::MAX_AUDIO_SECS`], 4 hours). Checked before any audio is rendered
+/// or allocated, so a very long session is refused at once with a clear error.
+pub const MAX_TRANSCRIBE_SECS: usize = soundcraft_pa_speech::MAX_AUDIO_SECS;
 
 /// Most words one stored transcript may hold (about 100 hours of speech); more is refused.
 pub const MAX_TRANSCRIPT_WORDS: usize = 2_000_000;
@@ -111,6 +116,7 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
     // Render the track's clips and downmix to mono at the session rate, then resample to 16 kHz.
     let sr = e.session().sample_rate;
     let end = e.session().content_end();
+    check_length(end, sr)?;
     let channels = soundcraft_mix::render_clips(e.session(), track, Range::new(0, end));
     let mono = soundcraft_pa_speech::downmix(&channels);
     // High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's 16 kHz.
@@ -122,6 +128,22 @@ fn transcribe_job_with(e: &Engine, p: &Value, search: &ModelSearch) -> Result<Tr
         max_speakers: 6,
     };
     Ok(TranscribeJob { track, sample_rate: sr, audio, model, models_dir, opts })
+}
+
+/// Refuse a session longer than [`MAX_TRANSCRIBE_SECS`] (`end` samples at `sr`) before rendering it.
+fn check_length(end: Samples, sr: SampleRate) -> Result<()> {
+    let secs = end.max(0) as f64 / sr.as_f64().max(1.0);
+    if secs > MAX_TRANSCRIBE_SECS as f64 {
+        return Err(bad(
+            TRANSCRIBE,
+            format!(
+                "the session is {:.1} hours long; transcription is limited to {} hours (shorten the track or the session first)",
+                secs / 3600.0,
+                MAX_TRANSCRIBE_SECS / 3600
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl TranscribeJob {
@@ -445,6 +467,32 @@ mod tests {
         let other = ModelSearch::from_parts(soundcraft_pa_speech::Platform::Other, soundcraft_brand::APP_NAME, home, None);
         let expected = std::path::Path::new("/home/gil/.local/share").join(soundcraft_brand::CONFIG_DIR_XDG).join("models");
         assert_eq!(other.app_support, Some(expected));
+    }
+
+    #[test]
+    fn a_session_longer_than_the_cap_is_refused_before_anything_is_rendered() {
+        let sr = SampleRate::HZ_48000;
+        let cap = MAX_TRANSCRIBE_SECS as i64 * 48_000;
+        assert!(check_length(0, sr).is_ok());
+        assert!(check_length(cap, sr).is_ok(), "exactly the cap is allowed");
+        let msg = check_length(cap + 48_000, sr).unwrap_err().to_string();
+        assert!(msg.contains("4.0 hours") && msg.contains("limited to 4 hours"), "{msg}");
+        assert!(check_length(i64::MAX, sr).is_err(), "no overflow");
+        assert!(check_length(-5, sr).is_ok());
+
+        // And through the command: move a clip to just past the cap; the job (and so the
+        // command) refuses without rendering the 4+ hours of audio that would otherwise be built.
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let clip = e.session().tracks.iter().find(|x| x.id == t).and_then(|x| x.clips().first().map(|c| c.id)).unwrap();
+        let hz = i64::from(e.session().sample_rate.hz());
+        e.session_mut().find_clip_mut(clip).unwrap().start = (MAX_TRANSCRIBE_SECS as i64 + 60) * hz;
+        let search = ModelSearch::default();
+        let refused = transcribe_job_with(&e, &json!({"track": t.0}), &search).err().expect("too long");
+        assert!(refused.to_string().contains("hours long"), "{refused}");
+        let steps = e.undo_history().len();
+        assert!(e.execute(TRANSCRIBE, &json!({"track": t.0})).is_err());
+        assert_eq!(e.undo_history().len(), steps);
     }
 
     #[test]

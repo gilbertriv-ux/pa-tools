@@ -259,6 +259,8 @@ impl Whisper {
 
     /// Transcribe mono 16 kHz audio, producing the internal tick-based transcript.
     fn run(&self, audio: &[f32], opts: &Options, progress: ProgressFn) -> Result<Transcript, SpeechError> {
+        // Refuse before allocating anything for it (see `crate::MAX_AUDIO_SECS`).
+        crate::check_length(audio.len())?;
         let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let n_mels = m.cfg.num_mel_bins;
         let content_frames = audio.len() / SAMPLES_PER_FRAME;
@@ -339,7 +341,7 @@ impl Whisper {
                 return Err(SpeechError::Cancelled);
             }
             let p = crate::diarize::Params { max_speakers: opts.max_speakers, ..Default::default() };
-            crate::diarize::diarize(audio, &mut t, &p);
+            crate::diarize::diarize(audio, &mut t, &p, &mut |status| progress(0.96, status))?;
         }
         progress(1.0, "Done");
         Ok(t)

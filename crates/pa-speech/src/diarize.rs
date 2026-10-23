@@ -17,13 +17,23 @@
 //!    nearest neighbour.
 //! 4. Speakers are numbered in order of first appearance ("Speaker 1", "Speaker 2"…).
 //!
+//! The cost is bounded: step 3 is cubic in the number of chunks, so more than
+//! [`Params::max_chunks`] chunks (about [`MAX_CHUNKS`] by default, an hour or two of continuous
+//! speech) are first merged into longer stretches of neighbouring chunks, and the caller is told
+//! (the speakers are then found per stretch, not per turn). The caller's callback runs inside every
+//! loop of steps 2 and 3, and returning `false` from it stops the work.
+//!
 //! It works for interviews and dialogue with distinct voices and clean turns; overlapping speech,
 //! very similar voices or music beds confuse it. Labels are editable in the Text panel (rename a
 //! speaker, or assign words to a speaker by hand), which is the fallback when it gets them wrong.
 
-use crate::SAMPLE_RATE;
 use crate::ptranscript::{Speaker, Transcript};
 use crate::tick::{TICKS_PER_SAMPLE, Tick};
+use crate::{SAMPLE_RATE, SpeechError};
+
+/// Most chunks clustered at once by default: the pairwise distance matrix is `n²` floats (16 MB
+/// here) and the agglomerative loop is `O(n³)`.
+pub const MAX_CHUNKS: usize = 2_000;
 
 /// Tunables (defaults chosen on LibriSpeech test-clean dialogues; see `docs/transcripts.md`).
 #[derive(Clone, Debug, PartialEq)]
@@ -33,12 +43,14 @@ pub struct Params {
     pub max_chunk: Tick,
     pub threshold: f32,
     pub max_speakers: usize,
+    /// More chunks than this are merged into longer stretches before clustering.
+    pub max_chunks: usize,
 }
 
 impl Default for Params {
     fn default() -> Self {
         let ms = |m: i64| Tick(m * TICKS_PER_SAMPLE * SAMPLE_RATE as i64 / 1000);
-        Self { chunk_gap: ms(250), min_chunk: ms(700), max_chunk: ms(4000), threshold: 0.4, max_speakers: 6 }
+        Self { chunk_gap: ms(250), min_chunk: ms(700), max_chunk: ms(4000), threshold: 0.4, max_speakers: 6, max_chunks: MAX_CHUNKS }
     }
 }
 
@@ -76,6 +88,16 @@ pub fn chunks(t: &Transcript, p: &Params) -> Vec<std::ops::Range<usize>> {
     merged
 }
 
+/// Merge neighbouring chunks, equal groups at a time, until at most `max` remain (at least one).
+fn coarsen(chunks: Vec<std::ops::Range<usize>>, max: usize) -> Vec<std::ops::Range<usize>> {
+    let max = max.max(1);
+    if chunks.len() <= max {
+        return chunks;
+    }
+    let group = chunks.len().div_ceil(max);
+    chunks.chunks(group).filter_map(|g| Some(g.first()?.start..g.last()?.end)).collect()
+}
+
 fn mfcc_frames(audio: &[f32]) -> (usize, Vec<f32>, Vec<f32>) {
     let (frames, mel) = crate::mel::mel_energies(audio, N_MELS);
     // per frame: log energies (dB-ish) and the DCT-II of the log mel
@@ -109,21 +131,37 @@ fn rms_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// Label the speakers of `t` from `audio` (mono 16 kHz, the transcript's time base). Replaces
 /// `t.speakers` and every word's speaker; returns the number of speakers found.
-pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
+///
+/// `keep_going(status)` is called throughout, including inside the clustering loops (about once
+/// per merge), with a short status text; returning `false` stops the work with
+/// [`SpeechError::Cancelled`] and leaves `t` as it was. It is also called once, with a note, when
+/// there are more chunks than `p.max_chunks` and they are merged into longer stretches.
+pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params, keep_going: &mut dyn FnMut(&str) -> bool) -> Result<usize, SpeechError> {
+    const STATUS: &str = "Labelling speakers";
+    let mut check = |status: &str| if keep_going(status) { Ok(()) } else { Err(SpeechError::Cancelled) };
     let ch = chunks(t, p);
     if t.words.is_empty() {
-        return 0;
+        return Ok(0);
     }
+    let ch = if ch.len() > p.max_chunks.max(1) {
+        let before = ch.len();
+        let ch = coarsen(ch, p.max_chunks);
+        check(&format!("Many speaker turns ({before}): labelling speakers in {} longer stretches", ch.len()))?;
+        ch
+    } else {
+        ch
+    };
     let one = |t: &mut Transcript| {
         t.speakers = vec![Speaker { name: "Speaker 1".into() }];
         for w in &mut t.words {
             w.speaker = Some(0);
         }
-        1
+        Ok(1)
     };
     if ch.len() < 2 {
         return one(t);
     }
+    check(STATUS)?;
     let (frames, energy, mfcc) = mfcc_frames(audio);
     // chunk vectors: mean and std of MFCC 1..N over voiced frames
     let dim = 2 * (N_MFCC - 1);
@@ -166,6 +204,7 @@ pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
     let n = vecs.len();
     let mut dist = vec![0f32; n * n];
     for i in 0..n {
+        check(STATUS)?;
         for j in i + 1..n {
             let d = rms_distance(&vecs[i], &vecs[j]);
             dist[i * n + j] = d;
@@ -187,6 +226,7 @@ pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
         if clusters.len() <= 1 {
             break;
         }
+        check(STATUS)?;
         let mut best = (f32::INFINITY, 0, 0);
         for i in 0..clusters.len() {
             for j in i + 1..clusters.len() {
@@ -208,6 +248,7 @@ pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
         if clusters.len() <= 1 {
             break;
         }
+        check(STATUS)?;
         let small = clusters.iter().position(|c| c.iter().map(|&i| weight[i]).sum::<f32>() < 0.05 * total);
         let Some(si) = small else { break };
         let s = clusters.remove(si);
@@ -237,7 +278,7 @@ pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
         }
     }
     t.speakers = (0..order.len()).map(|i| Speaker { name: format!("Speaker {}", i + 1) }).collect();
-    order.len()
+    Ok(order.len())
 }
 
 #[cfg(test)]
@@ -283,15 +324,16 @@ mod tests {
         out
     }
 
-    #[test]
-    fn two_synthetic_voices_are_told_apart() {
+    const TURNS: [bool; 8] = [true, false, true, true, false, false, true, false];
+
+    /// Two alternating synthetic voices: the audio and a transcript of four words per turn.
+    fn dialogue() -> (Vec<f32>, Transcript) {
         let a = |s| voice(110.0, [(600.0, 90.0), (1100.0, 120.0)], 2.0, s);
         let b = |s| voice(230.0, [(400.0, 80.0), (2600.0, 150.0)], 2.0, s);
         let silence = vec![0f32; 8000];
-        let turns = [true, false, true, true, false, false, true, false];
         let mut audio = Vec::new();
         let mut words = Vec::new();
-        for (k, &is_a) in turns.iter().enumerate() {
+        for (k, &is_a) in TURNS.iter().enumerate() {
             let t0 = audio.len() as f64 / 16_000.0;
             audio.extend(if is_a { a(k as u32) } else { b(k as u32) });
             // four 0.5 s "words" per turn
@@ -301,8 +343,14 @@ mod tests {
             }
             audio.extend(&silence);
         }
-        let mut t = Transcript { words, ..Default::default() };
-        let n = diarize(&audio, &mut t, &Params::default());
+        (audio, Transcript { words, ..Default::default() })
+    }
+
+    #[test]
+    fn two_synthetic_voices_are_told_apart() {
+        let turns = TURNS;
+        let (audio, mut t) = dialogue();
+        let n = diarize(&audio, &mut t, &Params::default(), &mut |_| true).unwrap();
         assert_eq!(n, 2);
         for (k, &is_a) in turns.iter().enumerate() {
             let want = if is_a { 0 } else { 1 };
@@ -319,7 +367,7 @@ mod tests {
         let audio = voice(140.0, [(500.0, 90.0), (1500.0, 120.0)], 12.0, 1);
         let words = (0..20).map(|i| Word::new("x", seconds_tick(i as f64 * 0.6), seconds_tick(i as f64 * 0.6 + 0.4))).collect();
         let mut t = Transcript { words, ..Default::default() };
-        assert_eq!(diarize(&audio, &mut t, &Params::default()), 1);
+        assert_eq!(diarize(&audio, &mut t, &Params::default(), &mut |_| true), Ok(1));
         assert!(t.words.iter().all(|w| w.speaker == Some(0)));
     }
 
@@ -328,5 +376,63 @@ mod tests {
         let w = |a: f64, b: f64| Word::new("x", seconds_tick(a), seconds_tick(b));
         let t = Transcript { words: vec![w(0.0, 0.5), w(0.5, 1.0), w(2.0, 2.2), w(3.0, 3.6), w(3.6, 4.4)], ..Default::default() };
         assert_eq!(chunks(&t, &Params::default()), vec![0..3, 3..5]);
+    }
+
+    #[test]
+    fn coarsen_bounds_the_chunk_count_and_keeps_order_and_coverage() {
+        let many: Vec<std::ops::Range<usize>> = (0..10_000).map(|i| i * 2..i * 2 + 2).collect();
+        for max in [1usize, 2, 3, 7, 1999, 2000, 9_999] {
+            let c = coarsen(many.clone(), max);
+            assert!(!c.is_empty() && c.len() <= max, "max {max}: {} chunks", c.len());
+            assert_eq!(c.first().map(|r| r.start), Some(0));
+            assert_eq!(c.last().map(|r| r.end), Some(20_000));
+            assert!(c.windows(2).all(|w| w[0].end == w[1].start), "max {max}: groups are neighbours with no gap");
+        }
+        // within the cap nothing changes; zero is read as one; empty stays empty
+        assert_eq!(coarsen(many.clone(), 10_000), many);
+        assert_eq!(coarsen(many.clone(), 0).len(), 1);
+        assert!(coarsen(Vec::new(), 5).is_empty());
+        const { assert!(MAX_CHUNKS * MAX_CHUNKS * 4 <= 32 << 20, "the distance matrix stays small") };
+    }
+
+    #[test]
+    fn more_chunks_than_the_cap_degrade_gracefully_with_a_note() {
+        let (audio, mut t) = dialogue();
+        let all = chunks(&t, &Params::default()).len();
+        assert!(all >= 4, "the fixture has several chunks ({all})");
+        let p = Params { max_chunks: 2, ..Params::default() };
+        let mut notes = Vec::new();
+        let n = diarize(&audio, &mut t, &p, &mut |s| {
+            notes.push(s.to_string());
+            true
+        })
+        .unwrap();
+        assert!(n >= 1);
+        assert!(notes.iter().any(|s| s.contains("longer stretches")), "the caller is told: {notes:?}");
+        assert!(t.words.iter().all(|w| w.speaker.is_some()), "every word is still labelled");
+        t.check().unwrap();
+    }
+
+    #[test]
+    fn cancelling_at_any_checkpoint_stops_and_leaves_the_transcript_alone() {
+        let (audio, t0) = dialogue();
+        let mut calls = 0usize;
+        diarize(&audio, &mut t0.clone(), &Params::default(), &mut |_| {
+            calls += 1;
+            true
+        })
+        .unwrap();
+        // one check before the heavy work, one per row of the distance matrix, one per merge
+        assert!(calls > chunks(&t0, &Params::default()).len(), "checked inside the loops, not once ({calls} calls)");
+        for stop_at in 1..=calls {
+            let mut t = t0.clone();
+            let mut seen = 0usize;
+            let r = diarize(&audio, &mut t, &Params::default(), &mut |_| {
+                seen += 1;
+                seen < stop_at
+            });
+            assert_eq!(r, Err(SpeechError::Cancelled), "stop at call {stop_at}");
+            assert_eq!(t, t0, "a cancelled run changes nothing (stop at call {stop_at})");
+        }
     }
 }

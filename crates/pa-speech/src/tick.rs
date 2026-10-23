@@ -40,11 +40,28 @@ impl std::ops::Add for Tick {
 
 /// Media time of a 16 kHz sample index.
 pub fn sample_tick(n: i64) -> Tick {
-    Tick(n * TICKS_PER_SAMPLE)
+    Tick(n.saturating_mul(TICKS_PER_SAMPLE))
 }
 
 /// Media time of `s` seconds (rounded to the nearest 16 kHz sample). Test helper.
 #[cfg(test)]
 pub fn seconds_tick(s: f64) -> Tick {
     sample_tick((s * SAMPLE_RATE as f64).round() as i64)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_ticks_are_exact_and_saturate_instead_of_overflowing() {
+        assert_eq!(sample_tick(0), Tick(0));
+        assert_eq!(sample_tick(16_000).seconds(), 1.0);
+        assert_eq!(sample_tick(-16_000).seconds(), -1.0);
+        // far beyond any real position: pinned at the limit, never wrapped or panicking
+        assert_eq!(sample_tick(i64::MAX), Tick(i64::MAX));
+        assert_eq!(sample_tick(i64::MIN), Tick(i64::MIN));
+        assert_eq!(sample_tick(i64::MAX / TICKS_PER_SAMPLE + 1), Tick(i64::MAX));
+    }
 }

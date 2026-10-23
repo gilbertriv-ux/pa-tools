@@ -9,7 +9,7 @@
 //! - [`Transcriber`]: the trait every recogniser implements — mono 16 kHz samples in, a
 //!   [`Transcript`] with word-level time bounds out.
 //! - [`FixedTranscriber`]: returns a supplied transcript (tests, demos, agents that bring their
-//!   own transcript); words past the clip's end are dropped. No model.
+//!   own transcript); words that end past the clip's end are dropped. No model.
 //! - [`models`]: the catalogue of downloadable Whisper models (source pinned to a revision,
 //!   SHA-256, size, licence) and where they live. Weights are **never** bundled or committed.
 //! - [`discover`]: finds installed model weights at run time ([`ModelSearch`], [`resolve_models_dir`]):
@@ -45,6 +45,25 @@ use serde::{Deserialize, Serialize};
 
 /// The sample rate every transcriber takes.
 pub const SAMPLE_RATE: u32 = 16_000;
+
+/// The longest audio, in seconds, that a recogniser accepts (4 hours). Longer is refused with
+/// [`SpeechError::TooLong`] before anything is allocated for it: the recogniser holds several
+/// spectrogram-sized buffers for the whole clip (about 100 MB per hour for the mel front end
+/// alone, more for speaker labelling), and the decoder walks it in 30 s windows.
+pub const MAX_AUDIO_SECS: usize = 4 * 3600;
+
+/// [`MAX_AUDIO_SECS`] in samples at [`SAMPLE_RATE`].
+pub const MAX_AUDIO_SAMPLES: usize = MAX_AUDIO_SECS * SAMPLE_RATE as usize;
+
+/// `Ok` when `samples` (at [`SAMPLE_RATE`]) is within [`MAX_AUDIO_SAMPLES`], else
+/// [`SpeechError::TooLong`] saying how long it is and what the limit is.
+pub fn check_length(samples: usize) -> Result<(), SpeechError> {
+    if samples <= MAX_AUDIO_SAMPLES {
+        return Ok(());
+    }
+    let hours = samples as f64 / f64::from(SAMPLE_RATE) / 3600.0;
+    Err(SpeechError::TooLong(format!("{hours:.1} hours; the limit is {} hours", MAX_AUDIO_SECS / 3600)))
+}
 
 /// A transcribed word with its time bounds in seconds (relative to the first sample).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,6 +118,9 @@ pub enum SpeechError {
     Unavailable(String),
     #[error("model: {0}")]
     Model(String),
+    /// The audio is longer than [`MAX_AUDIO_SECS`]; the text says by how much.
+    #[error("the audio is too long to transcribe ({0})")]
+    TooLong(String),
     #[error("download: {0}")]
     Download(String),
     #[error("{0}")]
@@ -140,7 +162,7 @@ pub trait Transcriber: Send + Sync {
 }
 
 /// A transcriber that returns a fixed transcript (tests, demos and agents that bring their own
-/// transcript); words beyond the audio's length are dropped.
+/// transcript); words that end past the audio's length are dropped.
 pub struct FixedTranscriber {
     pub transcript: Transcript,
     pub id: String,
@@ -156,7 +178,8 @@ impl Transcriber for FixedTranscriber {
         }
         let end_sec = audio.len() as f64 / SAMPLE_RATE as f64;
         let mut t = self.transcript.clone();
-        t.words.retain(|w| w.start_sec < end_sec);
+        // A word that ends past the clip (or has no finite bounds) is not in the audio: dropped.
+        t.words.retain(|w| w.start_sec.is_finite() && w.end_sec.is_finite() && w.end_sec <= end_sec);
         t.source = self.id.clone();
         progress(1.0, "Done");
         Ok(t)
@@ -224,6 +247,7 @@ pub fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -232,6 +256,17 @@ mod tests {
         assert_eq!(word_error_rate("the cat sat", "The cat, sat."), 0.0);
         assert!((word_error_rate("the cat sat on the mat", "the cat sat on mat") - 1.0 / 6.0).abs() < 1e-9);
         assert!((word_error_rate("a b", "a x b y") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_longer_than_the_cap_is_refused_before_any_work() {
+        assert_eq!(MAX_AUDIO_SAMPLES, 4 * 3600 * 16_000);
+        assert_eq!(check_length(0), Ok(()));
+        assert_eq!(check_length(MAX_AUDIO_SAMPLES), Ok(()));
+        let err = check_length(MAX_AUDIO_SAMPLES + 1).unwrap_err();
+        assert!(matches!(err, SpeechError::TooLong(_)));
+        assert!(err.to_string().contains("4.0 hours; the limit is 4 hours"), "{err}");
+        assert!(check_length(usize::MAX).is_err(), "no overflow on absurd lengths");
     }
 
     #[test]
