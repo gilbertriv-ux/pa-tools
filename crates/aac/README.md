@@ -94,7 +94,7 @@ covers every input sample (`ceil(n / 1024) + 1` access units).
 
 Performance (Apple Silicon, release, single thread): 10 s of 44.1 kHz stereo encodes at ~85× realtime
 and decodes at ~1000× realtime. With the `rayon` feature channels are quantised in parallel inside the
-rate loop.
+rate loop; the feature only takes effect together with `aac-encode` and does not enable it.
 
 ## Decoder
 

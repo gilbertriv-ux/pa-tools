@@ -602,12 +602,12 @@ impl Encoder {
     }
 
     fn quantise_all(frames: &[ElementFrame], lambda: f32) -> Vec<Vec<QuantChannel>> {
-        #[cfg(feature = "rayon")]
+        #[cfg(all(feature = "rayon", feature = "aac-encode"))]
         {
             use rayon::prelude::*;
             frames.par_iter().map(|f| f.chans.par_iter().map(|c| quantise_channel(c, lambda)).collect()).collect()
         }
-        #[cfg(not(feature = "rayon"))]
+        #[cfg(not(all(feature = "rayon", feature = "aac-encode")))]
         {
             frames.iter().map(|f| f.chans.iter().map(|c| quantise_channel(c, lambda)).collect()).collect()
         }
