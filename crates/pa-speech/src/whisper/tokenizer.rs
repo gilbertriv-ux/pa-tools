@@ -48,12 +48,28 @@ fn unicode_to_byte() -> HashMap<char, u8> {
 /// from the file never sizes an allocation past this.
 pub const MAX_VOCAB: usize = 262_144;
 
+/// Timestamp tokens in a model's vocabulary: `<|0.00|>` to `<|30.00|>` in 0.02 s steps.
+pub const TIMESTAMP_COUNT: usize = 1501;
+
 /// The longest language code accepted for a language token (`haw`, `yue`, ...).
 const MAX_LANGUAGE_CODE: usize = 8;
 
 /// The language code inside a `<|xx|>` token, if it has one. `<|>` and `<|en` have none.
 fn language_code(token: &str) -> Option<&str> {
     token.strip_prefix("<|")?.strip_suffix("|>")
+}
+
+/// The step (0..=1500, in 0.02 s) of a timestamp token `<|S.SS|>`, if `token` is one. A token
+/// that is shaped like a timestamp but is not on the 0.02 s grid (`<|0.01|>`, `<|31.00|>`) is
+/// `Some(Err(()))`: it is neither a timestamp nor an ordinary special token.
+fn timestamp_step(token: &str) -> Option<Result<usize, ()>> {
+    let (secs, hundredths) = language_code(token)?.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 2 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(secs) || hundredths.len() != 2 || !digits(hundredths) {
+        return None;
+    }
+    let (secs, hundredths): (usize, usize) = (secs.parse().ok()?, hundredths.parse().ok()?);
+    Some(if hundredths % 2 == 0 && secs * 50 + hundredths / 2 < TIMESTAMP_COUNT { Ok(secs * 50 + hundredths / 2) } else { Err(()) })
 }
 
 fn plausible_language_code(code: &str) -> bool {
@@ -76,10 +92,14 @@ impl Tokenizer {
         }
         let table = unicode_to_byte();
         let mut bytes = vec![Vec::new(); vocab_size];
+        let mut highest_text_id = 0usize;
         for (tok, id) in vocab {
             let id = id.as_u64().ok_or_else(|| bad("vocab id is not a whole number"))?;
-            let slot = usize::try_from(id).ok().and_then(|i| bytes.get_mut(i));
-            let Some(slot) = slot else { return Err(bad(&format!("vocab id {id} is outside 0..{vocab_size}"))) };
+            let index = usize::try_from(id).ok().filter(|i| *i < vocab_size);
+            let (Some(index), Some(slot)) = (index, index.and_then(|i| bytes.get_mut(i))) else {
+                return Err(bad(&format!("vocab id {id} is outside 0..{vocab_size}")));
+            };
+            highest_text_id = highest_text_id.max(index);
             *slot = tok.chars().filter_map(|c| table.get(&c).copied()).collect();
         }
         let added = v["added_tokens"].as_array().ok_or_else(|| bad("no added_tokens"))?;
@@ -109,6 +129,8 @@ impl Tokenizer {
             }
         }
         languages.sort_by_key(|x| x.1);
+        let timestamp_begin = need("<|0.00|>")?;
+        check_timestamp_layout(&special, timestamp_begin, highest_text_id, vocab_size).map_err(|why| bad(&why))?;
         Ok(Self {
             eot: need("<|endoftext|>")?,
             sot,
@@ -116,7 +138,7 @@ impl Tokenizer {
             translate,
             no_timestamps: need("<|notimestamps|>")?,
             no_speech: get("<|nospeech|>").or_else(|| get("<|nocaptions|>")),
-            timestamp_begin: need("<|0.00|>")?,
+            timestamp_begin,
             languages,
             bytes,
             special,
@@ -154,6 +176,40 @@ impl Tokenizer {
     pub fn non_text_specials(&self) -> Vec<u32> {
         self.special.values().copied().filter(|&id| id != self.eot && id < self.timestamp_begin).collect()
     }
+}
+
+/// The timestamp tokens must be what the decoder assumes they are: one run of [`TIMESTAMP_COUNT`]
+/// consecutive ids starting at `<|0.00|>`, inside the vocabulary and above every other token, so
+/// that "id >= `timestamp_begin`" means "timestamp" and nothing else does. A file that breaks this
+/// (say `<|0.00|>` moved to id 0, making every token a timestamp) would make the decoder step the
+/// audio forward 10 ms at a time, for hours; it is refused when the model is loaded.
+fn check_timestamp_layout(special: &HashMap<String, u32>, timestamp_begin: u32, highest_text_id: usize, vocab_size: usize) -> Result<(), String> {
+    let begin = timestamp_begin as usize;
+    if begin.saturating_add(TIMESTAMP_COUNT) > vocab_size {
+        return Err(format!("the {TIMESTAMP_COUNT} timestamp tokens starting at <|0.00|> (id {begin}) do not fit in a vocabulary of {vocab_size}"));
+    }
+    if highest_text_id >= begin {
+        return Err(format!("text token {highest_text_id} lies at or after <|0.00|> (id {begin}): timestamps must come after every other token"));
+    }
+    for (content, &id) in special {
+        match timestamp_step(content) {
+            Some(Ok(step)) if id as usize == begin + step => {}
+            Some(Ok(step)) => {
+                return Err(format!(
+                    "{content} has id {id}, but the timestamp tokens run consecutively from <|0.00|> (id {begin}): expected {}",
+                    begin + step
+                ));
+            }
+            Some(Err(())) => return Err(format!("{content} is not a timestamp on the 0.02 s grid between 0.00 and 30.00")),
+            None if id as usize >= begin => {
+                return Err(format!(
+                    "{content} (id {id}) lies at or after <|0.00|> (id {begin}): timestamps must come after every other special token"
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 /// Group text tokens into words: a token whose text starts with a space starts a new word;
@@ -208,32 +264,38 @@ pub fn group_words(tok: &Tokenizer, ids: &[u32]) -> Vec<(String, std::ops::Range
 mod tests {
     use super::*;
 
-    /// A small multilingual tokenizer: ids below 100, specials at 90..=99.
+    /// The vocabulary size of the small tokenizers below: text below 90, specials 90..=99, then
+    /// the timestamp run from 100 (so it needs `100 + 1501` ids).
+    const VOCAB: usize = 1700;
+
+    /// A small multilingual tokenizer: ids below 90 are text, specials at 90..=99, `<|0.00|>` at 100.
     fn json(vocab: &str, extra: &str) -> String {
         format!(
             r#"{{"model": {{"vocab": {vocab}}}, "added_tokens": [
                 {{"id": 90, "content": "<|endoftext|>"}}, {{"id": 91, "content": "<|startoftranscript|>"}},
                 {{"id": 92, "content": "<|en|>"}}, {{"id": 93, "content": "<|translate|>"}},
                 {{"id": 94, "content": "<|transcribe|>"}}, {{"id": 95, "content": "<|notimestamps|>"}},
-                {{"id": 96, "content": "<|0.00|>"}}{extra}]}}"#
+                {{"id": 100, "content": "<|0.00|>"}}, {{"id": 101, "content": "<|0.02|>"}}{extra}]}}"#
         )
     }
 
     #[test]
     fn a_well_formed_tokenizer_parses() {
-        let t = Tokenizer::from_json(&json(r#"{"a": 0, "b": 1}"#, ""), 100).unwrap();
-        assert_eq!((t.eot, t.sot, t.timestamp_begin), (90, 91, 96));
+        let t = Tokenizer::from_json(&json(r#"{"a": 0, "b": 1}"#, ""), VOCAB).unwrap();
+        assert_eq!((t.eot, t.sot, t.timestamp_begin), (90, 91, 100));
         assert_eq!(t.languages, vec![("en".to_string(), 92)]);
         assert_eq!(t.decode(&[0, 1, 90]), "ab");
+        // The run ends exactly at the vocabulary's end.
+        assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, ""), 100 + TIMESTAMP_COUNT).is_ok());
     }
 
     #[test]
     fn ids_at_or_past_vocab_size_are_refused() {
-        for id in [100u64, 1 << 32, 1_000_000_000_000_000] {
-            let err = Tokenizer::from_json(&json(&format!(r#"{{"a": {id}}}"#), ""), 100).err().unwrap();
+        for id in [VOCAB as u64, 1 << 32, 1_000_000_000_000_000] {
+            let err = Tokenizer::from_json(&json(&format!(r#"{{"a": {id}}}"#), ""), VOCAB).err().unwrap();
             assert!(err.to_string().contains("vocab id"), "{err}");
             let extra = format!(r#", {{"id": {id}, "content": "<|zz|>"}}"#);
-            let err = Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), 100).err().unwrap();
+            let err = Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), VOCAB).err().unwrap();
             assert!(err.to_string().contains("outside"), "{err}");
         }
         assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, ""), 0).is_err());
@@ -245,10 +307,10 @@ mod tests {
         for content in ["<|>", "<|", "|>", "<|EN|>", "<|a b|>", "<||>", "<|waytoolongcode|>"] {
             let extra = format!(r#", {{"id": 97, "content": {}}}"#, serde_json::to_string(content).unwrap());
             // 97 is outside (sot, translate) = (91, 93): only tokens in that range are language tokens
-            assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), 100).is_ok(), "{content}");
+            assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, &extra), VOCAB).is_ok(), "{content}");
             let in_range = json(r#"{"a": 0}"#, "")
                 .replace(r#""id": 92, "content": "<|en|>""#, &format!(r#""id": 92, "content": {}"#, serde_json::to_string(content).unwrap()));
-            let err = Tokenizer::from_json(&in_range, 100).err().unwrap_or_else(|| panic!("{content} was accepted as a language"));
+            let err = Tokenizer::from_json(&in_range, VOCAB).err().unwrap_or_else(|| panic!("{content} was accepted as a language"));
             assert!(err.to_string().contains("language token"), "{err}");
         }
     }
@@ -257,5 +319,65 @@ mod tests {
     fn more_entries_than_vocab_size_are_refused() {
         let err = Tokenizer::from_json(&json(r#"{"a": 0, "b": 1, "c": 2}"#, ""), 2).err().unwrap();
         assert!(err.to_string().contains("vocab"), "{err}");
+    }
+
+    /// Replace `<|0.00|>`'s id (the shape of the hostile file that made every token a timestamp).
+    fn with_timestamp_begin(id: u32) -> String {
+        json(r#"{"a": 0, "b": 1}"#, "").replace(r#""id": 100, "content": "<|0.00|>""#, &format!(r#""id": {id}, "content": "<|0.00|>""#))
+    }
+
+    #[test]
+    fn timestamps_moved_below_the_other_tokens_are_refused() {
+        // `<|0.00|>` at id 0: "id >= timestamp_begin" would be true of every token.
+        for id in [0u32, 1, 50, 89, 93, 99] {
+            let err = Tokenizer::from_json(&with_timestamp_begin(id), VOCAB).err().unwrap_or_else(|| panic!("<|0.00|> at {id} was accepted"));
+            assert!(err.to_string().contains("timestamp"), "{id}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_run_that_does_not_fit_the_vocabulary_is_refused() {
+        // 1700 ids hold the run, 1600 do not (100 + 1501 > 1600).
+        let err = Tokenizer::from_json(&json(r#"{"a": 0}"#, ""), 1600).err().unwrap();
+        assert!(err.to_string().contains("do not fit"), "{err}");
+        assert!(Tokenizer::from_json(&with_timestamp_begin(VOCAB as u32 - 10), VOCAB).is_err());
+    }
+
+    #[test]
+    fn a_timestamp_off_the_run_or_the_grid_is_refused() {
+        for extra in [
+            r#", {"id": 150, "content": "<|0.04|>"}"#,  // not at begin + 2
+            r#", {"id": 103, "content": "<|0.05|>"}"#,  // not on the 0.02 s grid
+            r#", {"id": 103, "content": "<|31.00|>"}"#, // past 30 s
+            r#", {"id": 1700, "content": "<|0.06|>"}"#, // outside the vocabulary
+        ] {
+            assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, extra), VOCAB).is_err(), "{extra}");
+        }
+        // The right place is fine.
+        assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, r#", {"id": 102, "content": "<|0.04|>"}"#), VOCAB).is_ok());
+        assert!(Tokenizer::from_json(&json(r#"{"a": 0}"#, r#", {"id": 1600, "content": "<|30.00|>"}"#), VOCAB).is_ok());
+    }
+
+    #[test]
+    fn nothing_else_may_sit_inside_or_after_the_timestamp_run() {
+        // Another special token past `<|0.00|>`.
+        let err = Tokenizer::from_json(&json(r#"{"a": 0}"#, r#", {"id": 500, "content": "<|startoflm|>"}"#), VOCAB).err().unwrap();
+        assert!(err.to_string().contains("after every other special token"), "{err}");
+        // A text token past `<|0.00|>`.
+        let err = Tokenizer::from_json(&json(r#"{"a": 0, "late": 600}"#, ""), VOCAB).err().unwrap();
+        assert!(err.to_string().contains("after every other token"), "{err}");
+    }
+
+    #[test]
+    fn timestamp_tokens_are_recognised_by_shape() {
+        assert_eq!(timestamp_step("<|0.00|>"), Some(Ok(0)));
+        assert_eq!(timestamp_step("<|0.02|>"), Some(Ok(1)));
+        assert_eq!(timestamp_step("<|1.00|>"), Some(Ok(50)));
+        assert_eq!(timestamp_step("<|30.00|>"), Some(Ok(1500)));
+        assert_eq!(timestamp_step("<|30.02|>"), Some(Err(())));
+        assert_eq!(timestamp_step("<|0.01|>"), Some(Err(())));
+        for not in ["<|en|>", "<|notimestamps|>", "<|0.0|>", "<|0.000|>", "<|.50|>", "<|1.2x|>", "0.00", "<|-1.00|>", "<|100.00|>"] {
+            assert_eq!(timestamp_step(not), None, "{not}");
+        }
     }
 }

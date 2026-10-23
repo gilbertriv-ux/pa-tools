@@ -305,8 +305,36 @@ pub struct Model {
     pub device: Device,
 }
 
+/// Refuse weights that hold NaN or infinity: a network built from them runs, and answers with
+/// noise (a model of NaN transcribed 11 s of speech as `!!!!!!!!!!`). One pass over each
+/// floating-point tensor's bytes, no copy; the first tensor (in name order) that has one is named.
+/// Integer tensors are not looked at.
+fn check_finite(weights: &[u8]) -> Result<()> {
+    let st = candle_core::safetensors::SliceSafetensors::new(weights)?;
+    let mut tensors = st.tensors();
+    tensors.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, view) in tensors {
+        let data = view.data();
+        // The exponent field all ones is infinity (mantissa zero) or NaN (mantissa not): not finite.
+        let non_finite = match DType::try_from(view.dtype()) {
+            Ok(DType::F32) => data.chunks_exact(4).any(|c| <[u8; 4]>::try_from(c).map_or(true, |b| !f32::from_le_bytes(b).is_finite())),
+            Ok(DType::F64) => data.chunks_exact(8).any(|c| <[u8; 8]>::try_from(c).map_or(true, |b| !f64::from_le_bytes(b).is_finite())),
+            Ok(DType::F16) => data.chunks_exact(2).any(|c| <[u8; 2]>::try_from(c).map_or(true, |b| (u16::from_le_bytes(b) >> 10) & 0x1F == 0x1F)),
+            Ok(DType::BF16) => data.chunks_exact(2).any(|c| <[u8; 2]>::try_from(c).map_or(true, |b| (u16::from_le_bytes(b) >> 7) & 0xFF == 0xFF)),
+            _ => false,
+        };
+        if non_finite {
+            candle_core::bail!("tensor `{name}` holds NaN or infinity");
+        }
+    }
+    Ok(())
+}
+
 impl Model {
+    /// Build the network from the weights file's bytes. Refuses weights that are not finite
+    /// ([`check_finite`]) before building anything from them.
     pub fn load(cfg: Config, weights: Vec<u8>) -> Result<Self> {
+        check_finite(&weights)?;
         let device = Device::Cpu;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
         let vb = vb.pp("model");
@@ -337,6 +365,75 @@ mod tests {
             max_target_positions: 448,
             vocab_size: 51_865,
         }
+    }
+
+    /// A safetensors file holding `tensors` as `(name, dtype, bytes)`.
+    fn safetensors(tensors: &[(&str, &str, Vec<u8>)]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        let mut body = Vec::new();
+        for (name, dtype, bytes) in tensors {
+            let width = match *dtype {
+                "F64" | "I64" => 8,
+                "F32" => 4,
+                _ => 2,
+            };
+            let start = body.len();
+            body.extend_from_slice(bytes);
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({"dtype": dtype, "shape": [bytes.len() / width], "data_offsets": [start, body.len()]}),
+            );
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&body);
+        file
+    }
+
+    fn f32s(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn weights_with_nan_or_infinity_are_refused_naming_the_tensor() {
+        let fine = || ("model.decoder.ok", "F32", f32s(&[0.5, -2.0, 0.0, f32::MAX, f32::MIN_POSITIVE / 2.0]));
+        assert!(check_finite(&safetensors(&[fine()])).is_ok(), "ordinary values, zero, the largest and a subnormal are finite");
+        for (what, bad) in [
+            ("NaN", f32s(&[1.0, f32::NAN])),
+            ("+inf", f32s(&[f32::INFINITY, 1.0])),
+            ("-inf", f32s(&[0.0, 0.0, f32::NEG_INFINITY])),
+            ("all 0xFF bytes", vec![0xFF; 16]),
+        ] {
+            let err = check_finite(&safetensors(&[fine(), ("model.encoder.conv1.weight", "F32", bad)])).unwrap_err().to_string();
+            assert!(err.contains("`model.encoder.conv1.weight`") && err.contains("NaN or infinity"), "{what}: {err}");
+        }
+        // The first offender in name order is the one named.
+        let both = safetensors(&[("z.last", "F32", f32s(&[f32::NAN])), ("a.first", "F32", f32s(&[f32::INFINITY]))]);
+        assert!(check_finite(&both).unwrap_err().to_string().contains("`a.first`"));
+    }
+
+    #[test]
+    fn half_precision_and_double_weights_are_checked_too() {
+        let half = |bits: &[u16]| bits.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>();
+        // f16: 0x3C00 = 1.0, 0x7BFF = largest finite, 0x7C00 = +inf, 0x7E00 = NaN, 0xFC00 = -inf.
+        assert!(check_finite(&safetensors(&[("h", "F16", half(&[0x3C00, 0x7BFF, 0x0001, 0x0000]))])).is_ok());
+        for bits in [0x7C00u16, 0x7E00, 0xFC00, 0xFFFF] {
+            assert!(check_finite(&safetensors(&[("h", "F16", half(&[0x3C00, bits]))])).is_err(), "f16 {bits:#06x}");
+        }
+        // bf16: 0x3F80 = 1.0, 0x7F7F = largest finite, 0x7F80 = +inf, 0x7FC0 = NaN, 0xFF80 = -inf.
+        assert!(check_finite(&safetensors(&[("b", "BF16", half(&[0x3F80, 0x7F7F, 0x0000]))])).is_ok());
+        for bits in [0x7F80u16, 0x7FC0, 0xFF80, 0xFFFF] {
+            assert!(check_finite(&safetensors(&[("b", "BF16", half(&[0x3F80, bits]))])).is_err(), "bf16 {bits:#06x}");
+        }
+        let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        assert!(check_finite(&safetensors(&[("d", "F64", doubles(&[1.0, -1e300]))])).is_ok());
+        assert!(check_finite(&safetensors(&[("d", "F64", doubles(&[1.0, f64::NAN]))])).is_err());
+        // Integer tensors (token tables) hold any bit pattern.
+        assert!(check_finite(&safetensors(&[("i", "I64", vec![0xFF; 16])])).is_ok());
+        // Not a safetensors file: an error, not a panic.
+        assert!(check_finite(b"not a safetensors file").is_err());
+        assert!(check_finite(&[]).is_err());
     }
 
     #[test]

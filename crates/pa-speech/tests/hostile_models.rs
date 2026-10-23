@@ -175,6 +175,42 @@ fn a_timestamp_token_beyond_vocab_size_is_refused() {
 }
 
 #[test]
+fn timestamps_moved_to_id_zero_are_refused_at_load() {
+    // `<|0.00|>` at id 0 made "id >= timestamp_begin" true of every token: each window then
+    // advanced the audio by 10 ms, and a long recording took hours. Refused when the model loads,
+    // before the weights are read.
+    let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == "<|0.00|>" { (c, 0) } else { (c, id) }).collect();
+    refuses("tsid0", &config(), &generation_config(), &tokenizer_of(json!({"!": 5, "a": 1}), &a), "timestamp");
+    // The same for any move below the other special tokens, and for a run that leaves the vocabulary.
+    for id in [1u64, NO_TIMESTAMPS, VOCAB - 1500] {
+        let a: Vec<(String, u64)> = added()
+            .into_iter()
+            .map(|(c, i)| {
+                if c == "<|0.00|>" {
+                    (c, id)
+                } else if c == "<|0.02|>" {
+                    (c, id + 1)
+                } else {
+                    (c, i)
+                }
+            })
+            .collect();
+        refuses(&format!("tsmoved-{id}"), &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+    }
+}
+
+#[test]
+fn another_special_token_inside_the_timestamp_run_is_refused() {
+    let mut a = added();
+    a.push(("<|startoflm|>".to_string(), TS_BEGIN + 40));
+    refuses("tsrun", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+    // A timestamp that is not where its time puts it.
+    let mut a = added();
+    a.push(("<|0.04|>".to_string(), TS_BEGIN + 9));
+    refuses("tsoff", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+}
+
+#[test]
 fn every_special_token_must_be_inside_the_vocabulary() {
     for target in ["<|endoftext|>", "<|startoftranscript|>", "<|transcribe|>", "<|notimestamps|>", "<|nospeech|>", "<|translate|>"] {
         let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == target { (c, VOCAB + 7) } else { (c, id) }).collect();
@@ -230,6 +266,66 @@ fn alignment_heads_must_exist() {
         generation["alignment_heads"] = bad.clone();
         refuses("alignhead", &config(), &generation, &tokenizer(), "alignment head");
     }
+}
+
+#[test]
+fn many_duplicate_alignment_heads_load_as_a_few() {
+    // Hundreds of copies of one head (the SPV's file had ~630) are one head; the folder gets as far as the weights.
+    let mut generation = generation_config();
+    generation["alignment_heads"] = json!(vec![[3, 2]; 500]);
+    let (_scratch, models_dir) = install("dupheads", &config(), &generation, &tokenizer());
+    let err = load(&models_dir, MODEL).err().expect("zero weights cannot load");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(text.contains("model.safetensors"), "validation accepted the duplicates: {text:?}");
+}
+
+/// A weights file of exactly the catalogue size: one F32 tensor `name` covering all of it, zero
+/// except for `first` at its start.
+fn write_weights(models_dir: &Path, name: &str, first: f32) {
+    let m = models::find(MODEL).expect("model in the catalogue");
+    let weights = m.files.iter().find(|f| f.name == "model.safetensors").expect("weights in the catalogue");
+    let total = usize::try_from(weights.size).expect("size fits");
+    // The header is padded with spaces until the data that follows it is a whole number of floats.
+    let mut header_len = 80usize;
+    let (header, floats) = loop {
+        let floats = (total - 8 - header_len) / 4;
+        let text = format!(r#"{{"{name}":{{"dtype":"F32","shape":[{floats}],"data_offsets":[0,{}]}}"#, floats * 4);
+        let text = format!("{text}}}");
+        if text.len() <= header_len && (total - 8 - header_len).is_multiple_of(4) {
+            break (format!("{text:<header_len$}"), floats);
+        }
+        header_len += 1;
+    };
+    let path = models::model_dir(models_dir, m).join("model.safetensors");
+    let mut file = File::create(&path).expect("create weights");
+    std::io::Write::write_all(&mut file, &(header_len as u64).to_le_bytes()).expect("write");
+    std::io::Write::write_all(&mut file, header.as_bytes()).expect("write");
+    std::io::Write::write_all(&mut file, &first.to_le_bytes()).expect("write");
+    file.set_len(weights.size).expect("sparse tail");
+    assert_eq!(std::fs::metadata(&path).expect("stat").len(), weights.size);
+    assert!(floats > 1);
+}
+
+#[test]
+fn weights_of_nan_or_infinity_are_refused_naming_the_tensor() {
+    // Valid config, tokenizer and safetensors structure; the weights are what is wrong. Without the
+    // check this loaded and transcribed speech as "!!!!!!!!!!".
+    for (first, label) in [(f32::NAN, "NaN"), (f32::INFINITY, "inf"), (f32::NEG_INFINITY, "-inf")] {
+        let (_scratch, models_dir) = install(&format!("nanweights-{label}"), &config(), &generation_config(), &tokenizer());
+        write_weights(&models_dir, "model.decoder.layers.0.fc1.weight", first);
+        let err = load(&models_dir, MODEL).err().unwrap_or_else(|| panic!("{label}: weights with {label} were accepted"));
+        let SpeechError::Model(text) = &err else { panic!("{label}: expected a model error, got {err:?}") };
+        assert!(
+            text.starts_with("model.safetensors:") && text.contains("`model.decoder.layers.0.fc1.weight`") && text.contains("NaN or infinity"),
+            "{label}: {text:?}"
+        );
+    }
+    // The same file with a finite first value gets past the check (and fails on the missing tensors).
+    let (_scratch, models_dir) = install("finiteweights", &config(), &generation_config(), &tokenizer());
+    write_weights(&models_dir, "model.decoder.layers.0.fc1.weight", 0.25);
+    let err = load(&models_dir, MODEL).err().expect("one tensor is not a network");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(!text.contains("NaN or infinity"), "{text:?}");
 }
 
 #[test]

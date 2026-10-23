@@ -85,7 +85,8 @@ const MAX_WEIGHT_BYTES: u64 = 8 << 30;
 /// Read `path`, refusing a file larger than `max` bytes.
 fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, SpeechError> {
     use std::io::Read;
-    let fail = |why: String| SpeechError::Model(format!("{}: {why}", path.display()));
+    // The file's name, not its path: the folder is the user's own and the message may reach a status line.
+    let fail = |why: String| SpeechError::Model(format!("{}: {why}", path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy())));
     let file = std::fs::File::open(path).map_err(|e| fail(e.to_string()))?;
     let mut bytes = Vec::new();
     file.take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| fail(e.to_string()))?;
@@ -96,7 +97,9 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, SpeechError> {
 }
 
 /// The `(layer, head)` pairs whose cross-attention gives word timing: those the model lists, else
-/// the second half of the decoder. A listed pair that does not exist is an error, not a skip.
+/// the second half of the decoder. A listed pair that does not exist is an error, not a skip. A
+/// pair listed twice counts once (the first place it is listed keeps its order), so the result
+/// never holds more pairs than the decoder has heads (`layers x heads`) however long the list is.
 fn alignment_heads(gen_cfg: &serde_json::Value, cfg: &Config) -> Result<Vec<(usize, usize)>, SpeechError> {
     let index = |v: &serde_json::Value| v.as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     let listed: Vec<(usize, usize)> =
@@ -110,7 +113,13 @@ fn alignment_heads(gen_cfg: &serde_json::Value, cfg: &Config) -> Result<Vec<(usi
             cfg.decoder_layers, cfg.decoder_attention_heads
         )));
     }
-    Ok(listed)
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<(usize, usize)> = listed.into_iter().filter(|pair| seen.insert(*pair)).collect();
+    // Every pair exists and is distinct, so this cannot fail; it states the bound the rest relies on.
+    if unique.len() > cfg.decoder_layers.saturating_mul(cfg.decoder_attention_heads) {
+        return Err(SpeechError::Model("generation_config.json: more alignment heads than the decoder has".into()));
+    }
+    Ok(unique)
 }
 
 /// Token ids listed in `gen_cfg[key]`, ignoring entries that are not ids.
@@ -278,6 +287,7 @@ impl Whisper {
         }
         let mut words: Vec<Word> = Vec::new();
         let mut seek = 0usize;
+        let mut guard = ProgressGuard::default();
         while seek < content_frames {
             let frac = seek as f32 / content_frames.max(1) as f32;
             if !progress(frac * 0.95, &format!("Transcribing {:.0}%", frac * 100.0)) {
@@ -331,6 +341,7 @@ impl Whisper {
                     words.push(Word::new(wtext, tick(a), tick(b)));
                 }
             }
+            guard.note(advance, seg_frames)?;
             seek += advance;
         }
         let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words };
@@ -389,6 +400,41 @@ fn argmax(x: &[f32]) -> u32 {
     u32::try_from(best.0).unwrap_or(0)
 }
 
+/// The smallest advance of the audio window that counts as progress: 0.5 s of mel frames (10 ms each).
+const MIN_ADVANCE_FRAMES: usize = 50;
+/// How many windows in a row may advance less than [`MIN_ADVANCE_FRAMES`] before decoding stops.
+const MAX_STALLED_WINDOWS: u32 = 8;
+
+/// Stops a decode that crawls. Each window normally advances by seconds (to the last complete
+/// timestamp pair, or by the whole 30 s); a model whose timestamps are broken could advance by
+/// 10 ms per window, and a long recording would then take hours of CPU for nothing. A run of
+/// [`MAX_STALLED_WINDOWS`] windows that each advance by less than [`MIN_ADVANCE_FRAMES`] is an
+/// error, not a slow success. A window cut short by the end of the audio is not a stall.
+#[derive(Default)]
+struct ProgressGuard {
+    stalled: u32,
+}
+
+impl ProgressGuard {
+    /// Note that a window of `window_frames` frames (at most 3000, fewer at the end of the audio)
+    /// advanced the audio by `advance` frames.
+    fn note(&mut self, advance: usize, window_frames: usize) -> Result<(), SpeechError> {
+        if advance < MIN_ADVANCE_FRAMES.min(window_frames) {
+            self.stalled = self.stalled.saturating_add(1);
+        } else {
+            self.stalled = 0;
+        }
+        if self.stalled >= MAX_STALLED_WINDOWS {
+            return Err(SpeechError::Model(format!(
+                "decoding stopped: {} windows in a row advanced by less than {} s (the model's timestamps do not move forward)",
+                self.stalled,
+                MIN_ADVANCE_FRAMES as f64 / 100.0
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The tail of `seq` (text tokens) repeats a short pattern many times: a decoding loop.
 fn repeating(seq: &[u32], tb: u32) -> bool {
     let text: Vec<u32> = seq.iter().copied().filter(|&t| t < tb).collect();
@@ -408,6 +454,72 @@ fn repeating(seq: &[u32], tb: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decode_that_crawls_is_stopped_with_an_error() {
+        // 10 ms per window (the hostile tokenizer's behaviour): stops after MAX_STALLED_WINDOWS.
+        let mut g = ProgressGuard::default();
+        let mut windows = 0;
+        let err = loop {
+            windows += 1;
+            if let Err(e) = g.note(1, 3000) {
+                break e;
+            }
+            assert!(windows < 1000, "the guard never fired");
+        };
+        assert_eq!(windows, MAX_STALLED_WINDOWS);
+        assert!(matches!(&err, SpeechError::Model(m) if m.contains("decoding stopped")), "{err:?}");
+    }
+
+    #[test]
+    fn a_few_short_windows_are_fine_and_progress_resets_the_count() {
+        let mut g = ProgressGuard::default();
+        for _ in 0..3 {
+            for _ in 0..MAX_STALLED_WINDOWS - 1 {
+                assert!(g.note(10, 3000).is_ok(), "one short of the limit");
+            }
+            // A window that moves on by a second resets the run.
+            assert!(g.note(100, 3000).is_ok());
+        }
+        // A whole 30 s window, and the last window of the audio (whatever its length), never count.
+        for _ in 0..100 {
+            assert!(g.note(3000, 3000).is_ok());
+            assert!(g.note(7, 7).is_ok());
+            assert!(g.note(49, 49).is_ok());
+        }
+        // Exactly the minimum counts as progress; one frame less does not.
+        assert_eq!(g.stalled, 0);
+        assert!(g.note(MIN_ADVANCE_FRAMES, 3000).is_ok() && g.stalled == 0);
+        assert!(g.note(MIN_ADVANCE_FRAMES - 1, 3000).is_ok() && g.stalled == 1);
+    }
+
+    fn decoder_config(layers: usize, heads: usize) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "num_mel_bins": 80, "d_model": 384, "encoder_layers": 4, "encoder_attention_heads": 6,
+            "decoder_layers": layers, "decoder_attention_heads": heads,
+            "max_source_positions": 1500, "max_target_positions": 448, "vocab_size": 51865
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn alignment_heads_are_deduplicated_and_bounded() {
+        let cfg = decoder_config(4, 6);
+        // 630 copies of one head (the file that made the SPV's run slow): one head.
+        let dup = serde_json::json!({"alignment_heads": vec![[2, 3]; 630]});
+        assert_eq!(alignment_heads(&dup, &cfg).unwrap(), vec![(2, 3)]);
+        // Order of first appearance is kept.
+        let mixed = serde_json::json!({"alignment_heads": [[3, 0], [2, 2], [3, 0], [2, 2], [3, 2]]});
+        assert_eq!(alignment_heads(&mixed, &cfg).unwrap(), vec![(3, 0), (2, 2), (3, 2)]);
+        // However many are listed, never more than layers x heads.
+        let all: Vec<[usize; 2]> = (0..50).flat_map(|_| (0..4).flat_map(|l| (0..6).map(move |h| [l, h]))).collect();
+        let huge = serde_json::json!({"alignment_heads": all});
+        assert_eq!(alignment_heads(&huge, &cfg).unwrap().len(), 4 * 6);
+        // A head that does not exist is still an error, whatever else is listed.
+        assert!(alignment_heads(&serde_json::json!({"alignment_heads": [[2, 3], [4, 0]]}), &cfg).is_err());
+        // None listed: the decoder's second half.
+        assert_eq!(alignment_heads(&serde_json::json!({}), &cfg).unwrap().len(), 2 * 6);
+    }
 
     #[test]
     fn repetition_guard() {
