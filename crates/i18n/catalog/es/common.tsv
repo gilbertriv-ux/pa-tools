@@ -1,0 +1,52 @@
+# Spanish (es) interface catalog for Pa Tools.
+# Columns, separated by a TAB:  context <TAB> English source text <TAB> translation
+#   context  usually empty. `@plural` and `@id` mean something to the app; see docs/i18n.md.
+#   A missing entry shows in English. The canonical English keys are in ../KEYS.txt.
+#
+# Provenance: every translation below was taken verbatim from the shared catalog of
+# storytold/craft-i18n (MIT OR Apache-2.0) at commit aa36bd87b3891f760c0757344863028a9a7562d2, for the entries whose English source
+# text matches exactly. No other product's localisation was consulted or copied. See ATTRIBUTION.md.
+
+@id	language.name	Español
+	OK	Aceptar
+	Cancel	Cancelar
+	Apply	Aplicar
+	Save	Guardar
+	Browse…	Examinar…
+	Clear	Borrar
+	Delete	Eliminar
+	Name	Nombre
+	Output	Salida
+	All	Todas
+	Comments	Comentarios
+	Commits	Commits
+	Create	Crear
+	Low	Baja
+	Appearance	Apariencia
+	Duplicate	Duplicar
+	Edit	Edición
+	File	Archivo
+	Object	Objeto
+	Recover	Recuperar
+	Replace	Reemplazar
+	Revert	Revertir
+	Search	Buscar
+	Window	Ventana
+	About	Acerca de
+	Add	Añadir
+	Paste	Pegar
+	Remove	Quitar
+	Theme	Tema
+	Title	Título
+	Type	Tipo
+	Version	Versión
+	Format	Formato
+	Home	Inicio
+	Location	Ubicación
+	Model	Modelo
+	Open Recent	Abrir recientes
+	Sort	Ordenar
+	System	Sistema
+	Dark	Oscuro
+@plural	{n} item|{n} items	{n} elemento|{n} elementos
+@plural	{n} commit|{n} commits	{n} commit|{n} commits

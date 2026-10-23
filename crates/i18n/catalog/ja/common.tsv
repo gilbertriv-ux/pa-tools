@@ -1,0 +1,52 @@
+# Japanese (ja) interface catalog for Pa Tools.
+# Columns, separated by a TAB:  context <TAB> English source text <TAB> translation
+#   context  usually empty. `@plural` and `@id` mean something to the app; see docs/i18n.md.
+#   A missing entry shows in English. The canonical English keys are in ../KEYS.txt.
+#
+# Provenance: every translation below was taken verbatim from the shared catalog of
+# storytold/craft-i18n (MIT OR Apache-2.0) at commit aa36bd87b3891f760c0757344863028a9a7562d2, for the entries whose English source
+# text matches exactly. No other product's localisation was consulted or copied. See ATTRIBUTION.md.
+
+@id	language.name	日本語
+	OK	OK
+	Cancel	キャンセル
+	Apply	適用
+	Save	保存
+	Browse…	参照…
+	Clear	クリア
+	Delete	削除
+	Name	名前
+	Output	出力
+	All	すべて
+	Comments	コメント
+	Commits	コミット
+	Create	作成
+	Low	低
+	Appearance	外観
+	Duplicate	複製
+	Edit	編集
+	File	ファイル
+	Object	オブジェクト
+	Recover	復元
+	Replace	置換
+	Revert	保存済みの状態に戻す
+	Search	検索
+	Window	ウィンドウ
+	About	概要
+	Add	追加
+	Paste	貼り付け
+	Remove	削除
+	Theme	テーマ
+	Title	タイトル
+	Type	種類
+	Version	バージョン
+	Format	形式
+	Home	ホーム
+	Location	場所
+	Model	モデル
+	Open Recent	最近使ったファイルを開く
+	Sort	並べ替え
+	System	システム
+	Dark	ダーク
+@plural	{n} item|{n} items	{n} 項目
+@plural	{n} commit|{n} commits	コミット {n} 件

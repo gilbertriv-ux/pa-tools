@@ -5,6 +5,7 @@
 //! [`Lang`]. A missing translation is the English itself; nothing here fails.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod builtin;
 mod catalog;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -12,6 +13,8 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use intl_pluralrules::{PluralCategory, PluralRuleType, PluralRules};
 use unic_langid::LanguageIdentifier;
+
+pub use builtin::{CATALOG, OFFERED, keys, pa_tools};
 
 /// The catalogs an app embeds, one entry per locale: (locale, shared catalog, the app's catalog).
 /// A missing catalog is `""`.

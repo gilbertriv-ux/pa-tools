@@ -1,0 +1,52 @@
+# Traditional Chinese (zh-hant) interface catalog for Pa Tools.
+# Columns, separated by a TAB:  context <TAB> English source text <TAB> translation
+#   context  usually empty. `@plural` and `@id` mean something to the app; see docs/i18n.md.
+#   A missing entry shows in English. The canonical English keys are in ../KEYS.txt.
+#
+# Provenance: every translation below was taken verbatim from the shared catalog of
+# storytold/craft-i18n (MIT OR Apache-2.0) at commit aa36bd87b3891f760c0757344863028a9a7562d2, for the entries whose English source
+# text matches exactly. No other product's localisation was consulted or copied. See ATTRIBUTION.md.
+
+@id	language.name	繁體中文
+	OK	確定
+	Cancel	取消
+	Apply	套用
+	Save	儲存
+	Browse…	瀏覽…
+	Clear	清除
+	Delete	刪除
+	Name	名稱
+	Output	輸出
+	All	全部
+	Comments	註解
+	Commits	提交次數
+	Create	建立
+	Low	低
+	Appearance	外觀
+	Duplicate	製作複本
+	Edit	編輯
+	File	檔案
+	Object	物件
+	Recover	恢復
+	Replace	取代
+	Revert	回復
+	Search	搜尋
+	Window	視窗
+	About	關於
+	Add	新增
+	Paste	貼上
+	Remove	刪除
+	Theme	主題
+	Title	標題
+	Type	型別
+	Version	版本
+	Format	格式
+	Home	首頁
+	Location	位置
+	Model	模型
+	Open Recent	最近開啟的檔案
+	Sort	排序
+	System	系統
+	Dark	深色
+@plural	{n} item|{n} items	{n} 個項目
+@plural	{n} commit|{n} commits	{n} 次提交

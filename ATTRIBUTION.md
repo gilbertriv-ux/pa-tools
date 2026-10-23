@@ -38,6 +38,7 @@ The localisation runtime and its translations are donor-sourced, both MIT OR Apa
 | Path | Author | Source | License |
 |---|---|---|---|
 | `crates/i18n/src/lib.rs`, `crates/i18n/src/catalog.rs` | ArtCraft Team and the craft-libs contributors | the `i18n` crate of [storytold/craft-libs](https://github.com/storytold/craft-libs) at commit `49190884278f16c9a9f5823d7698a8ffb5deb062`, imported verbatim then adapted (a `tr!`/global layer, an accented pseudo locale, Pa Tools' embedded catalog); see `docs/i18n.md` | MIT OR Apache-2.0 |
+| `crates/i18n/catalog/<locale>/common.tsv` | ArtCraft Team and the craft-i18n contributors | the shared catalog of [storytold/craft-i18n](https://github.com/storytold/craft-i18n) at commit `aa36bd87b3891f760c0757344863028a9a7562d2`, reused for the entries whose English source text matches exactly (40 strings × 10 locales); see `docs/i18n.md` | MIT OR Apache-2.0 |
 
 ## Files
 

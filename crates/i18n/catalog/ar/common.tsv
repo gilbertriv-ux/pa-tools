@@ -1,0 +1,51 @@
+# Arabic (ar) interface catalog for Pa Tools.
+# Columns, separated by a TAB:  context <TAB> English source text <TAB> translation
+#   context  usually empty. `@plural` and `@id` mean something to the app; see docs/i18n.md.
+#   A missing entry shows in English. The canonical English keys are in ../KEYS.txt.
+#
+# Provenance: every translation below was taken verbatim from the shared catalog of
+# storytold/craft-i18n (MIT OR Apache-2.0) at commit aa36bd87b3891f760c0757344863028a9a7562d2, for the entries whose English source
+# text matches exactly. No other product's localisation was consulted or copied. See ATTRIBUTION.md.
+
+@id	language.name	العربية
+	OK	موافق
+	Cancel	إلغاء
+	Apply	تطبيق
+	Save	حفظ
+	Browse…	استعراض…
+	Clear	مسح
+	Delete	حذف
+	Name	الاسم
+	Output	الناتج
+	All	الكل
+	Comments	التعليقات
+	Commits	الإيداعات
+	Create	إنشاء
+	Low	منخفضة
+	Appearance	المظهر
+	Duplicate	تكرار
+	Edit	تحرير
+	File	ملف
+	Object	كائن
+	Recover	استعادة
+	Replace	استبدال
+	Revert	استرجاع
+	Search	بحث
+	Window	نافذة
+	About	حول
+	Add	إضافة
+	Paste	لصق
+	Remove	إزالة
+	Theme	السمة
+	Title	العنوان
+	Type	النوع
+	Version	الإصدار
+	Format	الصيغة
+	Home	الرئيسية
+	Location	الموقع
+	Model	النموذج
+	Open Recent	فتح الملفات الأخيرة
+	Sort	فرز
+	System	النظام
+	Dark	داكن
+@plural	{n} commit|{n} commits	{n} إيداع|{n} إيداع|{n} إيداعان|{n} إيداعات|{n} إيداعاً|{n} إيداع

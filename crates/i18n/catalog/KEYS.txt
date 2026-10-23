@@ -1,0 +1,42 @@
+# Canonical English source strings Pa Tools' catalog translates (gap G-09).
+# One per line; these are the keys the ten locale catalogs translate. See docs/i18n.md.
+OK
+Cancel
+Apply
+Save
+Browse…
+Clear
+Delete
+Name
+Output
+All
+Comments
+Commits
+Create
+Low
+Appearance
+Duplicate
+Edit
+File
+Object
+Recover
+Replace
+Revert
+Search
+Window
+About
+Add
+Paste
+Remove
+Theme
+Title
+Type
+Version
+Format
+Home
+Location
+Model
+Open Recent
+Sort
+System
+Dark

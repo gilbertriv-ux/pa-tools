@@ -1,0 +1,52 @@
+# Russian (ru) interface catalog for Pa Tools.
+# Columns, separated by a TAB:  context <TAB> English source text <TAB> translation
+#   context  usually empty. `@plural` and `@id` mean something to the app; see docs/i18n.md.
+#   A missing entry shows in English. The canonical English keys are in ../KEYS.txt.
+#
+# Provenance: every translation below was taken verbatim from the shared catalog of
+# storytold/craft-i18n (MIT OR Apache-2.0) at commit aa36bd87b3891f760c0757344863028a9a7562d2, for the entries whose English source
+# text matches exactly. No other product's localisation was consulted or copied. See ATTRIBUTION.md.
+
+@id	language.name	Русский
+	OK	ОК
+	Cancel	Отмена
+	Apply	Применить
+	Save	Сохранить
+	Browse…	Обзор…
+	Clear	Очистить
+	Delete	Удалить
+	Name	Имя
+	Output	Вывод
+	All	Все
+	Comments	Комментарии
+	Commits	Коммиты
+	Create	Создать
+	Low	Низкая
+	Appearance	Внешний вид
+	Duplicate	Дублировать
+	Edit	Редактирование
+	File	Файл
+	Object	Объект
+	Recover	Восстановить
+	Replace	Заменить
+	Revert	Восстановить
+	Search	Поиск
+	Window	Окно
+	About	О программе
+	Add	Добавить
+	Paste	Вставить
+	Remove	Удалить
+	Theme	Тема
+	Title	Заголовок
+	Type	Тип
+	Version	Версия
+	Format	Формат
+	Home	Главная
+	Location	Расположение
+	Model	Модель
+	Open Recent	Открыть недавние
+	Sort	Сортировка
+	System	Системные
+	Dark	Тёмная
+@plural	{n} item|{n} items	{n} элемент|{n} элемента|{n} элементов
+@plural	{n} commit|{n} commits	{n} коммит|{n} коммита|{n} коммитов
