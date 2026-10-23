@@ -59,24 +59,29 @@ const MAX_PICTURE_SAMPLES: u64 = 8192 * 8192;
 /// slot holds the sample planes with their allocation margins plus the saved motion vectors,
 /// reference frames and segment ids; a frame being decoded holds its planes, the loop filter / CDEF /
 /// super-resolution / restoration copies, mode info, the motion field and, with film grain, the
-/// noise stripes. Deliberately pessimistic.
+/// noise stripes. Deliberately pessimistic. Saturating: a size no frame may have (a `u32::MAX` side
+/// from a hostile header, or a caller that did not check [`frame_size_allowed`] first) costs
+/// `u64::MAX` rather than overflowing.
 fn frame_costs(seq: &SequenceHeader, width: u32, height: u32) -> (u64, u64) {
     let (w, h) = (u64::from(width), u64::from(height));
-    let (aw, ah) = (w.div_ceil(128) * 128 + 160, h.div_ceil(128) * 128 + 160);
+    let (aw, ah) = (w.div_ceil(128).saturating_mul(128).saturating_add(160), h.div_ceil(128).saturating_mul(128).saturating_add(160));
     let (ssx, ssy) = (u32::from(seq.color.subsampling_x.min(1)), u32::from(seq.color.subsampling_y.min(1)));
-    let chroma = if seq.color.num_planes > 1 { 2 * (aw >> ssx) * (ah >> ssy) } else { 0 };
-    let planes = (aw * ah + chroma) * 2;
-    let mi_units = (2 * w.div_ceil(8)) * (2 * h.div_ceil(8));
+    let chroma = if seq.color.num_planes > 1 { 2u64.saturating_mul(aw >> ssx).saturating_mul(ah >> ssy) } else { 0 };
+    let planes = aw.saturating_mul(ah).saturating_add(chroma).saturating_mul(2);
+    let mi_units = (2 * w.div_ceil(8)).saturating_mul(2 * h.div_ceil(8));
     // Film grain synthesis (on the output picture) keeps three planes of i32 noise stripes.
-    let grain = if seq.film_grain_params_present { 13 * w * h } else { 0 };
-    (planes + 10 * mi_units, 5 * planes + 80 * mi_units + grain)
+    let grain = if seq.film_grain_params_present { 13u64.saturating_mul(w).saturating_mul(h) } else { 0 };
+    (
+        planes.saturating_add(10u64.saturating_mul(mi_units)),
+        5u64.saturating_mul(planes).saturating_add(80u64.saturating_mul(mi_units)).saturating_add(grain),
+    )
 }
 
 /// How many frames being decoded fit in `budget` once the eight reference slots of this size are
 /// paid for (0 = the frame size is beyond the budget).
 fn frames_in_flight_room(seq: &SequenceHeader, width: u32, height: u32, budget: u64) -> u64 {
     let (reference, working) = frame_costs(seq, width, height);
-    budget.saturating_sub(NUM_REF_FRAMES as u64 * reference) / working.max(1)
+    budget.saturating_sub((NUM_REF_FRAMES as u64).saturating_mul(reference)) / working.max(1)
 }
 
 /// Bytes the decoder estimates it needs to decode frames of `width` x `height` luma samples in a
@@ -84,7 +89,13 @@ fn frames_in_flight_room(seq: &SequenceHeader, width: u32, height: u32, budget: 
 /// [`Decoder::set_memory_budget`] that admits the size (a bigger budget also lets frames decode in
 /// parallel with the `threads` feature). The estimate is deliberately pessimistic and counts
 /// `u16` samples whatever the bit depth, so 8-bit and 10-bit pictures cost the same.
+///
+/// A size that [`frame_size_allowed`] refuses (past level 6.3, or past 8192 x 8192 samples) is admitted
+/// by no budget, so it costs `u64::MAX`; the arithmetic never overflows, whatever the size.
 pub fn memory_needed(seq: &SequenceHeader, width: u32, height: u32) -> u64 {
+    if !frame_size_allowed(width, height) {
+        return u64::MAX;
+    }
     let (reference, working) = frame_costs(seq, width, height);
     (NUM_REF_FRAMES as u64).saturating_mul(reference).saturating_add(working)
 }
@@ -1101,7 +1112,7 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MEMORY_BUDGET, SequenceHeader, frame_size_allowed, memory_needed, picture_fits_budget};
+    use super::{DEFAULT_MEMORY_BUDGET, SequenceHeader, frame_costs, frame_size_allowed, frames_in_flight_room, memory_needed, picture_fits_budget};
 
     #[test]
     fn frames_up_to_the_level_6_3_limits_are_allowed() {
@@ -1144,6 +1155,30 @@ mod tests {
             }
         }
         best
+    }
+
+    /// `memory_needed` is public and takes any size: a hostile `u32::MAX` side used to overflow the
+    /// cost arithmetic (a panic in a debug build). Now it saturates, and a size no budget admits costs
+    /// `u64::MAX`.
+    #[test]
+    fn the_cost_of_an_absurd_size_saturates_instead_of_overflowing() {
+        for seq in [seq_of(1, 1, false, false), seq_of(0, 0, false, true), seq_of(1, 1, true, false)] {
+            for (w, h) in [(u32::MAX, u32::MAX), (u32::MAX, 1), (1, u32::MAX), (u32::MAX, 0), (65536, 65536), (16385, 1), (8192, 8192), (0, u32::MAX)]
+            {
+                assert_eq!(memory_needed(&seq, w, h), u64::MAX, "{w}x{h} is admitted by no budget");
+                assert!(!picture_fits_budget(&seq, w, h, u64::MAX), "{w}x{h}");
+                // the helpers underneath do not overflow either (they are reached by the same sizes)
+                let (reference, working) = frame_costs(&seq, w, h);
+                let _ = frames_in_flight_room(&seq, w, h, u64::MAX);
+                if (w, h) == (u32::MAX, u32::MAX) {
+                    assert_eq!((reference, working), (u64::MAX, u64::MAX));
+                    assert_eq!(frames_in_flight_room(&seq, w, h, u64::MAX), 0, "saturated costs leave no room, and never panic");
+                }
+            }
+        }
+        // in range, nothing changed: 8K UHD still costs what it did
+        assert_eq!(memory_needed(&seq_of(1, 1, false, false), 7680, 4320), 1_711_365_120);
+        assert!(memory_needed(&seq_of(1, 1, false, false), 0, 0) > 0);
     }
 
     /// The same layout at another bit depth (the cost function must not care).
