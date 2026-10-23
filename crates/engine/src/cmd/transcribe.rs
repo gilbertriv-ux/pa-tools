@@ -503,11 +503,6 @@ impl TranscribeJob {
     }
 }
 
-/// What the recogniser's model says when it is asked for a language it does not have.
-const UNKNOWN_LANGUAGE: &str = "does not know the language";
-/// What a recogniser that cannot find the next word says when it gives up.
-const DECODING_STOPPED: &str = "decoding stopped";
-
 /// The error for a recogniser that stopped or failed while it ran. It is the recogniser's, so it is
 /// worded as that and never as a complaint about the caller's parameters: a stop reads "Transcription
 /// stopped"; a model whose files are damaged says so and says where to look, on one line a status
@@ -517,7 +512,8 @@ fn recogniser_failure(err: SpeechError) -> crate::EngineError {
     let text = match &err {
         SpeechError::Cancelled => "Transcription stopped".to_string(),
         // A request the model cannot serve, or a decode that went nowhere: not the files' fault.
-        SpeechError::Model(why) if why.contains(UNKNOWN_LANGUAGE) || why.contains(DECODING_STOPPED) => format!("Transcription failed: {err}"),
+        // (Told apart by their variants, never by the recogniser's words.)
+        SpeechError::UnknownLanguage(_) | SpeechError::DecodingStopped(_) => format!("Transcription failed: {err}"),
         // Everything else a running model reports (numbers that are not numbers, tensors of the wrong
         // shape, a tokenizer that does not parse) means the model's files cannot be used.
         SpeechError::Model(_) => {
@@ -1410,13 +1406,23 @@ mod tests {
         assert!(!text.contains("bad parameters") && !text.to_lowercase().contains("whisper"), "{text}");
 
         assert_eq!(recogniser_failure(SpeechError::Cancelled).to_string(), "Transcription stopped");
-        for fine in [
-            SpeechError::Model("the model does not know the language `xx`".into()),
-            SpeechError::Model("decoding stopped: 8 windows in a row advanced by less than 0.1 s".into()),
-        ] {
+        for fine in [SpeechError::UnknownLanguage("xx".into()), SpeechError::DecodingStopped("8 windows in a row advanced by less than 0.1 s".into())]
+        {
             let said = recogniser_failure(fine.clone()).to_string();
             assert!(said.starts_with("Transcription failed: ") && !said.contains("damaged") && !said.contains('\n'), "{said}");
         }
+        assert_eq!(
+            recogniser_failure(SpeechError::UnknownLanguage("xx".into())).to_string(),
+            "Transcription failed: the model does not know the language `xx`"
+        );
+        assert_eq!(
+            recogniser_failure(SpeechError::DecodingStopped("8 windows in a row advanced by less than 0.1 s".into())).to_string(),
+            "Transcription failed: decoding stopped: 8 windows in a row advanced by less than 0.1 s"
+        );
+        // The wording is not what decides: a model error that merely says these words is still a model
+        // error (damaged files).
+        let lookalike = recogniser_failure(SpeechError::Model("the model does not know the language `xx`; decoding stopped".into())).to_string();
+        assert!(lookalike.contains("the speech model's files are damaged"), "{lookalike}");
         assert_eq!(
             recogniser_failure(SpeechError::TooLong("5.0 hours".into())).to_string(),
             "Transcription failed: the audio is too long to transcribe (5.0 hours)"

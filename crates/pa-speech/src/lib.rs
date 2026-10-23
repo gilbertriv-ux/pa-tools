@@ -122,6 +122,16 @@ pub enum SpeechError {
     Unavailable(String),
     #[error("model: {0}")]
     Model(String),
+    /// The caller asked for a language the model does not have (the text names the language). A
+    /// request the model cannot serve, not a sign that its files are damaged: callers match on this
+    /// variant, never on the words of [`SpeechError::Model`].
+    #[error("the model does not know the language `{0}`")]
+    UnknownLanguage(String),
+    /// Decoding went nowhere: the model's timestamps stopped moving forward (the text says how).
+    /// The audio or the model is at fault, not the files being unusable, and it is a failure that
+    /// ends a run that would otherwise crawl for hours. Callers match on this variant.
+    #[error("decoding stopped: {0}")]
+    DecodingStopped(String),
     /// The audio is longer than [`MAX_AUDIO_SECS`]; the text says by how much.
     #[error("the audio is too long to transcribe ({0})")]
     TooLong(String),
@@ -303,6 +313,8 @@ mod tests {
             SpeechError::Unavailable("this build does not include the speech feature".into()),
             SpeechError::TooLong("4.1 hours; the limit is 4 hours".into()),
             SpeechError::Cancelled,
+            SpeechError::UnknownLanguage("xx".into()),
+            SpeechError::DecodingStopped("8 windows in a row advanced by less than 0.1 s".into()),
         ];
         for e in &errors {
             for text in [e.to_string(), e.summary()] {
@@ -314,6 +326,19 @@ mod tests {
         assert_eq!(errors[2].summary(), "Speech model, base (multilingual) was not found");
         assert!(errors[2].to_string().contains("searched: application data"), "agents still get the places searched");
         assert!(!errors[2].summary().contains("/home"), "the summary leaves the user's folders out");
+    }
+
+    /// Callers tell these two run-time failures apart by variant, so the variants carry the words
+    /// people read: the same sentences the model's errors always had.
+    #[test]
+    fn a_language_the_model_lacks_and_a_decode_that_stalls_have_their_own_variants() {
+        let language = SpeechError::UnknownLanguage("xx".into());
+        assert_eq!(language.to_string(), "the model does not know the language `xx`");
+        assert_eq!(language.summary(), "the model does not know the language `xx`");
+        let stalled = SpeechError::DecodingStopped("8 windows in a row advanced by less than 0.1 s".into());
+        assert_eq!(stalled.to_string(), "decoding stopped: 8 windows in a row advanced by less than 0.1 s");
+        assert_ne!(language, SpeechError::Model(language.to_string()), "a model error that says the same words is not the same error");
+        assert_ne!(stalled, SpeechError::Model(stalled.to_string()));
     }
 
     #[test]

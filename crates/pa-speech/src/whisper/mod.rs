@@ -307,7 +307,7 @@ impl Whisper {
         let (frames, mel) = crate::mel::log_mel(&padded, n_mels);
         let mut language = opts.language.clone().filter(|l| !l.is_empty() && l != "auto");
         if language.as_deref().is_some_and(|l| self.tok.multilingual() && self.tok.language_token(l).is_none()) {
-            return Err(SpeechError::Model(format!("the model does not know the language `{}`", language.unwrap_or_default())));
+            return Err(SpeechError::UnknownLanguage(language.unwrap_or_default()));
         }
         let mut words: Vec<Word> = Vec::new();
         let mut seek = 0usize;
@@ -450,8 +450,8 @@ impl ProgressGuard {
             self.stalled = 0;
         }
         if self.stalled >= MAX_STALLED_WINDOWS {
-            return Err(SpeechError::Model(format!(
-                "decoding stopped: {} windows in a row advanced by less than {} s (the model's timestamps do not move forward)",
+            return Err(SpeechError::DecodingStopped(format!(
+                "{} windows in a row advanced by less than {} s (the model's timestamps do not move forward)",
                 self.stalled,
                 MIN_ADVANCE_FRAMES as f64 / 100.0
             )));
@@ -493,7 +493,8 @@ mod tests {
             assert!(windows < 1000, "the guard never fired");
         };
         assert_eq!(windows, MAX_STALLED_WINDOWS);
-        assert!(matches!(&err, SpeechError::Model(m) if m.contains("decoding stopped")), "{err:?}");
+        assert!(matches!(&err, SpeechError::DecodingStopped(why) if why.contains("windows in a row")), "{err:?}");
+        assert!(err.to_string().starts_with("decoding stopped: "), "the wording is unchanged: {err}");
     }
 
     #[test]
