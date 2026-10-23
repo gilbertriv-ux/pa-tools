@@ -33,6 +33,7 @@ pub mod video_window;
 pub mod waveform;
 pub mod widgets;
 pub mod windows;
+pub mod workspace;
 
 use serde_json::{Value, json};
 use soundcraft_engine::{Engine, TransportRequest};
@@ -1259,6 +1260,7 @@ impl SoundApp {
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
         }
+        workspace::show(self, ui);
         // With the Mix window in its own native window, the main window keeps Edit.
         match if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window } {
             MainWindow::Edit => edit_window::show(self, ui),

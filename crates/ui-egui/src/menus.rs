@@ -750,7 +750,13 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         }
         "window.universe" => toggle(&mut app.ui.show_universe),
         "window.video" => toggle(&mut app.ui.show_video),
-        "window.transcript" => toggle(&mut app.ui.show_transcript),
+        "window.transcript" => {
+            if let Some(value) = p.get("docked") {
+                let Some(docked) = value.as_bool() else { return Some(Err("docked must be a boolean".into())) };
+                app.ui.transcript.docked = docked;
+            }
+            toggle(&mut app.ui.show_transcript)
+        }
         "window.video_universe" => toggle(&mut app.ui.show_video_universe),
         "window.close" | "window.hide_floating" => {
             app.ui.show_transport = false;

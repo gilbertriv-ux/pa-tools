@@ -89,6 +89,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | Native desktop workspace V2 lands the navigation/onboarding/transcript portion of G-19; other beta UI work remains |
 | 2026-10-22 | minor | G-18 local recognition and searchable transcript implemented; remaining quality and editing work retained |
 | 2026-10-14 | trivial | M8: reject oversized MCP batches before execution (#460) |
 | 2026-10-10 | minor | Added the alpha gate (3 of 6 core workflows fail → pre-alpha) |

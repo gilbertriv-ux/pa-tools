@@ -3,8 +3,8 @@
 //! returned early (no hover position) before the menu was drawn.
 
 use egui::{Event, Modifiers, PointerButton, pos2, vec2};
-use egui_kittest::Harness;
-use soundcraft_ui_egui::{Services, SoundApp};
+use egui_kittest::{Harness, kittest::Queryable as _};
+use soundcraft_ui_egui::{Services, SoundApp, edit_window};
 
 /// One UI frame, with queued synthetic pointer input applied first (as the control channel does).
 fn step(h: &mut Harness<'_, SoundApp>) {
@@ -45,19 +45,41 @@ fn clip_menu_stays_open_while_moving_onto_delete() {
     let before = kick_clip_count(&h);
     assert!(before > 0, "the demo session should have a recorded Kick clip");
 
-    // Right-click the Kick clip, then move the pointer into the menu and down to Delete.
-    press(&mut h, 880.0, 240.0, PointerButton::Secondary);
+    // Find a visible Kick clip from the actual layout, including workspace/header height.
+    let (at, lane_bottom) = {
+        let session = h.state().engine.session();
+        let kick = session.track_by_name("Kick").unwrap();
+        let timeline = edit_window::rect(h.state().edit_layout.timeline);
+        let row = edit_window::rect(h.state().edit_layout.rows.iter().find(|(id, _)| *id == kick.id.0).unwrap().1);
+        let (left, right) = kick
+            .clips()
+            .iter()
+            .map(|clip| {
+                (
+                    edit_window::x_of(session, timeline, clip.start).max(timeline.min.x),
+                    edit_window::x_of(session, timeline, clip.end()).min(timeline.max.x),
+                )
+            })
+            .find(|(left, right)| right - left > 20.0)
+            .unwrap();
+        (pos2((left + right) * 0.5, row.center().y), row.max.y)
+    };
+    press(&mut h, at.x, at.y, PointerButton::Secondary);
     for _ in 0..10 {
         step(&mut h);
     }
+    let first_item = h.get_by_label("Mute/Unmute").rect().center();
+    let delete = h.get_by_label("Delete").rect().center();
+    assert!(delete.y > lane_bottom, "the regression must move the pointer out of the original lane");
     // Move (no click) into the menu, as a real pointer would, so the lane loses its hover.
-    for (x, y) in [(900.0, 300.0), (907.0, 442.0)] {
-        h.state_mut().synthetic.push(Event::PointerMoved(pos2(x, y)));
+    for position in [first_item, delete] {
+        h.state_mut().synthetic.push(Event::PointerMoved(position));
         for _ in 0..10 {
             step(&mut h);
         }
     }
-    press(&mut h, 907.0, 442.0, PointerButton::Primary);
+    h.get_by_label("Delete");
+    press(&mut h, delete.x, delete.y, PointerButton::Primary);
     for _ in 0..15 {
         step(&mut h);
     }

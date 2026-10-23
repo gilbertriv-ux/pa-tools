@@ -55,3 +55,14 @@ Apache-2.0 — the same license as this repository. The donor's `filmcraft-time`
 dependency. Whisper model weights (`openai/whisper-*`, MIT) are downloaded on first use and are
 never committed. The opt-in local macOS speech runner stages verified weights and their license
 inside its output app bundle for offline use.
+
+## Desktop V2 design and generated assistance
+
+The original native code in `crates/ui-egui/src/workspace.rs` and the V2 UI changes are under
+this repository's MIT OR Apache-2.0 license. The user's
+[Stitch design study](https://stitch.google.com/projects/13723414442799651417) informed the layout
+and color palette. The user's [Opal workflow](https://opal.google/edit/1hu6KhvsJaGaBZZz6r0refx_XSZXXrbgR)
+provided planning assistance; Google AI Studio generated a transcript grouping study under
+the requested MIT OR Apache-2.0 terms, subsequently adapted and tested locally. No artwork,
+font files, third-party web libraries, logos or proprietary product assets were copied from
+those exports. See `docs/stitch-desktop-v2.md` for the implementation and validation boundary.

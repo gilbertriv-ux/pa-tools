@@ -1,5 +1,7 @@
 # Control protocol
 
+Last updated: 2026-10-22 (desktop workspace V2 transcript host).
+
 Pa Tools can be driven completely by other programs: scripts, test harnesses and AI agents.
 Every menu item, button, mouse gesture and keystroke maps to a **command** (or to synthetic
 input), and every command is reachable from:
@@ -88,6 +90,12 @@ fixed when the OS appearance changes. An offscreen render without `--system-them
 OS appearance and therefore resolves System to Dark.
 
 ## Panel docking
+
+The Transcript inspector has its own resizable right-side host on desktop widths of at least
+1040 points, with a floating-window fallback below that width. `window.transcript` accepts
+`{"value":true,"docked":true}` to open the inspector, or `docked:false` for a floating window.
+The host preference is saved in `ui.transcript.docked`; it does not alter session content.
+This specialist inspector is separate from the shared panel IDs listed below.
 
 Tracks and Groups, Clips, MIDI Editor, Memory Locations, and Undo History use movable panels. Commands target the active Edit or Mix view; floating panels stay inside the current viewport. Edit and Mix retain separate arrangements; Clips and MIDI Editor belong to Edit. Transport, plug-in, and specialist utility windows retain their existing hosts. The document/session view is protected. Layouts, active tabs, panel visibility, and floating rectangles are saved with the app's existing UI preferences. These operations do not edit document contents.
 

@@ -4,7 +4,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular, rgb};
 use crate::widgets::{
     PannerEdit, PannerSpeaker, db_text, fader, fader_slot, groove, inset, meter, meter_scale, multi_meter, pan_knob, pan_text, raised_key,
-    rec_toggle, selector_box, selector_box_with_tooltip, shade, surround_panner, text_toggle, vgradient,
+    rec_toggle, selector_box, selector_box_with_tooltip, shade, surround_panner, text_toggle,
 };
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
@@ -12,10 +12,11 @@ use soundcraft_model::{ChannelFormat, Route, SurroundPan, Track, TrackId, TrackK
 use soundcraft_playback::MeterSnapshot;
 
 pub fn strip_width(narrow: bool) -> f32 {
-    if narrow { 64.0 } else { 98.0 }
+    if narrow { 64.0 } else { 108.0 }
 }
 
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
+    crate::transcript_window::show_docked(app, ui);
     crate::docking::show(app, ui, crate::MainWindow::Mix);
 }
 
@@ -49,7 +50,7 @@ pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
     let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
     egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 1.0;
+            ui.spacing_mut().item_spacing.x = 5.0;
             for id in ids {
                 strip(app, ui, id, snap.as_ref());
             }
@@ -159,9 +160,10 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     let (r, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
     let selected = app.engine.session().edit.selected_tracks.contains(&id);
     let bg = if selected { t.strip_selected } else { t.strip_bg };
-    vgradient(ui.painter(), r, shade(bg, 0.06), bg);
-    ui.painter().vline(r.min.x + 0.5, r.y_range(), Stroke::new(1.0, t.edge_light));
-    let mut y = r.min.y + 4.0;
+    ui.painter().rect_filled(r, 4.0, bg);
+    ui.painter().rect_stroke(r.shrink(0.5), 4.0, Stroke::new(1.0, t.border_light), StrokeKind::Inside);
+    ui.painter().rect_filled(Rect::from_min_size(r.min + vec2(1.0, 1.0), vec2(w - 2.0, 3.0)), 1.0, rgb(track.color));
+    let mut y = r.min.y + 7.0;
     let inner_w = w - 8.0;
     let x0 = r.min.x + 4.0;
     let views = app.ui.mix_views.clone();

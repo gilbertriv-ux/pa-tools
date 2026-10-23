@@ -199,7 +199,13 @@ fixture proves the local round-trip, not production dialogue quality.
 
 ### G-19. UI feel
 
-See [`ui-parity.md`](ui-parity.md). ≈ 60–100 h.
+**Implemented (2026-10-22):** desktop workspace V2 adds session navigation and empty-session
+actions, studio colors and mixer strip boundaries, and a docked transcript inspector with
+speaker utterances. See [`stitch-desktop-v2.md`](stitch-desktop-v2.md).
+
+Generic plugin windows, shortcut collisions, pro-grade meters/scaling and wider interaction
+validation remain. See [`ui-parity.md`](ui-parity.md). Remaining estimate needs reassessment;
+the overall readiness estimate is unchanged.
 
 ### G-20. MIDI and instrument depth
 
@@ -220,6 +226,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | G-19 records workspace/onboarding/transcript layout work; remaining professional UI depth retained |
 | 2026-10-22 | minor | G-18 shrunk to accuracy, correction/editing and platform validation after real spoken-fixture recognition |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |

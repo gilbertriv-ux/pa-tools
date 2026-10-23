@@ -1,5 +1,5 @@
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT as _, Queryable};
 use serde_json::json;
 use soundcraft_ui_egui::dialogs::Dialog;
 use soundcraft_ui_egui::{Services, SoundApp, dialogs, menus};
@@ -23,7 +23,12 @@ fn steps(h: &mut Harness<'_, SoundApp>) {
 }
 
 fn click(h: &mut Harness<'_, SoundApp>, label: &str) {
-    h.get_by_label(label).click();
+    if label == "Save" {
+        // The workspace also offers Save. Exercise the confirmation dialog's button.
+        h.get_by_label("Don't Save").parent().unwrap().get_by_label(label).click();
+    } else {
+        h.get_by_label(label).click();
+    }
     steps(h);
 }
 

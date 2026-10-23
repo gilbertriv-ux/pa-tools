@@ -112,6 +112,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if app.ui.show_universe {
         egui::Panel::top("universe").exact_size(64.0).frame(egui::Frame::NONE.fill(Tokens::current().universe_bg)).show(ui, |ui| universe(app, ui));
     }
+    crate::transcript_window::show_docked(app, ui);
     crate::docking::show(app, ui, crate::MainWindow::Edit);
 }
 
@@ -261,7 +262,11 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
     }
     // Below the tracks a click clears the selection and a double-click opens New Tracks.
     let empty = Rect::from_min_max(pos2(full.min.x, y.max(tl.min.y)), tl.max);
-    if empty.height() > 4.0 {
+    if app.engine.session().tracks.is_empty() && empty.height() > 100.0 {
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("session_onboarding").max_rect(empty));
+        child.set_clip_rect(empty.intersect(ui.clip_rect()));
+        crate::workspace::empty_session(app, &mut child);
+    } else if empty.height() > 4.0 {
         let resp = ui.interact(empty, ui.id().with("empty"), Sense::click());
         if resp.double_clicked() {
             let _ = app.dialogs.open_for_command(&app.engine, "track.new");
