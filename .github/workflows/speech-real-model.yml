@@ -5,7 +5,9 @@
 # OpenAI's MIT-licensed whisper repository), verifies both against pinned SHA-256 hashes, then:
 #   1. runs the speech crate + engine tests with the speech features, including the real-model
 #      test, which must RUN (a configured fixture with no model is a failure, never a skip);
-#   2. builds the CLI with the speech feature and transcribes the clip end to end
+#   2. runs the Transcript window's own real-model test (menu -> background job -> stored
+#      transcript), which must also RUN: a skip fails the step;
+#   3. builds the CLI with the speech feature and transcribes the clip end to end
 #      (import -> track.transcribe -> saved session), checking the stored words.
 # Nothing downloaded here is committed to the repository. ffmpeg is used only on the runner to
 # convert the clip; no GPL code enters the repository or the build.
@@ -113,6 +115,21 @@ jobs:
           grep -q "transcribes_a_fixture_when_a_model_is_present ... ok" speech-tests.log
           if grep -q "SKIPPED" speech-tests.log; then echo "::error::the real-model test skipped"; exit 1; fi
           grep "transcript (" speech-tests.log
+
+      - name: Transcript window, with the real model
+        env:
+          PA_SPEECH_MODELS_DIR: ${{ env.MODELS_DIR }}
+          PA_SPEECH_FIXTURE: ${{ env.FIXTURES_DIR }}/jfk-16k-mono.f32
+          PA_SPEECH_FIXTURE_KEYWORD: country
+          PA_SPEECH_FIXTURE_REFERENCE: ${{ env.REFERENCE }}
+        run: |
+          set -o pipefail
+          cargo test -p soundcraft-ui-egui --features whisper --test transcript_window the_real_model_transcribes_a_track_through_the_window -- --nocapture 2>&1 | tee window-tests.log
+          # The test must have run, not skipped (a skip prints SKIPPED and still passes).
+          if grep -q "SKIPPED" window-tests.log; then echo "::error::the window's real-model test skipped"; exit 1; fi
+          grep -q "the_real_model_transcribes_a_track_through_the_window ... ok" window-tests.log
+          grep -q "test result: ok. 1 passed" window-tests.log
+          grep "real model through the window" window-tests.log
 
       - name: End to end through the CLI (import, transcribe, save)
         run: |
