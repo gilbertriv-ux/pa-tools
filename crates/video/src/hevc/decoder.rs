@@ -594,6 +594,12 @@ fn run_job_as<S: Sample>(
 ) {
     let mut pic = PicState::<S>::new(frame.clone(), sps, pps, layout, scaling);
     pic.draft = draft;
+    // A last-resort net, not the defence: the decoder is written so that no input panics (checked
+    // arithmetic and bounds, errors as values), and the hostile-file tests run with this net absent
+    // in mind. The net only works where panics unwind. Under `panic = "abort"` (a consumer's profile
+    // setting) and on wasm32, where unwinding is not available, `catch_unwind` does nothing and a
+    // panic ends the process, so a panic reachable from a file is a crash there. See the "Limits"
+    // section of `docs/video-codecs.md`.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
         for s in &slices {

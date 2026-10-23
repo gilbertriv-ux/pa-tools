@@ -816,7 +816,41 @@ fn the_margin_stays_inside_the_byte_budget() {
     for (w, h, dpb, wide) in [(64, 64, 0, false), (4096, 2160, 16, true), (8192, 8192, 5, false), (7680, 4320, 8, true)] {
         let s = sps(w, h, dpb, wide);
         if s.dpb_bytes() <= MAX_DPB_BYTES {
-            assert!(s.dpb_entry_limit() >= dpb as usize + 1, "{w}x{h} dpb {dpb}");
+            assert!(s.dpb_entry_limit() > dpb as usize, "{w}x{h} dpb {dpb}");
+        }
+    }
+}
+
+/// The limits `docs/video-codecs.md` ("Limits") states for the 1 GiB HEVC picture buffer (Gil,
+/// decision 5): the largest `max_dec_pic_buffering` each picture size may declare. HEVC here is 4:2:0
+/// only; 8-bit pictures store one byte per sample and deeper ones two.
+#[test]
+fn the_one_gibibyte_picture_buffer_sets_the_hevc_limits() {
+    use crate::hevc::params::{MAX_DPB_BYTES, Sps};
+    assert_eq!(MAX_DPB_BYTES, 1 << 30);
+    let sps = |w: u32, h: u32, dpb: u32, wide: bool| {
+        let mut s = Sps::parse(&crate::bitstream::unescape_rbsp(&sps_at(true, (8, 8))[6..])).expect("sps");
+        (s.width, s.height, s.max_dec_pic_buffering) = (w, h, dpb);
+        if wide {
+            (s.bit_depth_luma, s.bit_depth_chroma) = (10, 10);
+        }
+        s
+    };
+    // (width, height, 10-bit, the largest declared buffer that fits; 16 is the most a stream can declare)
+    for (w, h, wide, most) in [
+        (1920, 1080, true, 16),
+        (3840, 2160, true, 16),
+        (5120, 2880, true, 16),
+        (7680, 4320, false, 16),
+        (7680, 4320, true, 8),
+        (8192, 4320, false, 16),
+        (8192, 4320, true, 7),
+        (8192, 8192, false, 8),
+        (8192, 8192, true, 3),
+    ] {
+        assert!(sps(w, h, most, wide).dpb_bytes() <= MAX_DPB_BYTES, "{w}x{h} wide {wide}: a buffer of {most} fits");
+        if most < 16 {
+            assert!(sps(w, h, most + 1, wide).dpb_bytes() > MAX_DPB_BYTES, "{w}x{h} wide {wide}: a buffer of {} does not", most + 1);
         }
     }
 }

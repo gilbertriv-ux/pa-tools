@@ -407,6 +407,23 @@ fn absurd_headers_are_refused_before_allocating() {
     assert!(decode_bytes(&FrameHeader { width: 9000, ..h }) > decode::MAX_DECODE_BYTES);
 }
 
+/// The numbers `docs/video-codecs.md` ("Limits") quotes for the 1 GiB VC-3 decode budget (Gil,
+/// decision 5): at 8192 x 8192 every layout fits, whatever the bit depth (samples are `u16`).
+#[test]
+fn every_picture_the_size_limit_lets_through_fits_the_vc3_decode_budget() {
+    for (chroma, alpha, bytes) in [
+        (ChromaFormat::Yuv420, false, 402_653_184u64),
+        (ChromaFormat::Yuv422, false, 536_870_912),
+        (ChromaFormat::Yuv444, false, 805_306_368),
+        (ChromaFormat::Yuv444, true, 1 << 30),
+    ] {
+        let mut h = header_for(1270, chroma, 10, 8192, false, true);
+        (h.width, h.alpha) = (8192, alpha);
+        assert_eq!(decode_bytes(&h), bytes, "{chroma:?} alpha {alpha}");
+        assert!(decode_bytes(&h) <= decode::MAX_DECODE_BYTES);
+    }
+}
+
 #[test]
 fn damaged_scan_line_indices_are_refused() {
     for (si, seed) in seeds().iter().enumerate() {

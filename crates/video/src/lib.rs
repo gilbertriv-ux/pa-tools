@@ -4,7 +4,8 @@
 //! - [`Movie::open`] (bytes) / [`Movie::open_source`] (any random-access [`ByteSource`]).
 //! - [`Movie::info`]: size, duration, frame rate, codec, whether it can be decoded.
 //! - [`Movie::frame_at`]: the frame shown at a time, decoded forward from the previous keyframe,
-//!   with a small LRU of decoded frames (sequential playback keeps decoding forward).
+//!   with an LRU of decoded frames held to a byte budget, 1 GiB by default (sequential playback keeps
+//!   decoding forward).
 //! - [`Movie::thumbnail_at`] / [`Movie::thumbnails`]: low-resolution timeline pictures (keyframes).
 //! - Unsupported codecs open fine (so the timeline can show the clip) but frame requests return
 //!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
@@ -20,6 +21,19 @@
 //! 4:2:0 / 4:2:2 / 4:4:4 / monochrome). A build without one still opens such a file, so the
 //! timeline shows the clip, and reports its pictures as "unsupported in this build". All three new
 //! decoders read MP4 / MOV only (no MXF, Matroska / WebM or IVF reader yet), and none tone-maps HDR.
+//!
+//! ## Panics and `catch_unwind`
+//!
+//! The decoders are written so that no file makes them panic: arithmetic and indexing are checked and
+//! errors are values (`#![deny(clippy::unwrap_used, ...)]` below, and adversarial tests in every
+//! codec). As a last resort the H.264, HEVC and AV1 frame workers wrap a picture in
+//! `std::panic::catch_unwind`, so that a panic that should never happen becomes a decoding error for
+//! that picture instead of a hung reader. That net works only where panics unwind. Under
+//! `panic = "abort"` (a profile setting of whoever builds the binary) and on `wasm32`, where unwinding
+//! is not available, `catch_unwind` does nothing: a panic there ends the process. This workspace sets
+//! no `panic = "abort"`, so the native app has the net; the web build does not. Nothing in this crate
+//! relies on the net, and none of it uses `debug_assert!`: an invariant a file can reach is a checked
+//! path. See "Limits" in `docs/video-codecs.md`.
 //!
 //! ## Adding a codec
 //!
@@ -67,7 +81,7 @@ pub mod synth;
 pub mod vc3;
 
 pub use isobmff::ByteSource;
-pub use movie::{DEFAULT_CACHE_BYTES, Frame, Movie, MovieInfo, SharedSource, fit_size};
+pub use movie::{DEFAULT_CACHE_BYTES, DEFAULT_CACHE_FRAMES, Frame, Movie, MovieInfo, SharedSource, fit_size};
 
 /// Errors from opening or decoding a movie.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

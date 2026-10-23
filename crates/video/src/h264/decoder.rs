@@ -534,6 +534,9 @@ fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool)
         _ => PicState::new(frame.clone()),
     };
     pic.skip_deblock = draft;
+    // A last-resort net, not the defence (the slice decoder is written to return errors, not panic),
+    // and it works only where panics unwind: under `panic = "abort"` and on wasm32 `catch_unwind`
+    // does nothing and a panic ends the process. See the "Limits" section of `docs/video-codecs.md`.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
         for s in &slices {
