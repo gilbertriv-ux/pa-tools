@@ -87,6 +87,17 @@ impl MovieInfo {
 /// How many sync samples a start search may step back over (open GOPs, unreliable sync flags).
 pub(crate) const MAX_START_STEPS: usize = 32;
 
+/// How many pictures a decoder may output past the one asked for, with the asked-for one still not
+/// among them, before the request gives up on it (a damaged sample, or a picture the stream never
+/// outputs). The container's presentation order is what labels each picture, and a decoder's output
+/// order does not always agree with it: a B-frame stream whose `ctts` is missing or wrong, or an
+/// H.264 stream that understates its reorder depth, outputs pictures whose labels run ahead of the
+/// asked-for one before it arrives. How far ahead is the stream's real reorder depth, which is 4 or
+/// less in everyday encodes and up to 7 in deep hierarchical GOPs, so the margin is 8. It also bounds
+/// the work a missing picture costs: the loop stops about this many pictures (plus the decoder's own
+/// hold-back) after the one asked for, not at the end of the movie.
+pub(crate) const PAST_PICTURES_BEFORE_GIVING_UP: usize = 8;
+
 /// Builds a [`GopDecoder`] (test movies run on scripted decoders).
 #[cfg(test)]
 pub(crate) type GopFactory = Arc<dyn Fn() -> Result<Box<dyn GopDecoder>> + Send + Sync>;
@@ -669,6 +680,8 @@ impl Movie {
         }
         let total = self.order.len();
         let mut last_err: Option<String> = None;
+        // Pictures this request has seen output with a presentation index past `index`.
+        let mut past = 0usize;
         // Bounded: each iteration feeds one sample, or flushes once at the end.
         for _ in 0..=total.saturating_add(1) {
             let Some(st) = self.gop.as_mut() else { break };
@@ -676,12 +689,15 @@ impl Movie {
             if let Some(yuv) = st.ready.remove(&index) {
                 return Ok(Arc::new(self.yuv_frame(&yuv, index)?));
             }
-            // Decoders output in presentation order, so once output has gone past `index` without
-            // producing it the picture is not coming (a damaged sample, or a picture the stream does
-            // not output). Stop here rather than decode the rest of the movie, and leave the decoder
-            // where it is: the pictures after `index` that it already output wait in `ready`, so the
-            // next frame still comes from this decoder.
-            if st.last_out.is_some_and(|lo| lo > index) {
+            // Decoders output in presentation order, so once output has gone well past `index`
+            // without producing it the picture is not coming (a damaged sample, or a picture the
+            // stream does not output). Stop here rather than decode the rest of the movie, and leave
+            // the decoder where it is: the pictures after `index` that it already output wait in
+            // `ready`, so the next frame still comes from this decoder. "Well past" is
+            // [`PAST_PICTURES_BEFORE_GIVING_UP`] pictures, not one: output order can disagree with
+            // the container's presentation order by the stream's reorder depth, and giving up at the
+            // first picture past `index` failed frames that were about to arrive.
+            if past >= PAST_PICTURES_BEFORE_GIVING_UP {
                 break;
             }
             if st.next == usize::MAX {
@@ -721,6 +737,9 @@ impl Movie {
                 let q = usize::try_from(p.pts).unwrap_or(usize::MAX);
                 st.last_out = Some(st.last_out.map_or(q, |lo| lo.max(q)));
                 self.decoded += 1;
+                if q > index {
+                    past += 1;
+                }
                 if q >= index {
                     st.ready.insert(q, p.yuv);
                 }

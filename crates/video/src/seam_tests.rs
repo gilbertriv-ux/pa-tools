@@ -5,7 +5,7 @@
 use crate::convert::{Matrix, Planes, Yuv, planar_to_rgba};
 use crate::gop::{GopDecoder, Pic};
 use crate::isobmff::{Av1Config, Brand, CodecConfig, FourCc, HevcConfig, Mp4Writer, SampleEntry, TrackConfig, VpcConfig, WriteSample, WriterOptions};
-use crate::movie::{GopFactory, MAX_START_STEPS};
+use crate::movie::{GopFactory, MAX_START_STEPS, PAST_PICTURES_BEFORE_GIVING_UP};
 use crate::synth::h264_mp4;
 use crate::{Frame, Movie, Result, VideoError};
 use std::io::Cursor;
@@ -316,10 +316,12 @@ fn a_request_for_a_damaged_frame_stops_early_and_the_next_frame_still_decodes() 
     let err = m.frame(30).unwrap_err();
     assert_eq!(err, VideoError::Decode("mock damaged".into()));
     let fed_now = fed(&log);
-    // the decoder holds `depth` (2) pictures back, so it is past picture 30 a few samples later
-    assert!(fed_now.len() <= 30 + 1 + 3, "fed {} of 60 samples", fed_now.len());
+    // the decoder holds `depth` (2) pictures back, and the request waits for `PAST_PICTURES_BEFORE_GIVING_UP`
+    // pictures past 30 before it gives up, so it is a handful of samples past picture 30, not the end of 60
+    let bound = 30 + 1 + PAST_PICTURES_BEFORE_GIVING_UP + 3;
+    assert!(fed_now.len() <= bound, "fed {} of 60 samples", fed_now.len());
     assert_eq!(fed_now, (0..fed_now.len() as u8).collect::<Vec<_>>(), "decode order, from the key frame");
-    assert!(m.decoded <= 33, "{} of 60 pictures decoded", m.decoded);
+    assert!(m.decoded <= 30 + 1 + PAST_PICTURES_BEFORE_GIVING_UP as u64, "{} of 60 pictures decoded", m.decoded);
     assert_eq!(created(&log), 1);
     // the pictures after it that were already output are still available, from the same decoder
     let fed_before = fed(&log).len();
@@ -330,7 +332,63 @@ fn a_request_for_a_damaged_frame_stops_early_and_the_next_frame_still_decodes() 
     // and asking for the damaged frame again fails the same way, again without running to the end
     let before = fed(&log).len();
     assert_eq!(m.frame(30).unwrap_err(), VideoError::Decode("mock damaged".into()));
-    assert!(fed(&log).len() - before <= 30 + 1 + 3, "a second request is bounded the same way");
+    assert!(fed(&log).len() - before <= bound, "a second request is bounded the same way");
+}
+
+/// A decoder whose output order disagrees with the container's presentation order. Here the container
+/// says the pictures are shown in the order 0 4 2 1 3 ... (a B-frame stream), and the decoder, which
+/// declares no reordering (`depth: 0`: a stream that understates its reorder depth, or a `ctts` that
+/// went missing), hands pictures back in decode order, labelled with the presentation index each was
+/// given. A request for picture 1 sees pictures 4 and 2 come out first. Giving up at the first picture
+/// past the one asked for made this fail frame 1 with "could not be decoded"; every frame must come back.
+#[test]
+fn a_stream_whose_output_order_disagrees_with_its_declared_reorder_still_returns_every_frame() {
+    // closed GOPs, reordering up to 3 pictures deep
+    let layout: Layout = [
+        (0, KEY),
+        (4, INTER),
+        (2, INTER),
+        (1, INTER),
+        (3, INTER),
+        (8, INTER),
+        (6, INTER),
+        (5, INTER),
+        (7, INTER),
+        (12, INTER),
+        (10, INTER),
+        (9, INTER),
+        (11, INTER),
+    ]
+    .to_vec();
+    let flat = Script { depth: 0, ..Script::default() };
+    // asked in order, and one at a time with nothing cached
+    let (mut seq, _) = scripted(&layout, flat.clone());
+    for pts in 0..13 {
+        assert_shows(&seq.frame(pts as usize).unwrap(), &layout, pts);
+    }
+    for pts in [1i64, 3, 2, 12, 9, 5, 7, 11, 6, 10, 8, 4, 0] {
+        let (mut m, _) = scripted(&layout, flat.clone());
+        assert_shows(&m.frame(pts as usize).unwrap(), &layout, pts);
+    }
+    // with the same script but a depth that matches the container, nothing changes
+    let (mut honest, _) = scripted(&layout, Script::default());
+    for pts in 0..13 {
+        assert_shows(&honest.frame(pts as usize).unwrap(), &layout, pts);
+    }
+}
+
+/// The same mismatch with a damaged sample: the request for the picture that never comes still stops
+/// within a bounded number of samples, and the others still decode.
+#[test]
+fn a_missing_picture_in_a_mismatched_stream_still_stops_within_a_bounded_number_of_samples() {
+    let layout = long_run();
+    let (mut m, log) = scripted(&layout, Script { depth: 0, fail_on: Some(30), ..Script::default() });
+    assert_eq!(m.frame(30).unwrap_err(), VideoError::Decode("mock damaged".into()));
+    // nothing is held back, so output is one picture per sample: stop after the margin past 30
+    assert!(fed(&log).len() <= 30 + 1 + PAST_PICTURES_BEFORE_GIVING_UP, "fed {} of 60 samples", fed(&log).len());
+    assert_shows(&m.frame(31).unwrap(), &layout, 31);
+    assert_shows(&m.frame(29).unwrap(), &layout, 29);
+    assert_eq!(created(&log), 2, "29 is before the running decoder, so a new one starts");
 }
 
 /// The full-size frame cache is held to its byte budget, not only to its frame count.
