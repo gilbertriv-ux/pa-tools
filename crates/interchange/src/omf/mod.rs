@@ -18,6 +18,9 @@ pub(crate) mod bento;
 mod read;
 mod write;
 
+#[cfg(test)]
+mod tests;
+
 use crate::comp::Document;
 use crate::{Report, Result};
 

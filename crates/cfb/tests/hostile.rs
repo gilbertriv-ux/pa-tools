@@ -451,3 +451,28 @@ mod fuzz {
         }
     }
 }
+
+/// The major version decides the sector size and how directory sizes are read; a header that
+/// names an unknown version, or a sector size that does not go with its version, is refused.
+#[test]
+fn a_version_and_sector_shift_that_do_not_agree_are_refused() {
+    for v in [Version::V3, Version::V4] {
+        let good = fixture(v);
+        assert!(CompoundFile::open(&good).is_ok());
+        for version in [0u16, 1, 2, 5, 0x0100, 0xFFFF] {
+            let mut b = good.clone();
+            b[26..28].copy_from_slice(&version.to_le_bytes());
+            assert!(CompoundFile::open(&b).is_err(), "version {version}");
+        }
+        for shift in [0u16, 7, 8, 10, 11, 13, 16] {
+            let mut b = good.clone();
+            b[30..32].copy_from_slice(&shift.to_le_bytes());
+            assert!(CompoundFile::open(&b).is_err(), "{v:?} with shift {shift}");
+        }
+        // the other version's shift
+        let mut b = good.clone();
+        let other: u16 = if v == Version::V3 { 12 } else { 9 };
+        b[30..32].copy_from_slice(&other.to_le_bytes());
+        assert!(CompoundFile::open(&b).is_err());
+    }
+}

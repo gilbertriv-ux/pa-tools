@@ -71,7 +71,7 @@ const OP_PADDING: u8 = 0xFF;
 const TOC_BUFFER_KIB: u16 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Seg {
+pub(crate) enum Seg {
     Imm(Vec<u8>),
     At(u64, u32),
 }
@@ -139,6 +139,21 @@ impl Writer {
         let t = self.type_id(ty);
         let seg = self.store(value);
         self.entries.push((obj, p, t, vec![seg]));
+    }
+
+    /// Set a value made of the given segments, which may point anywhere (tests build damaged files
+    /// with it).
+    #[cfg(test)]
+    pub fn set_segments(&mut self, obj: u32, property: &str, ty: &str, segs: Vec<Seg>) {
+        let p = self.property(property);
+        let t = self.type_id(ty);
+        self.entries.push((obj, p, t, segs));
+    }
+
+    /// Where the next stored value will lie in the heap (tests point segments at it).
+    #[cfg(test)]
+    pub fn heap_len(&self) -> u64 {
+        self.data.len() as u64
     }
 
     /// The reference list of `obj` (keys are object ids).

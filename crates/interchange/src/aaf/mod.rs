@@ -37,6 +37,11 @@ mod read;
 pub(crate) mod store;
 mod write;
 
+#[cfg(test)]
+mod hostile_tests;
+#[cfg(test)]
+mod tests;
+
 use crate::comp::Document;
 use crate::{Report, Result};
 

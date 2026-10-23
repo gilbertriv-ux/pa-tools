@@ -238,8 +238,13 @@ impl<'a> CompoundFile<'a> {
         }
         let version = le16(header, 26);
         let shift = le16(header, 30);
-        if !(7..=16).contains(&shift) {
-            return Err(invalid(format!("sector shift {shift}")));
+        // [MS-CFB] 2.2: the major version is 3 (512-byte sectors) or 4 (4096-byte sectors). The
+        // version also decides how a directory entry's size is read, so one this reader does not
+        // know is an error, not a guess.
+        match (version, shift) {
+            (3, 9) | (4, 12) => {}
+            (3 | 4, _) => return Err(invalid(format!("sector shift {shift} in a version {version} file"))),
+            _ => return Err(invalid(format!("format version {version}"))),
         }
         let mini_shift = le16(header, 32);
         if 1usize.checked_shl(u32::from(mini_shift)) != Some(MINI_SECTOR_SIZE) {

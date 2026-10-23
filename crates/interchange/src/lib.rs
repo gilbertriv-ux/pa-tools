@@ -35,6 +35,14 @@ mod tags;
 mod ticks;
 mod wav;
 
+#[cfg(test)]
+mod hostile_tests;
+
+/// The demo-like session the integration tests use, shared with the in-crate tests.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 use serde::{Deserialize, Serialize};
 use soundcraft_model::Session;
 use soundcraft_time::Samples;
