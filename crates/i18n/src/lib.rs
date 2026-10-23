@@ -1,12 +1,22 @@
-//! Translations for the Craft apps.
+//! The localisation runtime for Pa Tools (gap G-09).
 //!
-//! An app embeds the [craft-i18n](https://github.com/benandez/craft-i18n) catalogs at build time
-//! as an [`Embedded`] static, builds one [`I18n`] from it, and looks English source text up in a
-//! [`Lang`]. A missing translation is the English itself; nothing here fails.
+//! Pa Tools embeds its translation catalog (`crates/i18n/catalog/`, built into [`CATALOG`]) and
+//! builds one [`I18n`] from it; English source text is looked up in a chosen [`Lang`], falling back
+//! to the English itself. A missing translation is never an error and nothing here panics.
+//!
+//! Two ways to use it:
+//! - **Explicit:** build a runtime with [`pa_tools`] and pass a [`Lang`] to [`I18n::t`] and friends.
+//! - **Global:** [`global`] holds one process-wide runtime and [`current_lang`]/[`set_lang`] hold
+//!   the current language, so the [`tr!`], [`trc!`], [`trid!`] and [`trn!`] macros look a string up
+//!   with no arguments but the text. Switching with [`set_lang`] takes effect on the next lookup.
+//!
+//! The runtime and the catalog were imported from the storytold craft-libs / craft-i18n donors
+//! (MIT OR Apache-2.0); see `docs/i18n.md` and `ATTRIBUTION.md`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod builtin;
 mod catalog;
+mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -15,6 +25,39 @@ use intl_pluralrules::{PluralCategory, PluralRuleType, PluralRules};
 use unic_langid::LanguageIdentifier;
 
 pub use builtin::{CATALOG, OFFERED, keys, pa_tools};
+pub use runtime::{current_lang, global, problems, set_lang, set_lang_code, use_system_lang};
+
+/// Look up a plain string in the current interface language: `tr!("Save")`. Falls back to English.
+#[macro_export]
+macro_rules! tr {
+    ($source:expr $(,)?) => {
+        $crate::global().t($crate::current_lang(), $source)
+    };
+}
+
+/// Look up a string with a disambiguating context (`trc!("menu", "Open")`), else the plain row.
+#[macro_export]
+macro_rules! trc {
+    ($context:expr, $source:expr $(,)?) => {
+        $crate::global().tc($crate::current_lang(), $context, $source)
+    };
+}
+
+/// Look up a command's label by its id (`trid!("file.save", "Save")`), else the English label.
+#[macro_export]
+macro_rules! trid {
+    ($id:expr, $label:expr $(,)?) => {
+        $crate::global().tid($crate::current_lang(), $id, $label)
+    };
+}
+
+/// A count's wording in the current language, `{n}` filled in (`trn!(n, "{n} item", "{n} items")`).
+#[macro_export]
+macro_rules! trn {
+    ($n:expr, $one:expr, $other:expr $(,)?) => {
+        $crate::global().trn($crate::current_lang(), $n, $one, $other)
+    };
+}
 
 /// The catalogs an app embeds, one entry per locale: (locale, shared catalog, the app's catalog).
 /// A missing catalog is `""`.
