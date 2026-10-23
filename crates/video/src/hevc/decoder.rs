@@ -12,7 +12,7 @@ use crate::hevc::params::{Layout, Pps, Sps, Vps};
 use crate::hevc::picture::{Frame, FrameRef, Sample, stores_u8};
 use crate::hevc::slice::{NalHeader, SliceHeader, nal_type};
 use crate::hevc::slicedec::{Blk, F_INTRA, F_SKIP, PicState, SliceDecoder, SliceJob};
-use crate::hevc::{ColorInfo, Picture};
+use crate::hevc::{ColorInfo, Picture, Plane};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -450,8 +450,8 @@ impl Decoder {
         let mut missing = 0u64;
         // A missing reference picture is a grey frame of its own (8.3.3). The DPB budget (`Sps::dpb_bytes`)
         // allows the pictures it holds plus these, so past that room the grey frames share one buffer.
-        let dpb_size = sps.max_dec_pic_buffering as usize;
-        let room = (dpb_size + 1).saturating_sub(self.dpb.entries.len()).max(1) as u64;
+        let limit = sps.dpb_entry_limit();
+        let room = limit.saturating_sub(self.dpb.entries.len()).max(1) as u64;
         let mut shared: Option<FrameRef> = None;
         let mut make_missing = |p: i32| -> FrameRef {
             missing += 1;
@@ -481,8 +481,9 @@ impl Decoder {
         }
         self.out_queue.extend(outs);
         // A conforming stream never holds more pictures than the DPB size (the budget in `Sps::dpb_bytes`
-        // counts that many plus the current one and one spare).
-        ensure!(self.dpb.entries.len() <= dpb_size + 1, "decoded picture buffer overflow");
+        // counts that many plus the current one and one spare). Streams that understate their size get
+        // `DPB_MARGIN` more pictures while they fit the byte budget (`Sps::dpb_entry_limit`).
+        ensure!(self.dpb.entries.len() <= limit, "decoded picture buffer overflow");
         let (layout, scaling) = self.layout_for(pps, sps)?;
         let _ = scaling;
         let id = self.next_id;
@@ -647,7 +648,19 @@ fn output_meta(sps: &Sps, pts: i64, key: bool, draft: bool) -> OutputMeta {
         matrix_coefficients: vui.matrix_coefficients,
         sar: vui.sar,
         bit_depth: sps.bit_depth_luma,
+        bit_depth_chroma: sps.bit_depth_chroma,
         draft,
+    }
+}
+
+/// Shift every sample of a deeper-than-8-bit plane left by `by` bits (a no-op for 0).
+fn shift_up(p: &mut Plane, by: u32) {
+    if by == 0 {
+        return;
+    }
+    match p {
+        Plane::U16(v) => v.iter_mut().for_each(|s| *s = s.checked_shl(by).unwrap_or(0)),
+        Plane::U8(v) => v.iter_mut().for_each(|s| *s = s.checked_shl(by).unwrap_or(0)),
     }
 }
 
@@ -655,8 +668,16 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
     let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(2));
-    let bd = o.meta.bit_depth;
-    let (y, u, v) = o.frame.cropped_planes((cx, cy, cw, ch), bd <= 8);
+    // Luma and chroma may be coded at different depths (Main 10 allows 8 and 10 in one stream). The
+    // picture is handed out at the deeper of the two, with the shallower plane(s) shifted left, which
+    // keeps black, white and neutral chroma where the stream's own depth puts them (limited-range code
+    // values are defined as `16 << (depth - 8)` and so on).
+    let (bd_y, bd_c) = (o.meta.bit_depth, o.meta.bit_depth_chroma);
+    let bd = bd_y.max(bd_c);
+    let (mut y, mut u, mut v) = o.frame.cropped_planes((cx, cy, cw, ch), bd <= 8);
+    shift_up(&mut y, bd - bd_y);
+    shift_up(&mut u, bd - bd_c);
+    shift_up(&mut v, bd - bd_c);
     Picture {
         width: cw as u32,
         height: ch as u32,

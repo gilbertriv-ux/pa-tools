@@ -62,8 +62,6 @@ pub(crate) fn describe(cfg: &HevcConfig) -> Described {
         Some(format!("{detail} {what} pictures are not supported yet"))
     } else if luma_depth > 12 || chroma_depth > 12 {
         Some(format!("{detail} {}-bit pictures are not supported yet", luma_depth.max(chroma_depth)))
-    } else if luma_depth != chroma_depth {
-        Some(format!("{detail} with different luma and chroma bit depths ({luma_depth}/{chroma_depth}) is not supported yet"))
     } else {
         sps.as_ref().and_then(|s| match s.check_supported() {
             Err(crate::hevc::Error::Unsupported(why)) => Some(format!("{detail}: {why}")),

@@ -1,7 +1,8 @@
 //! Clean-room pure-Rust H.265 / HEVC decoder, implemented from ITU-T Rec. H.265 (ISO/IEC 23008-2).
 //!
 //! Supported: Main and Main 10 profiles (4:2:0, 8/10-bit; up to 12-bit 4:2:0 without range-extension
-//! tools), all coding tools of those profiles: CABAC, coding / transform quadtrees, AMP, PCM,
+//! tools; luma and chroma may be coded at different depths, and are handed out at the deeper one),
+//! all coding tools of those profiles: CABAC, coding / transform quadtrees, AMP, PCM,
 //! transform skip, scaling lists, sign data hiding, 35 intra modes with strong intra smoothing,
 //! merge / AMVP / TMVP, weighted prediction, deblocking, SAO, tiles, wavefront parallel processing
 //! (parsing), dependent slice segments, short- and long-term reference picture sets.
@@ -111,7 +112,8 @@ pub struct Picture {
     pub height: u32,
     pub chroma_width: u32,
     pub chroma_height: u32,
-    /// Luma bit depth (chroma uses the same storage type).
+    /// Bit depth of the samples: the deeper of the luma and chroma depths when the stream codes them
+    /// apart (the shallower plane is shifted left to match; both planes use the same storage type).
     pub bit_depth: u32,
     pub y: Plane,
     pub u: Plane,

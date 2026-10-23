@@ -21,6 +21,8 @@ pub struct OutputMeta {
     pub matrix_coefficients: u8,
     pub sar: (u16, u16),
     pub bit_depth: u32,
+    /// Chroma bit depth (differs from `bit_depth` in the rare stream that codes them apart).
+    pub bit_depth_chroma: u32,
     /// Decoded in draft mode (no in-loop filters).
     pub draft: bool,
 }

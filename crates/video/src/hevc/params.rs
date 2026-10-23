@@ -10,8 +10,16 @@ use crate::hevc::tables::scan_diag;
 /// allocation derived from a file.
 pub const MAX_PICTURE_PIXELS: u64 = crate::movie::MAX_PIXELS;
 
-/// Most memory the decoded pictures of one sequence may take (see [`Sps::dpb_bytes`]).
+/// Most memory the decoded pictures of one sequence may take (see [`Sps::dpb_bytes`]). 1 GiB per
+/// decoder is Gil's decision 5 (2026-10-23).
 pub const MAX_DPB_BYTES: u64 = 1 << 30;
+
+/// Pictures beyond the declared decoded picture buffer (plus the one spare) that a stream may hold
+/// while it fits [`MAX_DPB_BYTES`]. A conforming stream never needs them, but real encoders and
+/// muxers understate `sps_max_dec_pic_buffering_minus1` (for instance by setting it to the number
+/// of reference pictures, one short of what the picture being decoded also needs), and other
+/// decoders play those files; refusing every picture of one would show nothing at all.
+pub const DPB_MARGIN: usize = 2;
 
 /// General profile / tier / level information.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -669,6 +677,16 @@ impl Sps {
         self.frame_bytes().saturating_mul(u64::from(self.max_dec_pic_buffering) + 2)
     }
 
+    /// Most pictures the DPB may hold besides the one being decoded: the declared size plus one spare
+    /// (what [`Sps::dpb_bytes`] pays for), and up to [`DPB_MARGIN`] more for streams that understate
+    /// their size, as long as all of them still fit [`MAX_DPB_BYTES`].
+    pub fn dpb_entry_limit(&self) -> usize {
+        let declared = self.max_dec_pic_buffering as usize + 1;
+        // pictures that fit the budget, one of them the picture being decoded
+        let fit = usize::try_from(MAX_DPB_BYTES / self.frame_bytes().max(1)).unwrap_or(usize::MAX).saturating_sub(1);
+        declared.saturating_add(DPB_MARGIN).min(fit).max(declared)
+    }
+
     /// Features this decoder does not handle yet, and sizes it will not allocate for.
     pub fn check_supported(&self) -> Result<()> {
         if self.chroma_format_idc != 1 {
@@ -676,9 +694,6 @@ impl Sps {
         }
         if self.bit_depth_luma > 12 || self.bit_depth_chroma > 12 {
             return unsupported(format!("bit depth {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
-        }
-        if self.bit_depth_luma != self.bit_depth_chroma {
-            return unsupported(format!("different luma and chroma bit depths {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
         }
         if u64::from(self.width) * u64::from(self.height) > MAX_PICTURE_PIXELS {
             return unsupported(format!("{}x{} is larger than this app decodes", self.width, self.height));

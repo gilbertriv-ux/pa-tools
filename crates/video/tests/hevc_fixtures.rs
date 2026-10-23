@@ -71,7 +71,6 @@ fn variants_the_decoder_cannot_do_open_with_the_reason() {
         (HevcConfig { chroma_format_idc: 3, ..base.clone() }, "4:4:4"),
         (HevcConfig { chroma_format_idc: 0, ..base.clone() }, "monochrome"),
         (HevcConfig { bit_depth_luma: 14, bit_depth_chroma: 14, ..base.clone() }, "14-bit"),
-        (HevcConfig { bit_depth_luma: 8, bit_depth_chroma: 10, ..base.clone() }, "different luma and chroma"),
     ];
     for (cfg, what) in cases {
         let mut m = one_sample_movie(cfg);
@@ -82,6 +81,10 @@ fn variants_the_decoder_cannot_do_open_with_the_reason() {
         assert!(why.contains(if ENABLED { what } else { "unsupported in this build" }), "{what}: {why}");
         assert!(!m.info().codec_detail.to_ascii_lowercase().contains("apple"));
     }
+    // Luma and chroma at different depths (valid in Main 10) pass too; they decode, see the synthetic
+    // stream test in `src/hevc/synth_tests.rs`.
+    let mixed = one_sample_movie(HevcConfig { general_profile_idc: 2, bit_depth_luma: 8, bit_depth_chroma: 10, ..base.clone() });
+    assert_eq!(mixed.info().decodable, ENABLED);
     // Main 10 at 4:2:0 passes the pre-check (the sample itself is not a picture; that is a decode error)
     let ok = one_sample_movie(HevcConfig { general_profile_idc: 2, bit_depth_luma: 10, bit_depth_chroma: 10, ..base });
     assert_eq!(ok.info().decodable, ENABLED);

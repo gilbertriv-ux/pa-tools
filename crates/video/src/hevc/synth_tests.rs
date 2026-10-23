@@ -161,7 +161,8 @@ pub(super) fn vps() -> Vec<u8> {
     nal(32, &w.finish())
 }
 
-pub(super) fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
+/// The SPS for luma / chroma bit depths `depth` (PCM samples are coded at the full depth).
+pub(super) fn sps_at(pcm_loop_filter_disabled: bool, depth: (u32, u32)) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(0, 4);
     w.write_bits(0, 3);
@@ -172,8 +173,8 @@ pub(super) fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
     w.write_ue(W as u32);
     w.write_ue(H as u32);
     w.write_bits(0, 1); // conformance window
-    w.write_ue(0);
-    w.write_ue(0);
+    w.write_ue(depth.0 - 8); // bit_depth_luma_minus8
+    w.write_ue(depth.1 - 8); // bit_depth_chroma_minus8
     w.write_ue(4); // log2_max_poc_lsb = 8
     w.write_bits(1, 1);
     w.write_ue(4); // max_dec_pic_buffering_minus1
@@ -189,8 +190,8 @@ pub(super) fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
     w.write_bits(0, 1); // amp
     w.write_bits(0, 1); // sao
     w.write_bits(1, 1); // pcm
-    w.write_bits(7, 4);
-    w.write_bits(7, 4);
+    w.write_bits(depth.0 - 1, 4);
+    w.write_bits(depth.1 - 1, 4);
     w.write_ue(0); // min PCM 8
     w.write_ue(1); // max PCM 16
     w.write_bits(pcm_loop_filter_disabled as u32, 1);
@@ -309,6 +310,15 @@ struct PicDesc {
     num_ref: u32,
     list_entry: Option<Vec<u32>>,
     segments: Vec<Segment>,
+    /// Luma / chroma bit depth of the stream (the PCM samples are written at these).
+    depth: (u32, u32),
+}
+
+/// An 8-bit test sample as a `bits`-bit one: shifted up, with its own low bits repeated below, so the
+/// deeper samples use their whole range (a decoder that drops or misplaces those bits shows).
+fn widen(v: u8, bits: u32) -> u32 {
+    let extra = bits - 8;
+    (u32::from(v) << extra) | (u32::from(v) & ((1 << extra) - 1))
 }
 
 /// Write the slice segment NAL units of a picture.
@@ -341,13 +351,13 @@ fn encode_picture(d: &PicDesc, tiles: &Tiles, pcm_content: &Planes, out: &mut Ve
                     e.w.align_zero();
                     for y in 0..CTB {
                         for x in 0..CTB {
-                            e.w.write_bits(pcm_content.y[(ry * CTB + y) * W + rx * CTB + x] as u32, 8);
+                            e.w.write_bits(widen(pcm_content.y[(ry * CTB + y) * W + rx * CTB + x], d.depth.0), d.depth.0);
                         }
                     }
                     for plane in [&pcm_content.u, &pcm_content.v] {
                         for y in 0..CTB / 2 {
                             for x in 0..CTB / 2 {
-                                e.w.write_bits(plane[(ry * CTB / 2 + y) * W / 2 + rx * CTB / 2 + x] as u32, 8);
+                                e.w.write_bits(widen(plane[(ry * CTB / 2 + y) * W / 2 + rx * CTB / 2 + x], d.depth.1), d.depth.1);
                             }
                         }
                     }
@@ -460,9 +470,14 @@ fn whole(n: usize) -> Vec<Segment> {
 /// Encode the test sequence; returns the stream and the exact expected pictures (when the PCM samples
 /// are not filtered).
 fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Vec<u8>, Vec<Planes>) {
+    sequence_at(tiles, pcm_lf_disabled, segments, (8, 8))
+}
+
+/// [`sequence`] at luma / chroma bit depths `depth`.
+fn sequence_at(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>, depth: (u32, u32)) -> (Vec<u8>, Vec<Planes>) {
     let mut s = Vec::new();
     s.extend(vps());
-    s.extend(sps(pcm_lf_disabled));
+    s.extend(sps_at(pcm_lf_disabled, depth));
     s.extend(pps(0, tiles, false));
     s.extend(pps(1, &None, true));
     let n = WC * HC;
@@ -470,7 +485,8 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
     let c0 = content(0);
     let c1 = content(1);
     // 0: IDR, PCM, tiles / slices / dependent segments
-    let p0 = PicDesc { nal_type: 19, poc: 0, intra: true, cu: Cu::Pcm, pps_id: 0, st: vec![], lt: vec![], num_ref: 0, list_entry: None, segments };
+    let p0 =
+        PicDesc { nal_type: 19, poc: 0, intra: true, cu: Cu::Pcm, pps_id: 0, st: vec![], lt: vec![], num_ref: 0, list_entry: None, segments, depth };
     encode_picture(&p0, tiles, &c0, &mut s, &mut saved);
     // 1: intra TRAIL_R keeping picture 0 as a long-term reference (not used by this picture)
     let p1 = PicDesc {
@@ -484,6 +500,7 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
         num_ref: 0,
         list_entry: None,
         segments: whole(n),
+        depth,
     };
     encode_picture(&p1, &None, &c1, &mut s, &mut saved);
     // 2: P, all skip, RefPicList0 = { LT picture 0 } -> a copy of picture 0
@@ -498,6 +515,7 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
         num_ref: 1,
         list_entry: None,
         segments: whole(n),
+        depth,
     };
     encode_picture(&p2, &None, &c1, &mut s, &mut saved);
     // 3: P, all skip, list modification puts the long-term picture first -> picture 0 again
@@ -512,6 +530,7 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
         num_ref: 3,
         list_entry: Some(vec![2, 0, 1]),
         segments: whole(n),
+        depth,
     };
     encode_picture(&p3, &None, &c1, &mut s, &mut saved);
     // 4: P, all skip, default list order: refIdx 0 = picture 3 (a copy of picture 0)
@@ -526,6 +545,7 @@ fn sequence(tiles: &Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) -> (Ve
         num_ref: 2,
         list_entry: None,
         segments: whole(n),
+        depth,
     };
     encode_picture(&p4, &None, &c1, &mut s, &mut saved);
     let expect = vec![content(0), content(1), content(0), content(0), content(0)];
@@ -628,4 +648,175 @@ fn slices_without_tiles() {
         Segment { start: 16, len: 8, dependent: false },
     ];
     run("slices", None, false, segs);
+}
+
+/// Luma and chroma coded at different depths (Main 10 allows it). No encoder makes such a stream and
+/// ffmpeg refuses to decode one, so the check is a hand-built one with exactly known output: PCM
+/// pictures and skipped copies of them (PCM, inter prediction and the output path of both planes).
+/// The picture comes out at the deeper depth with the shallower plane shifted left.
+#[test]
+fn luma_and_chroma_at_different_bit_depths_decode_exactly() {
+    for depth in [(8, 8), (10, 10), (8, 10), (10, 8), (10, 12), (12, 10), (8, 12), (12, 8)] {
+        let out = depth.0.max(depth.1);
+        let (stream, expect) = sequence_at(&None, true, whole(WC * HC), depth);
+        for threads in [1, 4] {
+            let pics = decode_all(&stream, threads);
+            assert_eq!(pics.len(), expect.len(), "{depth:?}");
+            for (i, (p, e)) in pics.iter().zip(&expect).enumerate() {
+                assert_eq!((p.bit_depth, p.width, p.height), (out, W as u32, H as u32), "{depth:?} picture {i}");
+                let want = |plane: &[u8], bits: u32| -> Vec<u16> { plane.iter().map(|&v| (widen(v, bits) << (out - bits)) as u16).collect() };
+                let got = |plane: &crate::hevc::Plane| -> Vec<u16> { (0..plane.len()).map(|k| plane.get(k)).collect() };
+                assert_eq!(p.y.as_u8().is_some(), out == 8, "{depth:?}: storage follows the deeper depth");
+                assert!(got(&p.y) == want(&e.y, depth.0), "{depth:?} picture {i} luma");
+                assert!(got(&p.u) == want(&e.u, depth.1), "{depth:?} picture {i} Cb");
+                assert!(got(&p.v) == want(&e.v, depth.1), "{depth:?} picture {i} Cr");
+            }
+        }
+    }
+}
+
+/// A movie of the synthetic stream at `depth`: the parameter sets in the `hvcC`, each picture one
+/// length-prefixed sample.
+fn movie_at(depth: (u32, u32)) -> (crate::Movie, Vec<Planes>) {
+    use crate::isobmff::{Brand, HevcConfig, HevcNalArray, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    let (stream, expect) = sequence_at(&None, true, whole(WC * HC), depth);
+    let mut arrays: Vec<HevcNalArray> = Vec::new();
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for n in crate::bitstream::annexb_nals(&stream) {
+        let t = (n[0] >> 1) & 0x3f;
+        if (32..=34).contains(&t) {
+            match arrays.iter_mut().find(|a| a.nal_type == t) {
+                Some(a) => a.nalus.push(n.to_vec()),
+                None => arrays.push(HevcNalArray { completeness: true, nal_type: t, nalus: vec![n.to_vec()] }),
+            }
+        } else {
+            let mut au = (n.len() as u32).to_be_bytes().to_vec();
+            au.extend_from_slice(n);
+            samples.push(au);
+        }
+    }
+    let cfg = HevcConfig {
+        general_profile_idc: 2,
+        chroma_format_idc: 1,
+        bit_depth_luma: depth.0 as u8,
+        bit_depth_chroma: depth.1 as u8,
+        length_size: 4,
+        arrays,
+        ..Default::default()
+    };
+    let mut mw = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).expect("writer");
+    let t = mw.add_track(TrackConfig::new(SampleEntry::hevc(cfg, W as u16, H as u16), 24)).expect("track");
+    for (i, au) in samples.iter().enumerate() {
+        mw.write_sample(t, WriteSample { data: au, duration: 1, composition_offset: 0, is_sync: i == 0 }).expect("sample");
+    }
+    (crate::Movie::open(mw.finish().expect("finish").into_inner()).expect("movie"), expect)
+}
+
+/// Through the movie: a file with luma and chroma at different depths opens as decodable (it used to be
+/// refused), and its pictures have the colours of the same pictures coded at the deeper depth for both.
+#[test]
+fn a_movie_with_different_luma_and_chroma_depths_shows_the_same_colours() {
+    for depth in [(8, 10), (10, 8), (10, 12), (12, 8), (8, 12)] {
+        let out = depth.0.max(depth.1);
+        let (mut reference, expect) = movie_at((out, out));
+        let (mut m, _) = movie_at(depth);
+        assert!(m.info().decodable, "{depth:?}");
+        assert_eq!(m.info().frame_count, expect.len());
+        for i in 0..expect.len() {
+            let (a, b) = (reference.frame(i).expect("reference"), m.frame(i).unwrap_or_else(|e| panic!("{depth:?} frame {i}: {e}")));
+            assert_eq!((b.width, b.height), (W as u32, H as u32));
+            // the shallower plane lacks the low bits the reference has (below one level of the deeper depth),
+            // so the 8-bit colours agree to within a level; an unshifted plane would be far off
+            let worst = a.rgba.iter().zip(&b.rgba).map(|(&x, &y)| x.abs_diff(y)).max().unwrap_or(0);
+            assert!(worst <= 2, "{depth:?} frame {i}: colours differ by {worst}");
+        }
+    }
+}
+
+/// An IDR followed by intra pictures that each keep their `refs` predecessors as reference pictures,
+/// in a sequence whose SPS declares a buffer of 5 (so a conforming stream holds at most 5, plus the
+/// spare the decoder allows: 6 pictures besides the one being decoded).
+fn deep_reference_stream(refs: usize, pictures: usize) -> Vec<u8> {
+    let tiles: Tiles = None;
+    let mut s = Vec::new();
+    s.extend(vps());
+    s.extend(sps_at(true, (8, 8)));
+    s.extend(pps(0, &tiles, false));
+    let mut saved = None;
+    for k in 0..pictures {
+        let d = PicDesc {
+            nal_type: if k == 0 { 19 } else { 1 },
+            poc: k as u32,
+            intra: true,
+            cu: Cu::Pcm,
+            pps_id: 0,
+            st: (1..=refs.min(k)).map(|d| (-(d as i32), false)).collect(),
+            lt: vec![],
+            num_ref: 0,
+            list_entry: None,
+            segments: whole(WC * HC),
+            depth: (8, 8),
+        };
+        encode_picture(&d, &tiles, &content(k as u32), &mut s, &mut saved);
+    }
+    s
+}
+
+/// Streams that understate their buffer size still play, up to `DPB_MARGIN` pictures over, and no
+/// further: `sps_max_dec_pic_buffering_minus1` is 4 here, so 5 pictures are declared, a 6th is the
+/// decoder's spare, and the margin allows a 7th and an 8th.
+#[test]
+fn a_stream_that_understates_its_buffer_gets_a_small_margin_and_no_more() {
+    assert_eq!(crate::hevc::params::DPB_MARGIN, 2);
+    for refs in [3usize, 5, 6, 7, 8] {
+        let stream = deep_reference_stream(refs, refs + 3);
+        let mut dec = Decoder::with_threads(1);
+        let mut pics = dec.decode(&stream, 0).unwrap_or_else(|e| panic!("{refs} reference pictures: {e}"));
+        pics.extend(dec.flush());
+        assert!(dec.take_error().is_none());
+        assert_eq!(pics.len(), refs + 3, "{refs} reference pictures: every picture comes out");
+    }
+    // one past the margin is refused, as before (a damaged or hostile stream)
+    for refs in [9usize, 12, 16] {
+        let stream = deep_reference_stream(refs, refs + 3);
+        let r = Decoder::with_threads(1).decode(&stream, 0);
+        assert!(matches!(&r, Err(e) if e.to_string().contains("decoded picture buffer overflow")), "{refs} reference pictures: {r:?}");
+    }
+}
+
+/// The margin comes out of the byte budget, never on top of it.
+#[test]
+fn the_margin_stays_inside_the_byte_budget() {
+    use crate::hevc::params::{DPB_MARGIN, MAX_DPB_BYTES, Sps};
+    let sps = |w: u32, h: u32, dpb: u32, wide: bool| {
+        let mut s = Sps::parse(&crate::bitstream::unescape_rbsp(&sps_at(true, (8, 8))[6..])).expect("sps");
+        (s.width, s.height, s.max_dec_pic_buffering) = (w, h, dpb);
+        if wide {
+            (s.bit_depth_luma, s.bit_depth_chroma) = (10, 10);
+        }
+        s
+    };
+    // small pictures: declared + 1 spare + the margin
+    let small = sps(1920, 1080, 5, false);
+    assert_eq!(small.dpb_entry_limit(), 5 + 1 + DPB_MARGIN);
+    // DCI 8K, 8-bit, buffer of 6: 10 pictures fit 1 GiB, one of them the current one, so 9 are held
+    let k8 = sps(8192, 8192, 6, false);
+    assert!(k8.dpb_bytes() <= MAX_DPB_BYTES);
+    assert_eq!(k8.dpb_entry_limit(), 9);
+    assert!((k8.dpb_entry_limit() as u64 + 1) * k8.frame_bytes() <= MAX_DPB_BYTES);
+    // a bigger declared buffer leaves less room: still never below the declared size plus the spare
+    let tight = sps(8192, 8192, 8, false);
+    assert!(tight.dpb_bytes() <= MAX_DPB_BYTES);
+    assert_eq!(tight.dpb_entry_limit(), 9);
+    // 8K UHD 10-bit, buffer of 6
+    let uhd = sps(7680, 4320, 6, true);
+    assert!(uhd.dpb_bytes() <= MAX_DPB_BYTES);
+    assert!(uhd.dpb_entry_limit() >= 7 && (uhd.dpb_entry_limit() as u64 + 1) * uhd.frame_bytes() <= MAX_DPB_BYTES);
+    // whatever the size, the limit is at least what the budget check paid for
+    for (w, h, dpb, wide) in [(64, 64, 0, false), (4096, 2160, 16, true), (8192, 8192, 5, false), (7680, 4320, 8, true)] {
+        let s = sps(w, h, dpb, wide);
+        if s.dpb_bytes() <= MAX_DPB_BYTES {
+            assert!(s.dpb_entry_limit() >= dpb as usize + 1, "{w}x{h} dpb {dpb}");
+        }
+    }
 }
