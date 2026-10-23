@@ -66,7 +66,8 @@ pub struct MovieInfo {
     pub frame_count: usize,
     /// Short codec id: `h264`, `hevc`, `av1`, `prores`, `dnxhd`, `mjpeg`, …
     pub codec: String,
-    /// Human-readable codec description (e.g. "H.264 High", "Apple ProRes 422 HQ").
+    /// Human-readable codec description shown on screen (e.g. "H.264 High", "PA ProRez 422 HQ",
+    /// "VC-3 (SQ, 10-bit)"); never a third-party product name.
     pub codec_detail: String,
     /// True when SoundCraft can decode this picture (otherwise frame requests return `Err`).
     pub decodable: bool,
@@ -321,7 +322,7 @@ impl Movie {
                     b"ap4x" => "4444 XQ",
                     _ => "",
                 };
-                (Codec::ProRes, "prores", format!("Apple ProRes {flavour}"))
+                (Codec::ProRes, "prores", format!("PA ProRez {flavour}").trim_end().to_string())
             }
             Some(CodecConfig::Jpeg { fourcc }) if &fourcc.0 != b"mjpb" => (Codec::Jpeg, "mjpeg", "Motion JPEG".to_string()),
             Some(CodecConfig::Hevc(c)) => classified(adapt_hevc::describe(c), "hevc", Codec::Hevc { hvcc: c.to_bytes() }),

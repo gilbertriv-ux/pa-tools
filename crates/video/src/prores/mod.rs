@@ -23,11 +23,11 @@ pub use header::{FrameHeader, PictureHeader};
 /// Codec errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error("truncated ProRes data")]
+    #[error("truncated PA ProRez data")]
     Truncated,
-    #[error("invalid ProRes data: {0}")]
+    #[error("invalid PA ProRez data: {0}")]
     Invalid(&'static str),
-    #[error("unsupported ProRes feature: {0}")]
+    #[error("unsupported PA ProRez feature: {0}")]
     Unsupported(&'static str),
     #[error("corrupt slice {slice} in picture {picture}")]
     Slice { picture: usize, slice: usize },

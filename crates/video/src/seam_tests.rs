@@ -4,7 +4,7 @@
 
 use crate::convert::{Matrix, Planes, Yuv, planar_to_rgba};
 use crate::gop::{GopDecoder, Pic};
-use crate::isobmff::{Av1Config, Brand, CodecConfig, FourCc, HevcConfig, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+use crate::isobmff::{Av1Config, Brand, CodecConfig, FourCc, HevcConfig, Mp4Writer, SampleEntry, TrackConfig, VpcConfig, WriteSample, WriterOptions};
 use crate::movie::{GopFactory, MAX_START_STEPS};
 use crate::synth::h264_mp4;
 use crate::{Frame, Movie, Result, VideoError};
@@ -407,4 +407,40 @@ fn the_codec_stubs_return_clean_errors() {
     // The intra path of the movie reaches the adapter and passes its error on.
     let mut m = m.with_dnx_adapter();
     assert!(matches!(m.frame(0), Err(VideoError::Unsupported(why)) if why.contains("VC-3")));
+}
+
+/// Words that must never appear in anything the app shows about a codec.
+const FORBIDDEN: [&str; 4] = ["apple", "prores", "avid", "dnx"];
+
+#[test]
+fn on_screen_codec_labels_name_no_third_party_product() {
+    let mut entries = vec![
+        SampleEntry::jpeg(64, 48),
+        SampleEntry::hevc(HevcConfig::default(), 64, 48),
+        SampleEntry::video(FourCc(*b"av01"), CodecConfig::Av1(Av1Config::default()), 64, 48),
+        SampleEntry::video(FourCc(*b"vp09"), CodecConfig::Vp9(VpcConfig::default()), 64, 48),
+        SampleEntry::dnx(FourCc(*b"AVdn"), 64, 48),
+        SampleEntry::dnx(FourCc(*b"AVdh"), 64, 48),
+    ];
+    for f in [b"apco", b"apcs", b"apcn", b"apch", b"ap4h", b"ap4x"] {
+        entries.push(SampleEntry::prores(FourCc(*f), 64, 48));
+    }
+    let mut labels = Vec::new();
+    for entry in entries {
+        let mut m = one_sample_movie(entry);
+        labels.push(m.info().codec_detail.clone());
+        if let Err(e) = m.frame(0) {
+            labels.push(e.to_string());
+        }
+    }
+    let h264 = Movie::open(h264_mp4(2, 2).unwrap()).unwrap();
+    labels.push(h264.info().codec_detail.clone());
+    for label in &labels {
+        let lower = label.to_ascii_lowercase();
+        assert!(!label.trim().is_empty() && !FORBIDDEN.iter().any(|w| lower.contains(w)), "label names a third-party product: {label:?}");
+    }
+    // ProRes is "PA ProRez", VC-3 is the standard's own name.
+    assert!(labels.iter().any(|l| l == "PA ProRez 422 HQ"));
+    assert!(labels.iter().any(|l| l == "PA ProRez 4444 XQ"));
+    assert!(labels.iter().any(|l| l == "VC-3"));
 }

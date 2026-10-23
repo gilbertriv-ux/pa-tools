@@ -10,7 +10,7 @@
 //!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
 //!
 //! Picture codecs: H.264 / AVC (Baseline, Main, High; progressive 8-bit 4:2:0; CAVLC and CABAC),
-//! Apple ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ) and Motion JPEG
+//! ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ; shown as "PA ProRez") and Motion JPEG
 //! (`jpeg`/`mjpa`). VC-3 (DNxHD / DNxHR), HEVC and AV1 tracks are recognised (`dnxhd`, `hevc`,
 //! `av1`) but not decoded yet. VC-3 is always built; the HEVC and AV1 decoders are the Cargo
 //! features `hevc-decode` and `av1-decode`, off by default, and a build without one reports its

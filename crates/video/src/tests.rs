@@ -77,7 +77,7 @@ fn h264_thumbnails_use_keyframes() {
 fn prores_and_mjpeg_decode() {
     let mut m = Movie::open(prores_mov(5).unwrap()).unwrap();
     assert_eq!(m.info().codec, "prores");
-    assert_eq!(m.info().codec_detail, "Apple ProRes 422 HQ");
+    assert_eq!(m.info().codec_detail, "PA ProRez 422 HQ");
     assert!(m.info().quicktime);
     assert!((m.info().frame_rate - 25.0).abs() < 1e-9);
     for i in [4usize, 0, 2] {
