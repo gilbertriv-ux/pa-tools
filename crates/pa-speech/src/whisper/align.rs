@@ -144,3 +144,45 @@ pub fn dtw(cost: &[f32], n: usize, m: usize) -> Vec<(usize, usize)> {
     path.reverse();
     path
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // Ported from the donor's `whisper/align.rs` (filmcraft-speech, MIT OR Apache-2.0).
+    #[test]
+    fn median_filter_removes_spikes() {
+        assert_eq!(median_filter(&[0.0, 0.0, 9.0, 0.0, 0.0], 3), vec![0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(median_filter(&[1.0, 2.0, 3.0], 1), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn dtw_follows_the_cheap_diagonal_band() {
+        // 3 rows × 6 columns, cheap cells at row 0: cols 0-1, row 1: cols 2-3, row 2: cols 4-5
+        let mut c = vec![1.0f32; 18];
+        for (r, cols) in [(0, [0, 1]), (1, [2, 3]), (2, [4, 5])] {
+            for k in cols {
+                c[r * 6 + k] = 0.0;
+            }
+        }
+        let p = dtw(&c, 3, 6);
+        assert_eq!(p.first(), Some(&(0, 0)));
+        assert_eq!(p.last(), Some(&(2, 5)));
+        let first_col = |row: usize| p.iter().find(|x| x.0 == row).unwrap().1;
+        assert_eq!((first_col(0), first_col(1), first_col(2)), (0, 2, 4));
+    }
+
+    #[test]
+    fn edge_cases_do_not_panic() {
+        assert!(median_filter(&[], 7).is_empty());
+        assert_eq!(median_filter(&[4.0], 7), vec![4.0]);
+        assert_eq!(median_filter(&[1.0, 2.0], 7).len(), 2);
+        assert!(dtw(&[], 0, 0).is_empty());
+        assert!(dtw(&[], 0, 5).is_empty());
+        assert!(dtw(&[], 5, 0).is_empty());
+        assert_eq!(dtw(&[0.5], 1, 1), vec![(0, 0)]);
+        // garbage in (NaN costs) gives some path, but always one inside the matrix
+        assert!(dtw(&[f32::NAN; 6], 2, 3).iter().all(|&(i, j)| i < 2 && j < 3));
+    }
+}

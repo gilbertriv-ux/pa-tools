@@ -22,13 +22,21 @@ plain `f64` seconds.
   names every place searched.
 - **Tests:** always-run (`tests/no_model.rs`) exercise the seam + `FixedTranscriber`;
   `tests/discovery.rs` covers the search order and the fallbacks with fake (sparse) installs and no
-  environment changes. Under `whisper`, the synthetic-voice diarization tests run with no model, and
-  `tests/whisper_model.rs` does a real round-trip. It cannot pass without recognising speech: it
-  SKIPS (printing `SKIPPED: ...`) only when no model is found and no `$PA_SPEECH_FIXTURE` is set; a
-  fixture with no model, an unreadable fixture, or no `$PA_SPEECH_FIXTURE_KEYWORD` fails; every
-  word must lie inside the clip. Run it with
-  `PA_SPEECH_MODELS_DIR=<dir> PA_SPEECH_FIXTURE=<mono 16 kHz f32 raw> PA_SPEECH_FIXTURE_KEYWORD=<word the clip says> cargo test -p soundcraft-pa-speech --features whisper,download -- --nocapture`
-  (optionally `PA_SPEECH_FIXTURE_REFERENCE=<true text>` prints the word error rate). It never downloads.
+  environment changes. Under `whisper`: the numeric unit tests (mel, DTW, level detection, ticks,
+  diarization caps and cancel), `tests/hostile_models.rs` (model folders of the right size with
+  hostile content, which `load` must refuse with an error), and `tests/whisper_model.rs`, a real
+  round-trip that **skips exactly when `$PA_SPEECH_FIXTURE` is unset**, whether or not a model is
+  installed. A skip proves nothing about speech: it prints `SKIPPED: <reason>` to stdout and stderr,
+  and `cargo test` hides the output of a passing test, so use `-- --nocapture` to see it. With the
+  fixture set it never skips: a fixture with no model found, an unreadable fixture, or no
+  `$PA_SPEECH_FIXTURE_KEYWORD` fails; the transcript must contain the keyword as a whole word
+  (case-insensitive, punctuation stripped; `coun` does not match `country`); every word must lie
+  inside the clip, end no earlier than it starts, and neither start before nor overlap the word
+  ahead of it; and with `PA_SPEECH_FIXTURE_REFERENCE=<true text>` the word error rate must be below
+  0.25. Run it with
+  `PA_SPEECH_MODELS_DIR=<dir> PA_SPEECH_FIXTURE=<mono 16 kHz f32 raw> PA_SPEECH_FIXTURE_KEYWORD=<word the clip says> cargo test -p soundcraft-pa-speech --features whisper,download -- --nocapture`.
+  It never downloads. CI builds and tests the crate with those features, but without a fixture, so
+  the real-model test skips there.
 
 ## Models
 Whisper weights (`openai/whisper-*` on Hugging Face, MIT) are downloaded on first use into
