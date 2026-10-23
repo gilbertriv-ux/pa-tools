@@ -179,6 +179,26 @@ impl Decoder {
         Ok(())
     }
 
+    /// True if decoding may start at this access unit: its first base-layer VCL NAL unit is an IDR,
+    /// CRA or BLA picture (a container's sync flag is not always right). False for anything that does
+    /// not split into NAL units.
+    pub fn is_random_access(&self, au: &[u8]) -> bool {
+        let nals = match self.nal_length_size {
+            Some(n) => split_length_prefixed(au, n),
+            None => Ok(annexb_nals(au)),
+        };
+        let Ok(nals) = nals else { return false };
+        for nal in nals {
+            if let Ok(h) = NalHeader::parse(nal)
+                && h.layer_id == 0
+                && h.is_vcl()
+            {
+                return (nal_type::BLA_W_LP..=nal_type::CRA).contains(&h.nal_type);
+            }
+        }
+        false
+    }
+
     /// Length of NAL length prefixes (from hvcC), or None for Annex-B input.
     pub fn nal_length_size(&self) -> Option<usize> {
         self.nal_length_size
