@@ -189,10 +189,11 @@ here. They still run on pull requests. Adjust them when the callers are replaced
 
 ### Dependabot
 
-The Cargo updates ignore `egui`, `eframe`, `egui_kittest`, `egui_*`, `epaint`, `emath` and `ecolor`
-(craft-ui, pinned in the root `Cargo.toml`, is built against egui 0.36, so the family moves only after
-craft-libs does) and ignore major and minor bumps of `symphonia*` (0.6 breaks the API; 0.5.x patch
-releases still come through). Lift the egui block when the craft-libs pin moves.
+The Cargo updates ignore major and minor bumps of `egui`, `eframe`, `egui_kittest`, `egui_*`, `epaint`,
+`emath` and `ecolor` (craft-ui, pinned in the root `Cargo.toml`, is built against egui 0.36, so the
+family moves only after craft-libs does; 0.36.x patch releases still come through) and of `symphonia*`
+(0.6 breaks the API; 0.5.x patch releases still come through). Lift the egui block when the craft-libs
+pin moves.
 
 ## What still has to be written
 
