@@ -52,9 +52,9 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     let path = dir.join("Song.scraft");
     let mut first = launch(&root);
     first.run("session.save_as", json!({"path": path})).unwrap();
-    // An autosave only counts as unsaved work when it is newer than the session file it came from.
-    // Linux file systems stamp files with a clock that ticks every few milliseconds, so without a
-    // pause both writes can carry the same time and the autosave is thrown away as outdated.
+    // An autosave counts as unsaved work when it is not older than the session file it came from;
+    // equal times are kept (`leftovers`), so the pause is no longer needed for that. It stays so the
+    // edit is strictly newer than the Save, as it is for a user.
     std::thread::sleep(std::time::Duration::from_millis(50));
     first.run("track.new", json!({"name": "Vocal"})).unwrap();
     first.close_autosave();

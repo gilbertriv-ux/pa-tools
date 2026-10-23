@@ -142,10 +142,15 @@ ever run on a Mac:
   (`crates/engine/src/io.rs`) built its expected path with a `/` inside one `join()`, which differs
   from the backslash path the engine returns. Test-only fix: join the components one by one.
 - **Linux:** the recovery tests (`crates/ui-egui/tests/recovery.rs`) failed at random, a different one
-  on each run, with three separate causes:
-  1. *Test:* an autosave counts as unsaved work only if it is newer than the session file it came
-     from; Linux file systems stamp files from a clock that ticks every few milliseconds, so a save and
-     the autosave right after it could carry the same time. The test now pauses 50 ms between them.
+  on each run, with two real causes (1 and 3) and one defensive change (2):
+  1. *Product bug (data loss), found by this flake:* an autosave counted as unsaved work only if it
+     was strictly newer than the session file it came from. Linux file systems stamp files from a clock
+     that ticks every few milliseconds, so a Save and the autosave right after it could carry the same
+     time and `leftovers()` deleted the autosave as outdated. Macs with HFS+ (one-second times) and FAT
+     volumes (two seconds) have the same problem with any edit made within a tick of a Save, so after a
+     crash the edit was lost. `leftovers()` now keeps an autosave whose time equals the session file's
+     (`saved >= o`), with a regression test that sets both times equal. The test's 50 ms pause between
+     the save and the edit stays, so the edit is strictly newer, as it is for a user.
   2. *Test (defensive, not a cause):* a test counted the autosave folders right after
      `SoundApp::recover()`. That call is synchronous (`crates/ui-egui/src/lib.rs`: `recover()` calls
      `write_autosave()`, which flushes the background writer before it returns), so the folder is
