@@ -50,6 +50,7 @@ The crate names are upstream's and stay (`UPSTREAM.md`).
 |---|---|---|
 | L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops |
 | L1 | `soundcraft-dsp` | Plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utility, instruments), offline processing, meters, FFT |
+| L1 | `soundcraft-fx` | Donor effect library (FilmCraft `audio-dsp`): dependency-free planar-f32 effects (graphic EQ, multiband and tube compressors, delays, reverbs, restoration, loudness). `soundcraft-dsp` adapts them to `Plugin` and lists them in its registry |
 | L2 | `soundcraft-model` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups) |
 | L3 | `soundcraft-mix` | Mix engine shared by realtime playback and offline bounce |
 | L4 | `soundcraft-engine`, `soundcraft-playback` | Command registry, undo, editing, import/export/bounce, parity catalog; audio device I/O (cpal) |

@@ -3688,6 +3688,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-fx"
+version = "0.11.0"
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.11.0"
 dependencies = [
