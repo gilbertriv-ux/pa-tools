@@ -17,7 +17,10 @@ workspace = true
 # limits and stubs that answer `Error::NotBuilt`, so callers need no `cfg`. CI and the tests build with it on.
 default = []
 aac-encode = ["dep:soundcraft-bitstream", "dep:soundcraft-isobmff"]
-rayon = ["dep:rayon", "aac-encode"]
+# Channels are quantised in parallel inside the encoder's rate loop. It only does anything together with
+# `aac-encode` (the only code that uses rayon is the encoder) and does NOT switch that feature on: AAC
+# encoding stays off unless `aac-encode` is named explicitly (Gil's decision, 2026-10-23).
+rayon = ["dep:rayon"]
 
 [dependencies]
 soundcraft-bitstream = { workspace = true, optional = true }

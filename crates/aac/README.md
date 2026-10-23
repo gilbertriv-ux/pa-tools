@@ -94,7 +94,7 @@ covers every input sample (`ceil(n / 1024) + 1` access units).
 
 Performance (Apple Silicon, release, single thread): 10 s of 44.1 kHz stereo encodes at ~85× realtime
 and decodes at ~1000× realtime. With the `rayon` feature channels are quantised in parallel inside the
-rate loop.
+rate loop; the feature only takes effect together with `aac-encode` and does not enable it.
 
 ## Decoder
 
@@ -179,7 +179,8 @@ channels.
   Python (stdlib-only) scripts that craft single-frame streams repeating a candidate bit string, fit the
   decoded output to the IMDCT basis, and walk the code tree. Every table is verified to be a complete
   prefix code (Kraft sum exactly 1) covering each index once (unit test), and the decoder matches
-  ffmpeg to ~1e-7 on real streams.
+  ffmpeg to ~1e-7 on real streams. Provenance, the review's checks and Gil's acceptance (2026-10-23) are in
+  `docs/audio-codecs.md` ("Huffman table provenance") and `ATTRIBUTION.md`.
 - Psychoacoustics follow textbook models (Bark scale, Schroeder spreading, Terhardt ATH, Johnston-style
   tonality/SFM offsets, perceptual entropy).
 

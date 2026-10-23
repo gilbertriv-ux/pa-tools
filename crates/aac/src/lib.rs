@@ -29,7 +29,8 @@
 //! for explicitly signalled HE-AAC only the AAC-LC core is decoded (at the core rate).
 //!
 //! Layer L0: depends only on `soundcraft-bitstream` and `soundcraft-isobmff` (both L0, and only with
-//! `aac-encode`) plus `thiserror` and optional `rayon`; no `unsafe`; builds for `wasm32-unknown-unknown`.
+//! `aac-encode`) plus `thiserror` and optional `rayon` (feature `rayon`, used only by the encoder and not
+//! implying `aac-encode`); no `unsafe`; builds for `wasm32-unknown-unknown`.
 //!
 //! ```
 //! # #[cfg(feature = "aac-encode")]

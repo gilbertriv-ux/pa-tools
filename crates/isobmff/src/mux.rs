@@ -514,6 +514,16 @@ fn validate_track(cfg: &TrackConfig) -> Result<Option<u32>> {
 
 /// Progressive MP4/MOV writer: `ftyp`, then one `mdat` streamed to `W`, then `moov` at [`finish`](Self::finish)
 /// (or moved in front of `mdat` by [`finish_faststart`](Self::finish_faststart)).
+///
+/// # Memory
+/// The media data goes straight to `W` and is never held, but the sample tables for the `moov` are kept
+/// until `finish`, so memory is not flat in the length of the file. The run-length tables (`stts`, `ctts`)
+/// stay tiny for constant-rate media, and consecutive samples of one track share one chunk. The per-sample
+/// ones grow: `stsz` collects 4 bytes for every sample (the file gets the compact form when all sizes are
+/// equal, but the list is collected all the same) and `stss` collects 4 bytes for every sync sample (the
+/// file omits it when every sample is a sync sample, but it is collected all the same). A track of sync
+/// samples such as AAC therefore costs about 8 bytes per access unit: roughly 32 MB per 24 hours at 48 kHz
+/// (1024 samples per access unit). PCM tracks keep no per-sample tables.
 pub struct Mp4Writer<W: Write + Seek> {
     w: W,
     opts: WriterOptions,

@@ -735,7 +735,8 @@ fn ffmpeg_reads_our_files_without_errors() {
                 .args(["-f", "f32le", "-ac", &ch.to_string(), "-ar", &rate.to_string(), "-"])
                 .output()
                 .unwrap();
-            let samples: Vec<f32> = pcm.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let (words, _) = pcm.stdout.as_chunks::<4>();
+            let samples: Vec<f32> = words.iter().map(|b| f32::from_le_bytes(*b)).collect();
             let got = samples.len() / usize::from(ch);
             eprintln!("   ffmpeg decoded {got} frames (input {frames})");
             // ffmpeg applies the start of the edit list (it skips the priming) but plays the tail of the last

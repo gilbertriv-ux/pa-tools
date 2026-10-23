@@ -134,7 +134,8 @@ stage-1/2 codebooks and prediction weights, gain, pitch, contour, LTP and pulse 
 weights) and the decoder-side normative arithmetic the encoder must reproduce bit-exactly (CELT
 allocation; SILK NLSF dequantisation and stabilisation, NLSF → LPC conversion, `log2lin`, the
 fixed-point division/inverse helpers and the LPC analysis filter) are mirrored from FilmCraft's
-first-party, spec-derived `soundcraft-opus-decode` decoder (MIT OR Apache-2.0), which is also the
+first-party, spec-derived `filmcraft-opus` decoder (MIT OR Apache-2.0; imported here as
+`soundcraft-opus-decode`), which is also the
 round-trip oracle in `tests/` and `crates/export/tests/opus_roundtrip.rs` (ffmpeg is a second,
 external oracle when installed). All encoder-side analysis and search (pitch, LPC, NLSF and
 LTP search, noise feedback, rate control, stereo prediction, the decimator) is our own design.

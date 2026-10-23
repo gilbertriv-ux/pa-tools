@@ -65,6 +65,10 @@ pub struct Stats {
     pub non_finite: u64,
     /// Finite input samples beyond full scale, clamped.
     pub clipped: u64,
+    /// Opus frames whose range coder had written past the frame's byte budget. Always 0 unless the
+    /// encoder's rate control has regressed: such a frame is cut short and decodes as garbage. The donor
+    /// asserted on it in debug builds; here it is a count, so release builds and callers can see it too.
+    pub frame_overflows: u64,
 }
 
 /// Longest input, in frames, at `sample_rate`.
@@ -164,7 +168,7 @@ impl<W: Write> OpusOggWriter<W> {
 
     /// What has been written so far.
     pub fn stats(&self) -> Stats {
-        self.stats
+        Stats { frame_overflows: self.enc.frame_overflows(), ..self.stats }
     }
 
     /// Appends interleaved samples.
@@ -234,6 +238,7 @@ impl<W: Write> OpusOggWriter<W> {
             self.pages.packet(&packet, granule)?;
         }
         self.stats.packets = self.packets;
+        self.stats.frame_overflows = self.enc.frame_overflows();
         let out = self.pages.finish()?;
         Ok((out, self.stats))
     }

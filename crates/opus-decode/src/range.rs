@@ -187,8 +187,15 @@ impl<'a> RangeDecoder<'a> {
     }
 
     /// Decodes a uniformly distributed integer in `[0, ft)` (`ft >= 2`).
+    ///
+    /// Total, with the same behaviour in debug and release builds: below the documented domain nothing is
+    /// read and the result is 0. `ft == 1` has a single value, which carries no information, so it is not an
+    /// error; `ft == 0` is an empty range, so it sets [`Self::error`] like any other out-of-range value.
     pub fn uint(&mut self, ft: u32) -> u32 {
-        debug_assert!(ft > 1);
+        if ft < 2 {
+            self.error |= ft == 0;
+            return 0;
+        }
         let ft1 = ft - 1;
         let ftb = ilog(ft1);
         if ftb > 8 {
@@ -481,6 +488,31 @@ mod tests {
         let d = RangeDecoder::new(&buf);
         assert_eq!(d.tell(), 1);
         assert_eq!(d.tell_frac(), 8);
+    }
+
+    /// `ft` below the documented minimum of 2 is answered the same way in debug and release builds (no
+    /// assertion): 0, nothing consumed, and the error flag only for the empty range `ft == 0`.
+    #[test]
+    fn uint_below_two_is_total_and_consumes_nothing() {
+        let buf = [0x5Au8, 0xC3, 0x11, 0x97, 0x2E, 0x68, 0xF0, 0x03];
+        let reference = {
+            let mut d = RangeDecoder::new(&buf);
+            (d.uint(5), d.uint(70_000), d.bits(3), d.tell_frac())
+        };
+        for (ft, flagged) in [(0u32, true), (1, false)] {
+            let mut d = RangeDecoder::new(&buf);
+            let (tell, frac) = (d.tell(), d.tell_frac());
+            assert_eq!(d.uint(ft), 0, "ft {ft}");
+            assert_eq!(d.error, flagged, "ft {ft}");
+            assert_eq!((d.tell(), d.tell_frac()), (tell, frac), "ft {ft} must read nothing");
+            // The stream continues exactly as if the call had not happened.
+            d.error = false;
+            assert_eq!((d.uint(5), d.uint(70_000), d.bits(3), d.tell_frac()), reference, "ft {ft}");
+            // And again on an empty buffer, where there is nothing to read at all.
+            let mut e = RangeDecoder::new(&[]);
+            assert_eq!(e.uint(ft), 0);
+            assert_eq!(e.error, flagged);
+        }
     }
 
     #[test]
