@@ -179,8 +179,21 @@ impl Autosave {
     /// A new folder under `root` for the session called `name`.
     fn create(root: &Path, name: &str) -> Result<Autosave> {
         let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
-        let dir = root.join(format!("{} {stamp}-{}", sanitize_name(name), std::process::id()));
-        let lock = std::fs::create_dir_all(&dir).and_then(|()| std::fs::File::create(dir.join(LOCK))).map_err(|err| io_error(&dir, err))?;
+        let base = format!("{} {stamp}-{}", sanitize_name(name), std::process::id());
+        std::fs::create_dir_all(root).map_err(|err| io_error(root, err))?;
+        // A folder that already exists is another session's, maybe one kept for the next launch with
+        // unsaved work in it: never reuse it. Folders for the same name made in the same millisecond
+        // (one session closes, the next opens) get a numeric suffix.
+        let mut dir = root.join(&base);
+        let mut n = 1;
+        while let Err(err) = std::fs::create_dir(&dir) {
+            n += 1;
+            if err.kind() != std::io::ErrorKind::AlreadyExists || n > 1000 {
+                return Err(io_error(&dir, err));
+            }
+            dir = root.join(format!("{base}-{n}"));
+        }
+        let lock = std::fs::File::create(dir.join(LOCK)).map_err(|err| io_error(&dir, err))?;
         lock.try_lock().map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
         Ok(Autosave { dir, lock: Some(lock), copies: BTreeMap::new(), next: 1, recording: false })
     }
@@ -256,8 +269,13 @@ pub struct Leftover {
     pub recording: bool,
 }
 
-/// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
-/// session file they came from or holding a recording. Empty and outdated ones are deleted.
+/// Leftover autosaves under `root`, newest first: folders no open session holds, written at or after
+/// the time of the session file they came from, or holding a recording. Empty and outdated ones are
+/// deleted.
+///
+/// Equal times count as unsaved work. Some file systems keep coarse times (HFS+ one second, FAT two),
+/// so a Save and an edit made right after it can carry the same time; deleting that autosave would
+/// lose the edit, and keeping one that turns out to match the saved file only costs an offer.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten().map(|d| d.path()) {
@@ -271,7 +289,7 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
+            Ok(saved) if recording || origin_saved.is_none_or(|o| saved >= o) => {
                 let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -447,6 +465,18 @@ mod tests {
     }
 
     #[test]
+    fn folders_made_in_the_same_millisecond_never_share_a_directory() {
+        let dir = folder("autosave-names");
+        let root = dir.join("Autosave");
+        // Made and released back to back, as when one session closes and the next opens: the
+        // millisecond in the name repeats, and a folder kept for the next launch must not be reused.
+        let dirs: Vec<PathBuf> = (0..50).map(|_| Autosave::create(&root, "Untitled").map(|a| a.dir.clone()).unwrap()).collect();
+        let distinct: std::collections::BTreeSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(distinct.len(), dirs.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn saved_audio_is_referenced_and_takes_are_copied_once() {
         let dir = folder("autosave-copies");
         let path = dir.join("Song/Song.scraft");
@@ -587,6 +617,37 @@ mod tests {
         for (path, bytes) in &files {
             assert_eq!(&std::fs::read(path).unwrap(), bytes, "{} untouched", path.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_autosave_with_the_same_time_as_its_session_file_is_kept() {
+        let dir = folder("autosave-same-time");
+        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let root = dir.join("Autosave");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Engine::default();
+        crate::io::save_session(&mut e, &path).unwrap();
+        record(&mut e, 0.5);
+        let mut a = Autosave::create(&root, "Song").unwrap();
+        a.write(e.session(), e.path.as_deref(), None).unwrap();
+        let autosaved = a.dir.join(SESSION);
+        drop(a);
+        let stamp_both = |saved_file: SystemTime, autosave_file: SystemTime| {
+            for (file, time) in [(Path::new(&path), saved_file), (autosaved.as_path(), autosave_file)] {
+                std::fs::OpenOptions::new().write(true).open(file).unwrap().set_modified(time).unwrap();
+            }
+        };
+        let second = |n: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n);
+        // A coarse clock (HFS+ one second, FAT two) stamps the Save and the edit after it alike.
+        stamp_both(second(10), second(10));
+        let left = leftovers(&root);
+        assert_eq!(left.len(), 1, "an autosave with the same time as the saved file is unsaved work");
+        assert!(left[0].dir.join(SESSION).is_file());
+        // Older than the saved file: outdated, deleted.
+        stamp_both(second(10), second(9));
+        assert!(leftovers(&root).is_empty());
+        assert!(!left[0].dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
