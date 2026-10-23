@@ -110,6 +110,26 @@ impl ParamSpec {
     }
 }
 
+/// Lowest sample rate the effects are built for (Hz); lower rates are raised to it.
+pub const MIN_SAMPLE_RATE: f32 = 8_000.0;
+/// Highest sample rate the effects are built for (Hz); higher rates are lowered to it.
+pub const MAX_SAMPLE_RATE: f32 = 768_000.0;
+/// Most channels an effect is built for.
+pub const MAX_CHANNELS: usize = 64;
+/// Longest tail any effect reports, in seconds.
+pub const MAX_TAIL_SECONDS: f32 = 30.0;
+
+/// A usable sample rate: NaN becomes 48 kHz, anything else is clamped to
+/// [`MIN_SAMPLE_RATE`]..=[`MAX_SAMPLE_RATE`].
+pub fn sane_sample_rate(sample_rate: f32) -> f32 {
+    if sample_rate.is_nan() { 48_000.0 } else { sample_rate.clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE) }
+}
+
+/// A usable channel count: 1..=[`MAX_CHANNELS`].
+pub fn sane_channels(channels: usize) -> usize {
+    channels.clamp(1, MAX_CHANNELS)
+}
+
 /// A real-time audio effect operating in place on planar channels.
 ///
 /// Implementations are constructed (allocating) with a sample rate and channel count; after that
@@ -134,6 +154,13 @@ pub trait AudioEffect: Send {
     fn process(&mut self, channels: &mut [&mut [f32]]);
     /// Processing latency in samples (look-ahead / STFT delay) for delay compensation.
     fn latency(&self) -> usize {
+        0
+    }
+    /// How long, in samples, the output keeps sounding after the input has gone silent at the
+    /// current settings (delay repeats, reverb decay, filter ringing), not counting
+    /// [`AudioEffect::latency`]. Hosts extend a bounce by this much. Feedback that never decays
+    /// reports [`MAX_TAIL_SECONDS`] worth of samples.
+    fn tail_samples(&self) -> usize {
         0
     }
     /// Analytic magnitude response (dB) at `freq` Hz for the current target settings, for

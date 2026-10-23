@@ -168,7 +168,7 @@ impl<const N: usize> GraphicEq<N> {
     }
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
-        assert!(N <= MAX_BANDS);
+        const { assert!(N <= MAX_BANDS) };
         let mut s = GraphicEq {
             pv: ParamValues::new(Self::PARAMS),
             bank: BandBank::new(sample_rate, channels, N),

@@ -620,8 +620,15 @@ pub fn realize(proto: &Prototype, band: Band, f1: f64, f2: f64, sample_rate: f64
         Band::LowPass => lp_to_lp(&mut f, warp(f1)),
         Band::HighPass => lp_to_hp(&mut f, warp(f1)),
         Band::BandPass | Band::BandStop => {
-            let (lo, hi) = if f1 <= f2 { (f1, f2) } else { (f2, f1) };
-            let hi = hi.max(lo * 1.001);
+            // Both edges stay below Nyquist and at least ~5 % apart: a band squeezed against
+            // Nyquist (or collapsed to zero width) would put poles on the unit circle.
+            let limit = nyq * 0.98;
+            let (a, b) = (f1.clamp(1.0, limit), f2.clamp(1.0, limit));
+            let (mut lo, mut hi) = if a <= b { (a, b) } else { (b, a) };
+            if hi < lo * 1.05 {
+                hi = (lo * 1.05).min(limit);
+                lo = lo.min(hi / 1.05);
+            }
             let (w1, w2) = (warp(lo), warp(hi));
             let (w0, bw) = ((w1 * w2).sqrt(), (w2 - w1).max(1e-6));
             if band == Band::BandPass { lp_to_bp(&mut f, w0, bw) } else { lp_to_bs(&mut f, w0, bw) }

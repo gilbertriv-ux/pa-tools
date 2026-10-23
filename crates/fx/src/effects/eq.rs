@@ -37,7 +37,7 @@ pub(crate) struct BandBank {
 
 impl BandBank {
     pub(crate) fn new(sample_rate: f32, channels: usize, nbands: usize) -> Self {
-        assert!(nbands <= MAX_BANDS);
+        let nbands = nbands.min(MAX_BANDS);
         let band = Band {
             kind: FilterType::Peaking,
             freq: Smoothed::with_ms(1000f32.log2(), sample_rate, SMOOTH_MS),
@@ -51,7 +51,7 @@ impl BandBank {
     }
 
     pub(crate) fn set_band(&mut self, i: usize, on: bool, kind: FilterType, freq: f32, gain: f32, q: f32, snap: bool) {
-        let b = &mut self.bands[i];
+        let Some(b) = self.bands.get_mut(i) else { return };
         if b.kind != kind {
             b.kind = kind;
             b.dirty = true;

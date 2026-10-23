@@ -6,6 +6,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod essential;
 pub mod filters;
+pub mod guard;
 pub mod modulation;
 pub mod multiband;
 pub mod pitch;
@@ -30,7 +31,8 @@ pub use reverbs::{ConvolutionReverb, SurroundReverb};
 pub use special::{AmbisonicsPanner, Binauralizer, ChannelMixer, Distortion, GuitarSuite, LoudnessMeterFx, Mastering, Mute, StereoExpander, VocalEnhancer};
 pub use time::{Delay, Reverb};
 
-use crate::{AudioEffect, ParamSpec};
+use crate::{AudioEffect, ParamSpec, sane_channels, sane_sample_rate};
+use guard::Guarded;
 
 /// Effect category (for menus / the Effects panel's Audio Effects bin).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,8 +55,13 @@ pub struct EffectInfo {
     pub name: &'static str,
     pub category: Category,
     pub params: &'static [ParamSpec],
-    /// Construct an instance for `(sample_rate, channels)`.
+    /// Construct an instance for `(sample_rate, channels)`. This is the one hosts use: the rate
+    /// and channel count are made sane ([`sane_sample_rate`], [`sane_channels`]) and the effect
+    /// runs inside the [`Guarded`] wrapper.
     pub create: fn(f32, usize) -> Box<dyn AudioEffect>,
+    /// Construct the bare effect (no wrapper, arguments taken as given). For tests and
+    /// benchmarks of the DSP itself.
+    pub create_raw: fn(f32, usize) -> Box<dyn AudioEffect>,
 }
 
 impl std::fmt::Debug for EffectInfo {
@@ -70,7 +77,14 @@ impl std::fmt::Debug for EffectInfo {
 
 macro_rules! entry {
     ($id:literal, $name:literal, $cat:ident, $ty:ty) => {
-        EffectInfo { id: $id, name: $name, category: Category::$cat, params: <$ty>::PARAMS, create: |sr, ch| Box::new(<$ty>::new(sr, ch)) }
+        EffectInfo {
+            id: $id,
+            name: $name,
+            category: Category::$cat,
+            params: <$ty>::PARAMS,
+            create: |sr, ch| Box::new(Guarded::new(<$ty>::new(sane_sample_rate(sr), sane_channels(ch)))),
+            create_raw: |sr, ch| Box::new(<$ty>::new(sr, ch)),
+        }
     };
 }
 
@@ -91,21 +105,24 @@ static REGISTRY: &[EffectInfo] = &[
         name: "Swap Channels",
         category: Category::Channel,
         params: Route::PARAMS,
-        create: |_, _| Box::new(Route::new(Routing::Swap)),
+        create: |_, _| Box::new(Guarded::new(Route::new(Routing::Swap))),
+        create_raw: |_, _| Box::new(Route::new(Routing::Swap)),
     },
     EffectInfo {
         id: "fill_left",
         name: "Fill Left with Right",
         category: Category::Channel,
         params: Route::PARAMS,
-        create: |_, _| Box::new(Route::new(Routing::FillLeft)),
+        create: |_, _| Box::new(Guarded::new(Route::new(Routing::FillLeft))),
+        create_raw: |_, _| Box::new(Route::new(Routing::FillLeft)),
     },
     EffectInfo {
         id: "fill_right",
         name: "Fill Right with Left",
         category: Category::Channel,
         params: Route::PARAMS,
-        create: |_, _| Box::new(Route::new(Routing::FillRight)),
+        create: |_, _| Box::new(Guarded::new(Route::new(Routing::FillRight))),
+        create_raw: |_, _| Box::new(Route::new(Routing::FillRight)),
     },
     entry!("dehum", "DeHum", Restoration, DeHum),
     entry!("denoise", "DeNoise", Restoration, DeNoise),

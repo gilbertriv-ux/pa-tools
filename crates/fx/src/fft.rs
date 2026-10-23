@@ -16,9 +16,9 @@ pub struct Fft {
 }
 
 impl Fft {
-    /// Plan an FFT of size `n` (must be a power of two ≥ 2).
+    /// Plan an FFT of size `n`: rounded up to a power of two, at least 2 and at most 2^24.
     pub fn new(n: usize) -> Fft {
-        assert!(n >= 2 && n.is_power_of_two(), "FFT size must be a power of two");
+        let n = n.clamp(2, 1 << 24).next_power_of_two();
         let bits = n.trailing_zeros();
         let rev = (0..n as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
         let (tw_re, tw_im) = (0..n / 2)
@@ -50,7 +50,9 @@ impl Fft {
 
     fn run(&self, re: &mut [f32], im: &mut [f32], inverse: bool) {
         let n = self.n;
-        assert!(re.len() >= n && im.len() >= n);
+        if re.len() < n || im.len() < n {
+            return;
+        }
         for i in 0..n {
             let j = self.rev[i] as usize;
             if j > i {
