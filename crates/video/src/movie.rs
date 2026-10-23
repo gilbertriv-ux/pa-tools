@@ -1,9 +1,10 @@
 //! [`Movie`]: open an MP4/MOV, report its picture format, and decode frames at times to RGBA.
 
-use crate::convert::{Matrix, planar_to_rgba, scale_rgba};
+use crate::convert::{Matrix, Yuv, planar_to_rgba, scale_rgba};
+use crate::gop::{Described, GopDecoder};
 use crate::isobmff::{self, ByteSource, CodecConfig, Mp4File, TrackKind};
-use crate::{Result, VideoError};
-use std::collections::VecDeque;
+use crate::{Result, VideoError, adapt_av1, adapt_dnx, adapt_h264, adapt_hevc};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 /// A random-access byte source a [`Movie`] can read from (in-memory bytes, or a file on native).
@@ -63,7 +64,7 @@ pub struct MovieInfo {
     /// Nominal frame rate (frames per second).
     pub frame_rate: f64,
     pub frame_count: usize,
-    /// Short codec id: `h264`, `prores`, `mjpeg`, `hevc`, …
+    /// Short codec id: `h264`, `hevc`, `av1`, `prores`, `dnxhd`, `mjpeg`, …
     pub codec: String,
     /// Human-readable codec description (e.g. "H.264 High", "Apple ProRes 422 HQ").
     pub codec_detail: String,
@@ -82,21 +83,96 @@ impl MovieInfo {
     }
 }
 
+/// How many sync samples a start search may step back over (open GOPs, unreliable sync flags).
+pub(crate) const MAX_START_STEPS: usize = 32;
+
+/// Builds a [`GopDecoder`] (test movies run on scripted decoders).
+#[cfg(test)]
+pub(crate) type GopFactory = Arc<dyn Fn() -> Result<Box<dyn GopDecoder>> + Send + Sync>;
+
+/// The track's codec and what is needed to build its decoder. Long-GOP codecs (H.264, HEVC, AV1)
+/// go through [`GopDecoder`]; ProRes, Motion JPEG and DNx decode one sample at a time.
 enum Codec {
-    H264 { avcc: Vec<u8> },
+    H264 {
+        avcc: Vec<u8>,
+    },
+    Hevc {
+        hvcc: Vec<u8>,
+    },
+    Av1 {
+        config_obus: Vec<u8>,
+    },
     ProRes,
     Jpeg,
+    Dnx,
     Unsupported(String),
+    #[cfg(test)]
+    Test(GopFactory),
 }
 
-struct H264State {
-    dec: crate::h264::Decoder,
+impl Codec {
+    /// Decoded forward from a random-access sample, with picture reordering.
+    fn is_gop(&self) -> bool {
+        match self {
+            Codec::H264 { .. } | Codec::Hevc { .. } | Codec::Av1 { .. } => true,
+            #[cfg(test)]
+            Codec::Test(_) => true,
+            Codec::ProRes | Codec::Jpeg | Codec::Dnx | Codec::Unsupported(_) => false,
+        }
+    }
+
+    /// A fresh decoder for a long-GOP codec.
+    fn new_gop(&self) -> Result<Box<dyn GopDecoder>> {
+        match self {
+            Codec::H264 { avcc } => adapt_h264::open(avcc),
+            Codec::Hevc { hvcc } => adapt_hevc::open(hvcc),
+            Codec::Av1 { config_obus } => adapt_av1::open(config_obus),
+            #[cfg(test)]
+            Codec::Test(make) => make(),
+            Codec::ProRes | Codec::Jpeg | Codec::Dnx | Codec::Unsupported(_) => Err(VideoError::Unsupported("not a long-GOP codec".into())),
+        }
+    }
+}
+
+/// An adapter's verdict on a track, as the codec to use plus the id and description to report.
+fn classified(d: Described, id: &'static str, usable: Codec) -> (Codec, &'static str, String) {
+    match d.unsupported {
+        None => (usable, id, d.detail),
+        Some(why) => (Codec::Unsupported(why), id, d.detail),
+    }
+}
+
+/// Up to `max` bytes from the start of sample `index` (a codec's header), if they can be read.
+fn sample_head(src: &dyn ByteSource, track: &isobmff::Track, index: usize, max: usize) -> Option<Vec<u8>> {
+    let s = track.samples.get(index)?;
+    let mut buf = vec![0u8; usize::try_from(s.size).ok()?.min(max)];
+    src.read_at(s.offset, &mut buf).ok()?;
+    Some(buf)
+}
+
+/// A packed picture as a [`Frame`], refusing sizes and buffers that do not add up.
+fn checked_frame(width: u32, height: u32, rgba: Vec<u8>, index: usize, time: f64) -> Result<Frame> {
+    let px = u64::from(width) * u64::from(height);
+    if px > MAX_PIXELS {
+        return Err(VideoError::Decode("picture too large".into()));
+    }
+    if px == 0 || rgba.len() as u64 != px * 4 {
+        return Err(VideoError::Decode("the decoder produced an empty picture".into()));
+    }
+    Ok(Frame { width, height, rgba, index, time })
+}
+
+/// A decoder fed forward from `start`, and the pictures it has produced but nobody asked for yet.
+struct GopState {
+    dec: Box<dyn GopDecoder>,
+    /// The sample (decode order) the decoder was started at.
+    start: usize,
     /// Next sample (decode order) to feed.
     next: usize,
     /// Last presentation index output, if any.
     last_out: Option<usize>,
     /// Output pictures not requested yet (presentation index → picture).
-    ready: std::collections::BTreeMap<usize, crate::h264::Picture>,
+    ready: BTreeMap<usize, Yuv>,
 }
 
 /// A tiny LRU of decoded frames.
@@ -141,7 +217,7 @@ pub struct Movie {
     rank: Vec<usize>,
     /// Presentation index → time in seconds.
     times: Vec<f64>,
-    h264: Option<H264State>,
+    gop: Option<GopState>,
     cache: Lru<usize>,
     thumbs: Lru<(usize, u32)>,
     /// Decoded frames since open (statistics for tests and the UI).
@@ -248,9 +324,15 @@ impl Movie {
                 (Codec::ProRes, "prores", format!("Apple ProRes {flavour}"))
             }
             Some(CodecConfig::Jpeg { fourcc }) if &fourcc.0 != b"mjpb" => (Codec::Jpeg, "mjpeg", "Motion JPEG".to_string()),
+            Some(CodecConfig::Hevc(c)) => classified(adapt_hevc::describe(c), "hevc", Codec::Hevc { hvcc: c.to_bytes() }),
+            Some(CodecConfig::Av1(c)) => classified(adapt_av1::describe(c), "av1", Codec::Av1 { config_obus: c.config_obus.clone() }),
+            Some(CodecConfig::Dnx { fourcc }) => {
+                let head = sample_head(&*src, t, 0, 1024);
+                classified(adapt_dnx::describe(fourcc.0, head.as_deref()), "dnxhd", Codec::Dnx)
+            }
             Some(other) => {
-                let nm = other.name();
-                (Codec::Unsupported(format!("{nm} pictures are not supported yet (H.264, ProRes and Motion JPEG are)")), nm, nm.to_ascii_uppercase())
+                let d = Described::not_yet(&other.name().to_ascii_uppercase());
+                (Codec::Unsupported(d.unsupported.unwrap_or_default()), other.name(), d.detail)
             }
             None => (Codec::Unsupported("the video track has no sample description".into()), "unknown", "unknown".into()),
         };
@@ -270,11 +352,27 @@ impl Movie {
             has_audio,
             quicktime: mp4.is_quicktime,
         };
-        Ok(Movie { src, mp4, track, info, codec, order, rank, times, h264: None, cache: Lru::new(12), thumbs: Lru::new(256), decoded: 0 })
+        Ok(Movie { src, mp4, track, info, codec, order, rank, times, gop: None, cache: Lru::new(12), thumbs: Lru::new(256), decoded: 0 })
     }
 
     pub fn info(&self) -> &MovieInfo {
         &self.info
+    }
+
+    /// Test seam: decode this movie's samples with the DNx adapter (which has no decoder yet).
+    #[cfg(test)]
+    pub(crate) fn with_dnx_adapter(mut self) -> Movie {
+        self.codec = Codec::Dnx;
+        self.info.decodable = true;
+        self
+    }
+
+    /// Test seam: decode this movie's samples with a scripted long-GOP decoder.
+    #[cfg(test)]
+    pub(crate) fn with_test_gop(mut self, make: GopFactory) -> Movie {
+        self.codec = Codec::Test(make);
+        self.info.decodable = true;
+        self
     }
 
     /// Frames kept decoded (full size). Thumbnails have their own cache.
@@ -318,13 +416,14 @@ impl Movie {
         if let Some(f) = self.cache.get(index) {
             return Ok(f);
         }
-        let f = match &self.codec {
-            Codec::Unsupported(why) => return Err(VideoError::Unsupported(why.clone())),
-            Codec::ProRes | Codec::Jpeg => {
-                let s = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
-                Arc::new(self.decode_intra(s, index)?)
-            }
-            Codec::H264 { .. } => self.decode_h264(index)?,
+        if let Codec::Unsupported(why) = &self.codec {
+            return Err(VideoError::Unsupported(why.clone()));
+        }
+        let f = if self.codec.is_gop() {
+            self.decode_gop(index)?
+        } else {
+            let s = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
+            Arc::new(self.decode_intra(s, index)?)
         };
         self.cache.put(index, Arc::clone(&f));
         Ok(f)
@@ -335,13 +434,12 @@ impl Movie {
     pub fn thumbnail_at(&mut self, secs: f64, max_h: u32) -> Result<Arc<Frame>> {
         let i = self.frame_index_at(secs).ok_or(VideoError::OutOfRange)?;
         let max_h = max_h.clamp(4, 1080);
-        let key = match self.codec {
-            Codec::H264 { .. } => {
-                let s = self.order.get(i).copied().ok_or(VideoError::OutOfRange)?;
-                let k = self.mp4.tracks.get(self.track).map_or(0, |t| t.sync_sample_before(s));
-                self.rank.get(k).copied().unwrap_or(i)
-            }
-            _ => i,
+        let key = if self.codec.is_gop() {
+            let s = self.order.get(i).copied().ok_or(VideoError::OutOfRange)?;
+            let k = self.start_sample(s, i);
+            self.rank.get(k).copied().unwrap_or(i)
+        } else {
+            i
         };
         if let Some(f) = self.thumbs.get((key, max_h)) {
             return Ok(f);
@@ -349,18 +447,11 @@ impl Movie {
         let full = if let Some(f) = self.cache.get(key) {
             f
         } else {
-            match &self.codec {
-                Codec::Unsupported(why) => return Err(VideoError::Unsupported(why.clone())),
-                Codec::H264 { avcc } => {
-                    let avcc = avcc.clone();
-                    let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
-                    Arc::new(self.decode_h264_single(&avcc, s, key)?)
-                }
-                _ => {
-                    let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
-                    Arc::new(self.decode_intra(s, key)?)
-                }
+            if let Codec::Unsupported(why) = &self.codec {
+                return Err(VideoError::Unsupported(why.clone()));
             }
+            let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
+            if self.codec.is_gop() { Arc::new(self.decode_gop_single(s, i)?) } else { Arc::new(self.decode_intra(s, key)?) }
         };
         let w = (f64::from(max_h) * self.info.display_aspect()).round().clamp(1.0, 4096.0) as u32;
         let t = Arc::new(full.fit(w, max_h));
@@ -423,47 +514,92 @@ impl Movie {
                 }
                 Ok(Frame { width, height, rgba: rgba.into_raw(), index, time })
             }
+            Codec::Dnx => {
+                let p = adapt_dnx::decode(&data, &self.info)?;
+                checked_frame(p.width, p.height, p.rgba, index, time)
+            }
             _ => Err(VideoError::Unsupported("not an intra-frame codec".into())),
         }
     }
 
-    fn h264_to_frame(&self, p: &crate::h264::Picture, index: usize) -> Frame {
-        let m = Matrix::for_code(p.color.matrix, p.height, p.color.full_range);
-        let rgba = planar_to_rgba(p.width as usize, p.height as usize, &p.y, p.y_stride, &p.u, &p.v, p.uv_stride, 2, 2, &m);
-        Frame { width: p.width, height: p.height, rgba, index, time: self.times.get(index).copied().unwrap_or(0.0) }
+    /// A decoded long-GOP picture as a frame at presentation index `index`.
+    fn yuv_frame(&self, yuv: &Yuv, index: usize) -> Result<Frame> {
+        checked_frame(yuv.width, yuv.height, yuv.to_rgba(), index, self.times.get(index).copied().unwrap_or(0.0))
     }
 
-    /// Decode one sample with a fresh decoder (keyframe thumbnails).
-    fn decode_h264_single(&mut self, avcc: &[u8], sample: usize, index: usize) -> Result<Frame> {
-        let mut dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
+    /// The sample (decode order) to start a decoder at to reach presentation index `index`, whose
+    /// sample is `target`: the latest sync sample whose own presentation index is not after
+    /// `index`. A sync sample can follow the target in presentation order (the leading pictures of
+    /// an open-GOP random-access point are decoded after it but shown before it), and starting
+    /// there would leave the target without its references; that sync sample is skipped. The
+    /// search steps back over at most [`MAX_START_STEPS`] sync samples.
+    fn start_sample(&self, target: usize, index: usize) -> usize {
+        let Some(t) = self.mp4.tracks.get(self.track) else { return 0 };
+        let mut s = t.sync_sample_before(target);
+        for _ in 0..MAX_START_STEPS {
+            if s == 0 || self.rank.get(s).is_none_or(|&r| r <= index) {
+                break;
+            }
+            s = t.sync_sample_before(s - 1);
+        }
+        s
+    }
+
+    /// For codecs whose sync flag cannot be trusted: steps back from `start` while the decoder says
+    /// the sample is not a real random-access point (at most [`MAX_START_STEPS`] times).
+    fn confirm_start(&self, dec: &dyn GopDecoder, mut start: usize, index: usize) -> usize {
+        if !dec.checks_random_access() {
+            return start;
+        }
+        for _ in 0..MAX_START_STEPS {
+            let ok = match self.read(start) {
+                Ok(au) => dec.is_random_access(&au),
+                // An unreadable sample fails the decode itself, with the real error.
+                Err(_) => true,
+            };
+            if ok || start == 0 {
+                break;
+            }
+            start = self.start_sample(start - 1, index);
+        }
+        start
+    }
+
+    /// Decode one sample with a fresh decoder (keyframe thumbnails). `index` is the presentation
+    /// index asked for; the picture comes from the random-access sample at or before `sample`.
+    fn decode_gop_single(&mut self, sample: usize, index: usize) -> Result<Frame> {
+        let mut dec = self.codec.new_gop()?;
+        let sample = self.confirm_start(&*dec, sample, index);
+        let key = self.rank.get(sample).copied().unwrap_or(index);
         let data = self.read(sample)?;
-        let mut pics = dec.decode(&data, index as i64).map_err(|e| VideoError::Decode(e.to_string()))?;
+        let mut pics = dec.decode(&data, key as i64)?;
         pics.extend(dec.flush());
         self.decoded += 1;
-        let p = pics.iter().find(|p| p.pts == index as i64).or(pics.first()).ok_or_else(|| VideoError::Decode("no picture decoded".into()))?;
-        Ok(self.h264_to_frame(p, index))
+        let p = pics.iter().find(|p| p.pts == key as i64).or(pics.first()).ok_or_else(|| VideoError::Decode("no picture decoded".into()))?;
+        self.yuv_frame(&p.yuv, key)
     }
 
-    fn decode_h264(&mut self, index: usize) -> Result<Arc<Frame>> {
-        let Codec::H264 { avcc } = &self.codec else { return Err(VideoError::Unsupported("not H.264".into())) };
+    /// Decode presentation index `index` of a long-GOP codec: continue the running decoder when it
+    /// is positioned before the picture, else start a new one at a random-access sample.
+    fn decode_gop(&mut self, index: usize) -> Result<Arc<Frame>> {
         let target = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
-        let key = self.mp4.tracks.get(self.track).map_or(0, |t| t.sync_sample_before(target));
-        let resume = self
-            .h264
-            .as_ref()
-            .is_some_and(|st| st.ready.contains_key(&index) || (key < st.next && st.next != usize::MAX && st.last_out.is_none_or(|lo| lo < index)));
+        let key = self.start_sample(target, index);
+        let resume = self.gop.as_ref().is_some_and(|st| {
+            st.ready.contains_key(&index) || (key >= st.start && key < st.next && st.next != usize::MAX && st.last_out.is_none_or(|lo| lo < index))
+        });
         if !resume {
-            let dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
-            self.h264 = Some(H264State { dec, next: key, last_out: None, ready: std::collections::BTreeMap::new() });
+            let dec = self.codec.new_gop()?;
+            let start = self.confirm_start(&*dec, key, index);
+            self.gop = Some(GopState { dec, start, next: start, last_out: None, ready: BTreeMap::new() });
         }
         let total = self.order.len();
         let mut last_err: Option<String> = None;
         // Bounded: each iteration feeds one sample, or flushes once at the end.
         for _ in 0..=total.saturating_add(1) {
-            let Some(st) = self.h264.as_mut() else { break };
+            let Some(st) = self.gop.as_mut() else { break };
             st.ready.retain(|q, _| *q >= index);
-            if let Some(p) = st.ready.remove(&index) {
-                return Ok(Arc::new(self.h264_to_frame(&p, index)));
+            if let Some(yuv) = st.ready.remove(&index) {
+                return Ok(Arc::new(self.yuv_frame(&yuv, index)?));
             }
             if st.next == usize::MAX {
                 break;
@@ -479,26 +615,31 @@ impl Movie {
                         continue;
                     }
                 };
-                let Some(st) = self.h264.as_mut() else { break };
+                let Some(st) = self.gop.as_mut() else { break };
                 match st.dec.decode(&data, pts) {
                     Ok(p) => p,
-                    Err(e) => {
+                    Err(VideoError::Decode(why)) => {
                         // Corrupt access unit: skip it (the decoder conceals what it can).
-                        last_err = Some(e.to_string());
+                        last_err = Some(why);
                         Vec::new()
+                    }
+                    Err(e) => {
+                        // Valid but beyond this decoder (or a broken container): no sample will do better.
+                        self.gop = None;
+                        return Err(e);
                     }
                 }
             } else {
                 st.next = usize::MAX;
                 st.dec.flush()
             };
-            let Some(st) = self.h264.as_mut() else { break };
+            let Some(st) = self.gop.as_mut() else { break };
             for p in pics {
                 let q = usize::try_from(p.pts).unwrap_or(usize::MAX);
                 st.last_out = Some(q);
                 self.decoded += 1;
                 if q >= index {
-                    st.ready.insert(q, p);
+                    st.ready.insert(q, p.yuv);
                 }
             }
             // Pictures waiting for a later request (bounded by the reorder depth in practice).
