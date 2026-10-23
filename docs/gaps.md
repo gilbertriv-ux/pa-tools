@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (G-17 shrunk: VC-3, HEVC and AV1 decode landed; previously trivial: G-04 mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -31,7 +31,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 | G-14 | Windows/Linux/Web exercised only lightly at runtime; no PR CI running the tests | Platforms / Stability | this file | 20–40 |
 | G-15 | Elastic Audio depth: one algorithm, no Elastic Pitch | Features | [target-app-parity.md](target-app-parity.md) | 30–45 |
 | G-16 | Session templates, track presets, workspace browser, batch rename | Features | [target-app-parity.md](target-app-parity.md) | 25–40 |
-| G-17 | Video: HEVC/DNx decode, video export, external timecode | Features / Formats | [file-format-parity.md](file-format-parity.md) | 30–50 |
+| G-17 | Video: MXF / Matroska readers, video export, external timecode, iXML | Features / Formats | [file-format-parity.md](file-format-parity.md) | 30–50 |
 | G-18 | Speech-to-text transcription | AI | this file | 30–50 |
 | G-19 | UI feel: generic plugin windows, shortcut collisions, pro-grade meters and scaling | UI/UX | [ui-parity.md](ui-parity.md) | 60–100 |
 | G-20 | MIDI/instrument depth: MIDI learn, sampler, notation editing | Features | [target-app-parity.md](target-app-parity.md) | 40–60 |
@@ -183,8 +183,12 @@ No session templates, track presets, workspace/sound browser with previews, batc
 
 ### G-17. Video and post
 
-No HEVC, DNxHD/HR or AV1 decode; no bounce with video; no external timecode/9-pin; no iXML
-field-recorder conform. ≈ 30–50 h.
+VC-3 (DNxHD / DNxHR) decodes in every build. HEVC and AV1 decoders are written and tested but sit
+behind the Cargo features `hevc-decode` and `av1-decode`, off in shipped builds for patent-licensing
+reasons ([`video-codecs.md`](video-codecs.md)); that is Gil's call, not a gap in the code. Still
+missing: readers for the MXF, Matroska / WebM and IVF containers (the new codecs are read from
+MP4 / MOV only); bounce with video; external timecode/9-pin; iXML field-recorder conform. ≈ 30–50 h
+(the estimate from before the decoders landed; re-measure when this is next picked up).
 
 ### G-18. Speech-to-text
 
@@ -214,6 +218,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | G-17 shrunk: VC-3 decode (always built), HEVC and AV1 decode (opt-in features, off in shipped builds) landed. Left: MXF / Matroska / IVF readers, video export, external timecode, iXML. Hours not re-measured |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |

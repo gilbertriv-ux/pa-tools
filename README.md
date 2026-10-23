@@ -53,7 +53,7 @@ processing and the rest.
   </tr>
   <tr>
     <td><b>Automation and markers.</b> Breakpoint automation for volume, pan, mute, sends and every plugin parameter, written live in Write, Touch and Latch, plus memory locations and a big counter.</td>
-    <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes and Motion JPEG in pure Rust, with timecode burn-in and sync offset.</td>
+    <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes, VC-3 (DNxHD / DNxHR) and Motion JPEG in pure Rust (HEVC and AV1 decoders are written too but compiled out of shipped builds; see [docs/video-codecs.md](docs/video-codecs.md)), with timecode burn-in and sync offset.</td>
   </tr>
   <tr>
     <td width="50%"></td>

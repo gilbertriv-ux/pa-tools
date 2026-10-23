@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (delay compensation includes the master faders' inserts (#351); previously minor: bounces stream to disk) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** trivial (video crate codec list; previously trivial: delay compensation includes the master faders' inserts (#351)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pa Tools is a Cargo workspace of small crates with enforced layering (`cargo xtask layers`).
 Nothing below the UI knows about egui, so the interface can be replaced.
@@ -58,8 +58,9 @@ they differ. There is no device or buffer-size selection, no ASIO, and no MIDI d
 (see [`hardware-parity.md`](hardware-parity.md)). Sources are decoded whole into the `SourcePool`
 and recordings are captured in memory until stop.
 
-`soundcraft-video` holds our own H.264, ProRes and Motion JPEG decoders and the ISO-BMFF demuxer
-for the video track. Hosted plugins (`clap-host`, `vst3-host`, `au-host`) are scanned, created and
+`soundcraft-video` holds our own H.264, ProRes, VC-3 and Motion JPEG decoders (plus HEVC and AV1
+decoders behind the off-by-default features `hevc-decode` and `av1-decode`, see
+[`video-codecs.md`](video-codecs.md)) and the ISO-BMFF demuxer for the video track. Hosted plugins (`clap-host`, `vst3-host`, `au-host`) are scanned, created and
 destroyed off the audio thread; only `process` runs on it.
 
 The cpal callbacks mark their thread (`soundcraft_playback::mark_audio_thread`). Code that may run
@@ -78,6 +79,7 @@ app as an MCP server. See `control-protocol.md` and `mcp.md`.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | trivial | Video crate codec list: VC-3, and HEVC / AV1 behind compile-time features |
 | 2026-10-13 | trivial | delay compensation includes the master faders' inserts (#351) |
 | 2026-10-10 | minor | Added video, vst3-host and au-host to the layer diagram; documented device I/O limits and in-memory media |
 | 2026-10-05 | major | First architecture overview |

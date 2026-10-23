@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** trivial (WAV: empty data chunk with trailing metadata (#466); previously minor: continuous fade curvature in Pa Tools sessions) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (video: VC-3 decode; HEVC and AV1 decode behind compile-time features; previously trivial: WAV empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -62,11 +62,18 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | Format | Pro Tools | Read | Write | Tests / notes |
 |---|---|---|---|---|
 | QuickTime / MP4, H.264 | import, bounce | ✅ | ❌ | Own pure-Rust decoder (Baseline/Main/High); mutated-movie fuzzing |
-| ProRes (all flavours) | import | ✅ | ❌ | Own decoder |
+| ProRes (all flavours) | import | ✅ | ❌ | Own decoder (shown as "PA ProRez") |
 | Motion JPEG | import | ✅ | ❌ | |
-| HEVC, AV1 | import | ❌ | ❌ | G-17 |
-| DNxHD / DNxHR, MXF video | import | ❌ | ❌ | G-17 |
+| VC-3 (DNxHD / DNxHR) in QuickTime MOV | import | ✅ | ❌ | Own pure-Rust decoder, always built: every compression ID (DNxHD 1235-1260, DNxHR LB/SQ/HQ/HQX/444), 8/10/12-bit, 4:2:0/4:2:2/4:4:4/RGB, interlaced; matches a reference decode of a committed sample to within two levels per sample (not bit-exact: the reference uses an integer inverse DCT); shown as "VC-3" with its variant |
+| HEVC (H.265) Main / Main 10 in MP4 / MOV | import | 🟡 | ❌ | Own decoder behind the Cargo feature `hevc-decode`: ✅ in builds with it, **off in shipped builds** for patent-licensing reasons (Gil's decision, [video-codecs.md](video-codecs.md)). 4:2:0 only; 4:2:2, 4:4:4 and range-extension files open but say they are unsupported. Bit-exact against reference decodes of committed samples |
+| AV1 in MP4 / MOV | import | 🟡 | ❌ | Own decoder behind the Cargo feature `av1-decode`: ✅ in builds with it, **off in shipped builds** for patent-licensing reasons (same decision). Every profile, 8/10/12-bit, 4:2:0/4:2:2/4:4:4/monochrome. Bit-exact against reference decodes of committed samples |
+| MXF video, Matroska / WebM, IVF files | import | ❌ | ❌ | G-17: no reader for these containers, so VC-3, HEVC and AV1 are read from MP4 / MOV only |
 | Bounce with video | export | — | ❌ | G-17 |
+
+HDR pictures are shown without tone mapping, and VC-3 alpha is not used (pictures are opaque).
+Pictures are limited to 8192 × 8192 pixels (67 million) and each decoder to a 1 GiB working budget; these
+are defaults, not a recorded decision. The 🟡 on HEVC and AV1 is only the build switch: the code is done and tested
+(CI runs it with both features on). The ~40 % file-formats estimate above does not move.
 
 ## Plugin and preset files
 
@@ -80,6 +87,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | Video (G-17): VC-3 import ✅ in MOV; HEVC and AV1 import written and tested but behind the compile-time features `hevc-decode` / `av1-decode`, off in shipped builds (patent posture, [video-codecs.md](video-codecs.md)) so shown 🟡; MXF / Matroska / WebM / IVF readers still missing. Readiness estimate unchanged |
 | 2026-10-13 | trivial | WAV: empty data chunk with trailing metadata (#466) |
 | 2026-10-13 | minor | Fade curvature round-trips in sessions with a zero default for older files. Format version and readiness estimate unchanged |
 | 2026-10-10 | major | Created: format inventory against Pro Tools 2026.4.1's declared document types and import/bounce options |

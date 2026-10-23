@@ -10,11 +10,16 @@
 //!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
 //!
 //! Picture codecs: H.264 / AVC (Baseline, Main, High; progressive 8-bit 4:2:0; CAVLC and CABAC),
-//! ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ; shown as "PA ProRez") and Motion JPEG
-//! (`jpeg`/`mjpa`). VC-3 (DNxHD / DNxHR), HEVC and AV1 tracks are recognised (`dnxhd`, `hevc`,
-//! `av1`) but not decoded yet. VC-3 is always built; the HEVC and AV1 decoders are the Cargo
-//! features `hevc-decode` and `av1-decode`, off by default, and a build without one reports its
-//! tracks as "unsupported in this build".
+//! ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ; shown as "PA ProRez"), VC-3 (DNxHD / DNxHR, the
+//! SMPTE ST 2019-1 intra codec; every compression ID, 8, 10 and 12 bits, 4:2:0 / 4:2:2 / 4:4:4,
+//! shown as "VC-3" with its variant) and Motion JPEG (`jpeg`/`mjpa`). VC-3 is always built.
+//!
+//! Two decoders are compile-time Cargo features, off by default, because their patent licensing is a
+//! separate question from the code licence (`docs/video-codecs.md`): `hevc-decode` (HEVC / H.265
+//! Main and Main 10, 4:2:0, 8 to 12 bits) and `av1-decode` (AV1, every profile, 8, 10 and 12 bits,
+//! 4:2:0 / 4:2:2 / 4:4:4 / monochrome). A build without one still opens such a file, so the
+//! timeline shows the clip, and reports its pictures as "unsupported in this build". All three new
+//! decoders read MP4 / MOV only (no MXF, Matroska / WebM or IVF reader yet), and none tone-maps HDR.
 //!
 //! ## Adding a codec
 //!
@@ -23,18 +28,22 @@
 //! [`convert::Yuv`], 8 or 9 to 16 bits, any subsampling, BT.601 / 709 / 2020); an intra-only codec
 //! returns packed RGBA for one sample. The glue (what the sample entry says, which variants decode,
 //! how a decoder is built) lives in one `adapt_<codec>.rs` file per codec, next to the decoder's own
-//! `hevc/`, `av1/` or `dnx/` module.
+//! `hevc/`, `av1/` or `vc3/` module.
 //!
 //! ## Origin
 //!
-//! The container, H.264 and ProRes code is a copy of the clean-room crates of our sibling app
-//! FilmCraft (`storytold/filmcraft`, same organisation, MIT OR Apache-2.0): `filmcraft-bitstream`
-//! → [`bitstream`], `filmcraft-isobmff` → [`isobmff`], `filmcraft-h264` → [`h264`] (without its
-//! test-only synthetic stream module), `filmcraft-prores` → [`prores`]. The crafting apps share no
-//! code as dependencies; each keeps its own copy. Module paths were changed and some parsers
-//! hardened (checked arithmetic, bounded allocations); [`bitstream`] matches FilmCraft commit
-//! `f47a1f6`. Fixes found here should be offered back upstream. [`Movie`], the pixel conversion
-//! and the frame caches are SoundCraft's own.
+//! The container, H.264, ProRes, VC-3, HEVC and AV1 code is a copy of the clean-room crates of our
+//! sibling app FilmCraft (`storytold/filmcraft`, same organisation, MIT OR Apache-2.0):
+//! `filmcraft-bitstream` → [`bitstream`], `filmcraft-isobmff` → [`isobmff`], `filmcraft-h264` →
+//! [`h264`] (without its test-only synthetic stream module), `filmcraft-prores` → [`prores`],
+//! `filmcraft-dnx` → [`vc3`] (renamed to the standard's name), and the HEVC and AV1 crates →
+//! `hevc` and `av1`. The crafting apps share no code as dependencies; each keeps its own copy.
+//! Module paths were changed and the parsers hardened against hostile files (checked arithmetic,
+//! bounded allocations, picture-size and memory budgets); [`bitstream`] matches FilmCraft
+//! commit `f47a1f6` apart from the checked arithmetic in `length_prefixed_nals`, and `vc3`, `hevc`
+//! and `av1` were taken from that commit. `ATTRIBUTION.md` lists each with its local changes. Fixes
+//! found here should be offered back upstream. [`Movie`], the pixel conversion and the frame caches
+//! are SoundCraft's own.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 // Codec code indexes fixed-size blocks; index loops read more clearly than iterator chains there.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
