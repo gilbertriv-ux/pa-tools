@@ -1,0 +1,120 @@
+# Pa Tools Windows MSI: builds the unsigned x64 and arm64 installers with the repository's own
+# packaging/windows/package.ps1 and uploads them as artifacts.
+#
+# Written for Pa Tools from package.ps1 and patools.wxs. Nothing is copied from
+# storytold/craft-common-actions (no licence file; see docs/ci-notes-patools.md). The `wix extension
+# add` step and the action SHAs are facts about public tools, not copied code.
+#
+# * x64 is built and then installed, run and uninstalled on the same runner (a smoke test of the
+#   MSI itself).
+# * arm64 is cross-compiled on this x64 runner (needs the MSVC ARM64 build tools, which the
+#   windows-latest image has). It cannot run here; the existing windows-arm64.yml installs and
+#   runs it on a Windows 11 ARM64 runner.
+# * Unsigned: no signing secret is passed to this workflow, so sign.ps1 prints a warning and leaves
+#   the files alone. Signed installers come from the release workflow, not from this one.
+name: Pa Tools Windows MSI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pa-tools]
+  pull_request:
+    paths:
+      - .github/workflows/windows-msi.yml
+      - packaging/windows/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-msi-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  # A missing resource compiler must fail the build, not ship an icon-less exe. (package.ps1 sets it
+  # too; stating it here keeps the requirement visible.)
+  SOUNDCRAFT_REQUIRE_WINRES: "1"
+  WIX_VERSION: "5.0.2"
+
+jobs:
+  msi:
+    name: MSI (${{ matrix.arch }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    env:
+      ARCH: ${{ matrix.arch }}
+      DIST: ${{ github.workspace }}\dist\${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable with the MSVC target)
+        shell: pwsh
+        run: |
+          $target = if ($env:ARCH -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+          rustup toolchain install stable --profile minimal --target $target
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-msi-${{ matrix.arch }}
+          cache-on-failure: true
+
+      # WiX v5 is a .NET global tool. patools.wxs references no extension today, but the UI and Util
+      # extensions are added at the same version so a dialog set or a util element can be added
+      # to the installer without touching this workflow. A global tool lives in ~/.dotnet/tools.
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $tools | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $env:PATH = "$tools;$env:PATH"
+          wix extension add -g "WixToolset.UI.wixext/$env:WIX_VERSION" "WixToolset.Util.wixext/$env:WIX_VERSION"
+          wix --version
+          wix extension list -g
+
+      - name: Build and package (unsigned)
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch $env:ARCH
+
+      - name: List the packages
+        shell: pwsh
+        run: Get-ChildItem $env:DIST | Format-Table Name, Length
+
+      # Install, check, run and uninstall the x64 MSI on this machine.
+      - name: Smoke-test the x64 MSI (install, run, uninstall)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem (Join-Path $env:DIST '*.msi') | Select-Object -First 1).FullName
+          $dir = Join-Path $env:ProgramFiles 'Pa Tools'
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/l*v', 'install.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
+          foreach ($exe in 'pa-tools.exe', 'pa-tools-cli.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $exe))) { throw "$exe was not installed in $dir" }
+            Write-Output "ok installed $exe"
+          }
+          & (Join-Path $dir 'pa-tools-cli.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "pa-tools-cli --version exited $LASTEXITCODE" }
+          $p = Start-Process msiexec.exe -ArgumentList '/x', "`"$msi`"", '/qn', '/l*v', 'uninstall.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+          if (Test-Path -LiteralPath (Join-Path $dir 'pa-tools.exe')) { throw 'uninstall left pa-tools.exe behind' }
+          Write-Output 'ok uninstalled'
+
+      - name: Upload the MSI
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patools-windows-${{ matrix.arch }}-msi
+          path: dist/${{ matrix.arch }}/*.msi
+          if-no-files-found: error
+          retention-days: 14

@@ -31,6 +31,16 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is text from Inter
 (SIL OFL 1.1) converted to outlines; no font file is shipped.
 
+## Third-party code and workflow provenance
+
+Dependencies and adapted files that are not assets (so `cargo xtask assets` does not check them),
+recorded here for their licence and provenance.
+
+| Path | Author | Source | License |
+|---|---|---|---|
+| `.github/workflows/ci.yml` | Pa Tools (GR8 ID YUZ.AI), adapted from the CI workflows of FilmCraft and PhotoCraft (ArtCraft Team and the FilmCraft / PhotoCraft contributors) | https://github.com/storytold/filmcraft (`.github/workflows/ci.yml`, the quality-gate job) and https://github.com/storytold/photocraft (`.github/workflows/ci.yml`, the OS matrix) | MIT OR Apache-2.0 |
+| `.github/workflows/windows-msi.yml`, `.github/scripts/ci-digest.sh` | Pa Tools (GR8 ID YUZ.AI) | original; the workflow only calls the repository's own `packaging/windows/` scripts. Nothing is taken from storytold/craft-common-actions, which has no licence file | MIT OR Apache-2.0 |
+
 ## Files
 
 | Path | Author | Source | License |

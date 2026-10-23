@@ -1,0 +1,139 @@
+# Pa Tools CI: the quality gate and a three-OS build.
+#
+#   gate         `cargo xtask ci` on Linux: rustfmt check, clippy -D warnings, tests, assets, layers
+#                and the wasm32 check. AGENTS.md makes this command the gate before every commit; this
+#                job runs it on every push to the integration branch and on every pull request.
+#   build-test   `cargo build --workspace` and `cargo test --workspace` on macOS (Apple silicon) and
+#                Windows, the two platforms the Linux gate does not exercise (CoreAudio and
+#                AudioToolbox on macOS, WASAPI and the Windows resource compiler on Windows).
+#
+# Provenance: written for Pa Tools. The `gate` job is adapted from the `ci.yml` of
+# storytold/filmcraft (MIT OR Apache-2.0, (c) ArtCraft Team and the FilmCraft contributors) and the
+# OS matrix from the `ci.yml` of storytold/photocraft (MIT OR Apache-2.0, (c) ArtCraft Team and
+# the PhotoCraft contributors); see ATTRIBUTION.md. Nothing here is taken from
+# storytold/craft-common-actions, which declares no licence (docs/ci-notes-patools.md).
+#
+# No secrets, no upstream reusable workflows, standard free GitHub-hosted runners only, every
+# third-party action pinned to a commit SHA. Dependabot (github-actions) proposes SHA bumps.
+name: Pa Tools CI
+
+on:
+  push:
+    branches: [pa-tools, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a branch or pull request cancels its older, now superseded run. The integration
+# branch is never cancelled: when merges land close together, every state of `pa-tools` that gets a
+# run is checked to the end.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/pa-tools' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Debug and test builds without debug info: faster compiles and links and a much smaller target
+  # directory (a failing test still names its file and line; only backtrace frames lose theirs).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # Release builds in CI skip thin LTO and use parallel codegen units. The release profile is for
+  # shipped binaries (release.yml and windows-msi.yml build those); filmcraft measured that LTO makes
+  # linking hundreds of test binaries take over an hour on a hosted runner.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  gate:
+    name: cargo xtask ci (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Unused toolchains in the runner image (Android SDK, .NET, GHC, CodeQL) are deleted in the
+      # background: the space is free by the time the build needs it and nothing waits for it.
+      - name: Free disk space
+        run: |
+          nohup sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL </dev/null >/dev/null 2>&1 &
+
+      # libasound2-dev: cpal (ALSA); libxkbcommon, wayland, x11, fontconfig: winit and egui;
+      # mesa-vulkan-drivers: a software Vulkan (lavapipe) so the headless wgpu/egui render tests
+      # have an adapter; libudev-dev: cheap insurance (no crate in today's Cargo.lock links
+      # libudev, but device-enumeration crates commonly do).
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev \
+            libfontconfig1-dev mesa-vulkan-drivers pkg-config
+
+      - name: Install Rust (stable with clippy, rustfmt and wasm32)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt \
+            --target wasm32-unknown-unknown
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      # A failing run still saves the cache: it holds compiled dependencies, not test results.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+
+      - name: Quality gate (cargo xtask ci)
+        run: |
+          set -o pipefail
+          cargo xtask ci 2>&1 | tee ci-step.log
+
+      - name: Failure digest
+        if: failure()
+        run: bash .github/scripts/ci-digest.sh ci-step.log "cargo xtask ci failed"
+
+  build-test:
+    name: build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Standard free runners only (no xlarge). macos-15 is Apple silicon.
+        os: [macos-15, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: build-test-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Build (cargo build --workspace)
+        run: |
+          set -o pipefail
+          cargo build --workspace 2>&1 | tee ci-step.log
+
+      - name: Test (cargo test --workspace)
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee ci-step.log
+
+      - name: Failure digest
+        if: failure()
+        run: bash .github/scripts/ci-digest.sh ci-step.log "build or test failed on ${{ matrix.os }}"
