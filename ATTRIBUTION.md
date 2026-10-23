@@ -31,6 +31,35 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is text from Inter
 (SIL OFL 1.1) converted to outlines; no font file is shipped.
 
+## Video codecs (ported, clean-room donor)
+
+The decoders in `crates/video` come from [FilmCraft](https://github.com/storytold/filmcraft) (`storytold/filmcraft`,
+the sibling app of SoundCraft; MIT OR Apache-2.0, the same license as this repository). Each is pinned
+to a donor commit, and the donor states that it wrote them from the public specifications. Where a
+module differs from the donor, the last column says how.
+
+| Path | Donor | Written from (per the donor) | License | Local changes |
+|---|---|---|---|---|
+| `crates/video/src/vc3/` | FilmCraft `filmcraft-dnx` @ f47a1f6 | SMPTE ST 2019-1:2016 and Amendment 1:2023 | MIT OR Apache-2.0 | hardening, neutral names |
+| `crates/video/src/hevc/` | FilmCraft `crates/hevc` @ f47a1f6 | ITU-T Rec. H.265 (ISO/IEC 23008-2) | MIT OR Apache-2.0 | hardening, neutral names |
+| `crates/video/src/av1/` | FilmCraft `crates/av1` @ f47a1f6 | AV1 Bitstream & Decoding Process Specification v1.0.0 with Errata 1 | MIT OR Apache-2.0 | hardening and adaptation |
+| `crates/video/src/bitstream.rs`, `isobmff/`, `h264/`, `prores/` | FilmCraft `filmcraft-bitstream`, `-isobmff`, `-h264`, `-prores` (`bitstream.rs` matches f47a1f6 apart from checked arithmetic in `length_prefixed_nals`; the others are an earlier copy, commit not recorded) | the public specifications | MIT OR Apache-2.0 | hardening (checked arithmetic, bounded allocations), module paths |
+
+The HEVC and AV1 decoders are Cargo features that are off by default; see `docs/video-codecs.md`.
+
+## Video test fixtures
+
+Small test samples for the video decoders, in `crates/video/tests/fixtures/`. They are Gil's decision of
+2026-10-23 (G-17); this is not legal advice.
+
+| Path | Provenance |
+|---|---|
+| `crates/video/tests/fixtures/vc3/dnxhr-lb-256x144-2f.mov` | VC-3 regression sample generated with the FFmpeg 6.1.1 native dnxhd encoder (libavcodec 60.31.102; dnxhd source LGPL-2.1-or-later; the FFmpeg build is --enable-gpl, so the binary is GPL-2.0-or-later) from a synthetic test pattern; the sample is encoder output, not a derivative work of the encoder, and no GPL code is included in this repository. |
+| `crates/video/tests/fixtures/hevc/hevc-main-8bit-64x64-4f.h265`, `hevc-main-8bit-64x64-4f.mp4`, `hevc-main-8bit-64x64-bframes2-ref2-48f.mp4`, `hevc-main10-64x64-4f.mp4` | HEVC regression samples generated with libx265 3.5+1-f0c1022b6 (GPL-2.0-or-later) from synthetic test patterns; the samples are encoder output, not derivative works of the encoder, and no GPL code is included in this repository. |
+| `crates/video/tests/fixtures/hevc/hevc-main-8bit-64x64-opengop-32f.mp4` | HEVC open-GOP regression sample (IDR then CRA pictures with RASL leading pictures) generated with libx265 3.5+1-f0c1022b6 (GPL-2.0-or-later), options `open-gop=1:keyint=8:min-keyint=8:bframes=2`, from a synthetic test pattern; the sample is encoder output, not a derivative work of the encoder, and no GPL code is included in this repository. |
+| `crates/video/tests/fixtures/av1/av1-8bit-64x64-4f.ivf`, `av1-8bit-64x64-4f.mp4`, `av1-10bit-64x64-4f.ivf`, `av1-10bit-64x64-4f.mp4` | AV1 regression samples generated with libaom v3.8.2 (BSD-2-Clause, with the Alliance for Open Media Patent License 1.0) from synthetic test patterns; the samples are encoder output, not derivative works of the encoder, and no GPL code is included in this repository. |
+| `crates/video/tests/fixtures/av1/regress-grain-points.frames`, `regress-scaled-reference.frames` | libaom-encoded synthetic test pictures with a few header bits altered, so they work as fuzz regression inputs. Same licence note as the AV1 regression samples above. |
+
 ## Files
 
 | Path | Author | Source | License |
@@ -45,4 +74,4 @@ The title in the macOS DMG background (`packaging/macos/dmg/background.svg`) is 
 | `assets/app-icon/hicolor/` | Pa Tools (GR8 ID YUZ.AI) | original, rendered from `icon.svg` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft (upstream UI, before the Pa Tools rebrand; to be replaced with Pa Tools screenshots) rendered from the synthesised demo session | MIT OR Apache-2.0 |
 
-| `docs/images-patools/edit.jpg`, `mix.jpg`, `about.jpg` | Pa Tools screenshots captured on 2026-10-22 from the V2 Intel build (demo song synthesised by the app) | Pa Tools build | MIT OR Apache-2.0 |
+| `docs/images-patools/edit.jpg`, `docs/images-patools/mix.jpg`, `docs/images-patools/about.jpg` | Pa Tools screenshots captured on 2026-10-22 from the V2 Intel build (demo song synthesised by the app) | Pa Tools build | MIT OR Apache-2.0 |

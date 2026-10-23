@@ -83,7 +83,7 @@ impl<'a> Reader<'a> {
 
     #[inline]
     pub fn read(&mut self, n: u32) -> u32 {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return 0;
         }
@@ -194,7 +194,7 @@ impl Writer {
 impl Sink for Writer {
     #[inline]
     fn put(&mut self, val: u32, bits: u32) {
-        debug_assert!(bits <= 32);
+        let bits = bits.min(32);
         if bits == 0 {
             return;
         }
@@ -242,6 +242,18 @@ impl Sink for Writer {
 mod tests {
     use super::*;
     use crate::prores::tables::*;
+
+    #[test]
+    fn over_long_bit_counts_are_clamped_not_asserted() {
+        let mut w = Writer::new();
+        w.put(0xdead_beef, 40);
+        w.put(7, u32::MAX);
+        let data = w.finish();
+        assert_eq!(&data[..4], [0xde, 0xad, 0xbe, 0xef]);
+        let mut r = Reader::new(&data);
+        assert_eq!(r.read(40), 0xdead_beef);
+        assert_eq!(r.read(u32::MAX), 7);
+    }
 
     #[test]
     fn codeword_roundtrip_all_codebooks() {

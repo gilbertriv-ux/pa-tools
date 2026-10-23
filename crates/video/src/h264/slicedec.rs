@@ -66,7 +66,12 @@ impl PicState {
 
     /// Reuse the buffers of a finished picture of the same size for a new frame.
     pub fn reset(&mut self, frame: FrameRef) {
-        debug_assert_eq!((self.mb_w, self.mb_h), (frame.mb_w, frame.mb_h()));
+        // The caller reuses a state only for a picture of the same size; should that ever not hold,
+        // build a fresh one rather than index buffers of the wrong size.
+        if (self.mb_w, self.mb_h) != (frame.mb_w, frame.mb_h()) {
+            *self = PicState::new(frame);
+            return;
+        }
         // start_mb() re-initialises each macroblock before use; only availability must be reset
         for m in &mut self.mbs {
             m.slice_num = u32::MAX;
@@ -1465,5 +1470,25 @@ impl<'a> SliceDecoder<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h264::picture::Frame;
+    use std::sync::Arc;
+
+    /// A recycled state is only valid for a picture of its own size; for any other it is rebuilt (no
+    /// debug assertion, no indexing of buffers of the wrong size).
+    #[test]
+    fn reset_rebuilds_a_state_for_a_picture_of_another_size() {
+        let mut pic = PicState::new(Arc::new(Frame::new(1, 0, 2, 2)));
+        assert_eq!((pic.mb_w, pic.mb_h, pic.mbs.len()), (2, 2, 4));
+        pic.reset(Arc::new(Frame::new(2, 5, 2, 2)));
+        assert_eq!((pic.mb_w, pic.mb_h, pic.mbs.len(), pic.poc), (2, 2, 4, 5), "same size: reused");
+        pic.reset(Arc::new(Frame::new(3, 7, 3, 2)));
+        assert_eq!((pic.mb_w, pic.mb_h, pic.mbs.len(), pic.poc), (3, 2, 6, 7), "other size: rebuilt");
+        assert_eq!(pic.row_count.len(), 2);
     }
 }

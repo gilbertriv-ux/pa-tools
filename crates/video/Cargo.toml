@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-video"
-description = "SoundCraft video: MP4/MOV demux, H.264 / ProRes / Motion JPEG decoding to RGBA, timeline thumbnails"
+description = "SoundCraft video: MP4/MOV demux, H.264 / ProRes / VC-3 / Motion JPEG decoding to RGBA (HEVC and AV1 behind opt-in features), timeline thumbnails"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,12 @@ default = []
 # Frame-parallel H.264 and slice-parallel ProRes decoding (rayon). Off by default: SoundCraft
 # decodes on its own background thread and only needs one picture at a time.
 threads = ["dep:rayon"]
+# HEVC and AV1 decoders. Compile-time, off by default (their patent licensing is a separate decision,
+# see docs/video-codecs.md); a build without one opens such files and reports their pictures as
+# "unsupported in this build". CI lints and tests with both on. VC-3 (DNxHD / DNxHR) has no
+# feature: it is always built.
+hevc-decode = []
+av1-decode = []
 
 [dependencies]
 thiserror.workspace = true

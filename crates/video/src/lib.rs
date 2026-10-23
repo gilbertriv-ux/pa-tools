@@ -4,37 +4,89 @@
 //! - [`Movie::open`] (bytes) / [`Movie::open_source`] (any random-access [`ByteSource`]).
 //! - [`Movie::info`]: size, duration, frame rate, codec, whether it can be decoded.
 //! - [`Movie::frame_at`]: the frame shown at a time, decoded forward from the previous keyframe,
-//!   with a small LRU of decoded frames (sequential playback keeps decoding forward).
+//!   with an LRU of decoded frames held to a byte budget, 1 GiB by default (sequential playback keeps
+//!   decoding forward). The LRU is a [`FrameCache`]: an app opens every movie with one shared handle
+//!   ([`Movie::open_source_with_cache`]) and the 1 GiB is for all of them together, least recently
+//!   used frame out first whichever movie it belongs to. A movie opened with [`Movie::open`] or
+//!   [`Movie::open_source`] has a cache of its own.
 //! - [`Movie::thumbnail_at`] / [`Movie::thumbnails`]: low-resolution timeline pictures (keyframes).
 //! - Unsupported codecs open fine (so the timeline can show the clip) but frame requests return
 //!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
 //!
 //! Picture codecs: H.264 / AVC (Baseline, Main, High; progressive 8-bit 4:2:0; CAVLC and CABAC),
-//! Apple ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ) and Motion JPEG (`jpeg`/`mjpa`).
+//! ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ; shown as "PA ProRez"), VC-3 (DNxHD / DNxHR, the
+//! SMPTE ST 2019-1 intra codec; every compression ID, 8, 10 and 12 bits, 4:2:0 / 4:2:2 / 4:4:4,
+//! shown as "VC-3" with its variant) and Motion JPEG (`jpeg`/`mjpa`). VC-3 is always built.
+//!
+//! Two decoders are compile-time Cargo features, off by default, because their patent licensing is a
+//! separate question from the code licence (`docs/video-codecs.md`): `hevc-decode` (HEVC / H.265
+//! Main and Main 10, 4:2:0, 8 to 12 bits) and `av1-decode` (AV1, every profile, 8, 10 and 12 bits,
+//! 4:2:0 / 4:2:2 / 4:4:4 / monochrome). A build without one still opens such a file, so the
+//! timeline shows the clip, and reports its pictures as "unsupported in this build". All three new
+//! decoders read MP4 / MOV only (no MXF, Matroska / WebM or IVF reader yet), and none tone-maps HDR.
+//!
+//! ## Panics and `catch_unwind`
+//!
+//! The decoders are written so that no file makes them panic: arithmetic and indexing are checked and
+//! errors are values (`#![deny(clippy::unwrap_used, ...)]` below, and adversarial tests in every
+//! codec). As a last resort the H.264, HEVC and AV1 frame workers wrap a picture in
+//! `std::panic::catch_unwind`, so that a panic that should never happen becomes a decoding error for
+//! that picture instead of a hung reader. That net works only where panics unwind. Under
+//! `panic = "abort"` (a profile setting of whoever builds the binary) and on `wasm32`, where unwinding
+//! is not available, `catch_unwind` does nothing: a panic there ends the process. This workspace sets
+//! no `panic = "abort"`, so the native app has the net; the web build does not. Nothing in this crate
+//! relies on the net, and none of it uses `debug_assert!`: an invariant a file can reach is a checked
+//! path. See "Limits" in `docs/video-codecs.md`.
+//!
+//! ## Adding a codec
+//!
+//! [`Movie`] knows no codec's internals. A codec with inter-picture prediction implements the
+//! crate-private `GopDecoder` trait (`gop.rs`: feed one sample, collect reordered pictures as
+//! [`convert::Yuv`], 8 or 9 to 16 bits, any subsampling, BT.601 / 709 / 2020); an intra-only codec
+//! returns packed RGBA for one sample. The glue (what the sample entry says, which variants decode,
+//! how a decoder is built) lives in one `adapt_<codec>.rs` file per codec, next to the decoder's own
+//! `hevc/`, `av1/` or `vc3/` module.
 //!
 //! ## Origin
 //!
-//! The container, H.264 and ProRes code is a copy of the clean-room crates of our sibling app
-//! FilmCraft (`storytold/filmcraft`, same organisation, MIT OR Apache-2.0): `filmcraft-bitstream`
-//! → [`bitstream`], `filmcraft-isobmff` → [`isobmff`], `filmcraft-h264` → [`h264`] (without its
-//! test-only synthetic stream module), `filmcraft-prores` → [`prores`]. The crafting apps share no
-//! code as dependencies; each keeps its own copy. Only the module paths were changed; fixes found
-//! here should be offered back upstream. [`Movie`], the pixel conversion and the frame caches are
-//! SoundCraft's own.
+//! The container, H.264, ProRes, VC-3, HEVC and AV1 code is a copy of the clean-room crates of our
+//! sibling app FilmCraft (`storytold/filmcraft`, same organisation, MIT OR Apache-2.0):
+//! `filmcraft-bitstream` → [`bitstream`], `filmcraft-isobmff` → [`isobmff`], `filmcraft-h264` →
+//! [`h264`] (without its test-only synthetic stream module), `filmcraft-prores` → [`prores`],
+//! `filmcraft-dnx` → [`vc3`] (renamed to the standard's name), and the HEVC and AV1 crates →
+//! `hevc` and `av1`. The crafting apps share no code as dependencies; each keeps its own copy.
+//! Module paths were changed and the parsers hardened against hostile files (checked arithmetic,
+//! bounded allocations, picture-size and memory budgets); [`bitstream`] matches FilmCraft
+//! commit `f47a1f6` apart from the checked arithmetic in `length_prefixed_nals`, and `vc3`, `hevc`
+//! and `av1` were taken from that commit. `ATTRIBUTION.md` lists each with its local changes. Fixes
+//! found here should be offered back upstream. [`Movie`], the pixel conversion and the frame cache
+//! are SoundCraft's own.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 // Codec code indexes fixed-size blocks; index loops read more clearly than iterator chains there.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+mod adapt_av1;
+mod adapt_dnx;
+mod adapt_h264;
+mod adapt_hevc;
+#[cfg(feature = "av1-decode")]
+pub mod av1;
 pub mod bitstream;
+mod cache;
 pub mod convert;
+mod gop;
 pub mod h264;
+#[cfg(feature = "hevc-decode")]
+pub mod hevc;
 pub mod isobmff;
 mod movie;
 pub mod prores;
 pub mod synth;
+pub mod vc3;
 
+pub use cache::{DEFAULT_SHARED_CACHE_FRAMES, FrameCache};
 pub use isobmff::ByteSource;
-pub use movie::{Frame, Movie, MovieInfo, SharedSource, fit_size};
+pub use movie::{DEFAULT_CACHE_BYTES, DEFAULT_CACHE_FRAMES, Frame, Movie, MovieInfo, SharedSource, fit_size};
 
 /// Errors from opening or decoding a movie.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -58,5 +110,7 @@ pub fn probe(bytes: &[u8]) -> Result<MovieInfo> {
     Movie::open(bytes.to_vec()).map(|m| m.info().clone())
 }
 
+#[cfg(test)]
+mod seam_tests;
 #[cfg(test)]
 mod tests;

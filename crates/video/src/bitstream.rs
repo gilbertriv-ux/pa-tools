@@ -13,6 +13,8 @@ pub enum BitError {
     Eof,
     /// An Exp-Golomb code longer than 32 leading zeros.
     InvalidExpGolomb,
+    /// A NAL length prefix size outside 1 to 4 bytes (AVCC/HVCC allow nothing else).
+    BadLengthSize,
 }
 
 impl fmt::Display for BitError {
@@ -20,6 +22,7 @@ impl fmt::Display for BitError {
         match self {
             BitError::Eof => f.write_str("unexpected end of bitstream"),
             BitError::InvalidExpGolomb => f.write_str("invalid Exp-Golomb code"),
+            BitError::BadLengthSize => f.write_str("NAL length prefix size outside 1 to 4 bytes"),
         }
     }
 }
@@ -63,10 +66,10 @@ impl<'a> BitReader<'a> {
         self.pos = pos;
     }
 
-    /// Peek up to 32 bits without consuming (zero-padded past the end).
+    /// Peek up to 32 bits without consuming (zero-padded past the end). A larger `n` reads 32.
     #[inline]
     pub fn peek(&self, n: u32) -> u32 {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return 0;
         }
@@ -115,8 +118,8 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
-    /// Unsigned Exp-Golomb `ue(v)`.
-    pub fn read_ue(&mut self) -> Result<u32> {
+    /// Raw Exp-Golomb codeNum, up to 32 leading zeros (so below 2^33).
+    fn read_code_num(&mut self) -> Result<u64> {
         let mut zeros = 0u32;
         while !self.read_bit()? {
             zeros += 1;
@@ -128,14 +131,20 @@ impl<'a> BitReader<'a> {
             return Ok(0);
         }
         let v = self.read_bits_u64(zeros)?;
-        let r = (1u64 << zeros) - 1 + v;
-        u32::try_from(r).map_err(|_| BitError::InvalidExpGolomb)
+        Ok((1u64 << zeros) - 1 + v)
+    }
+
+    /// Unsigned Exp-Golomb `ue(v)`.
+    pub fn read_ue(&mut self) -> Result<u32> {
+        u32::try_from(self.read_code_num()?).map_err(|_| BitError::InvalidExpGolomb)
     }
 
     /// Signed Exp-Golomb `se(v)`.
     pub fn read_se(&mut self) -> Result<i32> {
-        let k = self.read_ue()? as i64;
-        Ok(if k & 1 == 1 { ((k + 1) / 2) as i32 } else { -((k / 2) as i32) })
+        // codeNum 2^32 is -2^31, so the mapping is done before narrowing to 32 bits.
+        let k = self.read_code_num()? as i64;
+        let v = if k & 1 == 1 { (k + 1) / 2 } else { -(k / 2) };
+        i32::try_from(v).map_err(|_| BitError::InvalidExpGolomb)
     }
 
     /// Truncated Exp-Golomb `te(v)` with range `max`.
@@ -176,8 +185,9 @@ impl BitWriter {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Append the low `n` bits of `value` (at most 32; a larger `n` writes 32).
     pub fn write_bits(&mut self, value: u32, n: u32) {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return;
         }
@@ -194,7 +204,11 @@ impl BitWriter {
         self.write_bits(b as u32, 1);
     }
     pub fn write_ue(&mut self, v: u32) {
-        let x = v as u64 + 1;
+        self.write_code_num(u64::from(v));
+    }
+    /// Exp-Golomb codeNum up to 2^32 (the code of `se(v)` -2^31).
+    fn write_code_num(&mut self, v: u64) {
+        let x = v + 1;
         let len = 64 - x.leading_zeros();
         let zeros = len - 1;
         for _ in 0..zeros {
@@ -208,8 +222,8 @@ impl BitWriter {
         }
     }
     pub fn write_se(&mut self, v: i32) {
-        let k = if v > 0 { (v as u32) * 2 - 1 } else { (-(v as i64) as u32) * 2 };
-        self.write_ue(k);
+        let m = u64::from(v.unsigned_abs()) * 2;
+        self.write_code_num(if v > 0 { m - 1 } else { m });
     }
     pub fn bit_len(&self) -> usize {
         self.buf.len() * 8 + self.nbits as usize
@@ -302,24 +316,24 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1/2/4 bytes) into NAL units.
+/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1 to 4 bytes of big-endian length before each
+/// NAL unit) into NAL units. A length that runs past the data, a truncated prefix or a `length_size`
+/// outside 1 to 4 is an error. The data is consumed with `split_at_checked` rather than by index
+/// arithmetic: a four-byte length is up to `u32::MAX`, and `index + length` wraps on a 32-bit target
+/// (wasm32), which would have let a hostile length pass the bounds check and then slice out of range.
 pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    if !(1..=4).contains(&length_size) {
+        return Err(BitError::BadLengthSize);
+    }
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        if i + length_size > data.len() {
-            return Err(BitError::Eof);
-        }
-        let mut len = 0usize;
-        for k in 0..length_size {
-            len = (len << 8) | data[i + k] as usize;
-        }
-        i += length_size;
-        if i + len > data.len() {
-            return Err(BitError::Eof);
-        }
-        out.push(&data[i..i + len]);
-        i += len;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (prefix, tail) = rest.split_at_checked(length_size).ok_or(BitError::Eof)?;
+        // At most four bytes, so this fits a u32 exactly.
+        let len = prefix.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
+        let (nal, tail) = usize::try_from(len).ok().and_then(|n| tail.split_at_checked(n)).ok_or(BitError::Eof)?;
+        out.push(nal);
+        rest = tail;
     }
     Ok(out)
 }
@@ -352,6 +366,21 @@ mod tests {
         assert_eq!(r.read_bits(5), Err(BitError::Eof));
     }
 
+    /// No debug-only assertions in this crate: an over-long request is a checked path (it reads or writes 32
+    /// bits), never a panic in a debug build and a silent wrong shift in a release one.
+    #[test]
+    fn over_long_bit_counts_are_clamped_not_asserted() {
+        let d = [0xff, 0x00, 0xff, 0x00, 0xff, 0x00];
+        let r = BitReader::new(&d);
+        assert_eq!(r.peek(32), 0xff00_ff00);
+        assert_eq!(r.peek(33), r.peek(32));
+        assert_eq!(r.peek(u32::MAX), r.peek(32));
+        let mut w = BitWriter::new();
+        w.write_bits(0xdead_beef, 40);
+        w.write_bits(1, u32::MAX);
+        assert_eq!(w.finish(), [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x01]);
+    }
+
     #[test]
     fn exp_golomb_known() {
         // 1 | 010 | 011 | 00100 | 00101 -> 0,1,2,3,4
@@ -376,6 +405,41 @@ mod tests {
     }
 
     #[test]
+    fn signed_exp_golomb_extremes_roundtrip() {
+        let vals = [0, 1, -1, i32::MAX, i32::MIN];
+        let mut w = BitWriter::new();
+        for v in vals {
+            w.write_se(v);
+        }
+        let b = w.finish();
+        let mut r = BitReader::new(&b);
+        for v in vals {
+            assert_eq!(r.read_se(), Ok(v));
+        }
+    }
+
+    #[test]
+    fn signed_exp_golomb_reads_minimum_from_spec_bits() {
+        // 32 zero bits, 1, then the 32-bit suffix 1: codeNum = 2^32 -> -2^31.
+        let bytes = [0, 0, 0, 0, 0x80, 0, 0, 0, 0x80];
+        assert_eq!(BitReader::new(&bytes).read_se(), Ok(i32::MIN));
+    }
+
+    #[test]
+    fn signed_exp_golomb_rejects_positive_overflow() {
+        // 32 zero bits, 1, then 32 zero bits: codeNum = 2^32 - 1 -> +2^31, not an i32.
+        let bytes = [0, 0, 0, 0, 0x80, 0, 0, 0, 0];
+        assert_eq!(BitReader::new(&bytes).read_se(), Err(BitError::InvalidExpGolomb));
+    }
+
+    #[test]
+    fn unsigned_exp_golomb_keeps_u32_range() {
+        // codeNum = 2^32 is a valid se(v) code but does not fit ue(v)'s u32.
+        let bytes = [0, 0, 0, 0, 0x80, 0, 0, 0, 0x80];
+        assert_eq!(BitReader::new(&bytes).read_ue(), Err(BitError::InvalidExpGolomb));
+    }
+
+    #[test]
     fn emulation_prevention() {
         let raw = [0, 0, 1, 0, 0, 0, 5, 0, 0, 3];
         let esc = escape_rbsp(&raw);
@@ -390,6 +454,48 @@ mod tests {
         assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
         let l = [0, 0, 0, 2, 0x67, 1, 0, 0, 0, 1, 0x68];
         assert_eq!(length_prefixed_nals(&l, 4).unwrap(), vec![&[0x67, 1][..], &[0x68][..]]);
+    }
+
+    #[test]
+    fn length_prefixed_split_every_prefix_size() {
+        // 1, 2, 3 and 4-byte prefixes; a zero-length NAL unit and an exactly-fitting last one.
+        for size in 1..=4usize {
+            let mut sample = Vec::new();
+            for nal in [&[0x40u8, 1, 2][..], &[][..], &[0x42, 9][..]] {
+                sample.extend(std::iter::repeat_n(0u8, size - 1));
+                sample.push(nal.len() as u8);
+                sample.extend_from_slice(nal);
+            }
+            assert_eq!(length_prefixed_nals(&sample, size).unwrap(), vec![&[0x40, 1, 2][..], &[][..], &[0x42, 9][..]], "size {size}");
+        }
+        assert_eq!(length_prefixed_nals(&[], 4).unwrap(), Vec::<&[u8]>::new());
+    }
+
+    #[test]
+    fn length_prefixed_split_rejects_hostile_lengths_without_panicking() {
+        // A length that cannot fit, at every prefix size. Values chosen so that `index + length` is exactly
+        // 2^32 or just past it: on a 32-bit target (wasm32) the old index arithmetic wrapped to a small number,
+        // passed the bounds check and then sliced out of range. (A 64-bit test host cannot show the wrap itself;
+        // the checked split makes the question moot on every target.)
+        for (size, len) in [(1usize, 0xFFu32), (2, 0xFFFF), (3, 0xFF_FFFF), (4, u32::MAX), (4, u32::MAX - 3), (4, 0x8000_0000), (4, 6)] {
+            let mut sample = len.to_be_bytes()[4 - size..].to_vec();
+            sample.extend_from_slice(&[0x40, 1]);
+            assert_eq!(length_prefixed_nals(&sample, size), Err(BitError::Eof), "size {size} len {len:#x}");
+        }
+        // A second NAL unit whose length overruns, after a good first one.
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40, 0xFF, 0xFF, 0xFF, 0xFC, 7], 4), Err(BitError::Eof));
+        // A truncated prefix.
+        assert_eq!(length_prefixed_nals(&[0, 0, 0], 4), Err(BitError::Eof));
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40, 0, 0], 4), Err(BitError::Eof));
+    }
+
+    #[test]
+    fn length_prefixed_split_rejects_unusable_prefix_sizes() {
+        // Size 0 would never advance (an unbounded loop of empty NAL units); more than 4 cannot be a valid prefix.
+        for size in [0usize, 5, 8, 9, usize::MAX] {
+            assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x40], size), Err(BitError::BadLengthSize), "size {size}");
+            assert_eq!(length_prefixed_nals(&[], size), Err(BitError::BadLengthSize), "size {size}");
+        }
     }
 
     #[test]

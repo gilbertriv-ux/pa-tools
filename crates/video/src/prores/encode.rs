@@ -170,7 +170,9 @@ impl Encoder {
         for s in &slices {
             out.extend_from_slice(s);
         }
-        debug_assert_eq!(out.len(), total);
+        if out.len() != total {
+            return Err(Error::Input("the coded size does not match the picture header".into()));
+        }
         Ok(out)
     }
 }

@@ -1,9 +1,11 @@
 //! [`Movie`]: open an MP4/MOV, report its picture format, and decode frames at times to RGBA.
 
-use crate::convert::{Matrix, planar_to_rgba, scale_rgba};
+use crate::cache::{FrameCache, Lease};
+use crate::convert::{Matrix, Yuv, planar_to_rgba, scale_rgba};
+use crate::gop::{Described, GopDecoder};
 use crate::isobmff::{self, ByteSource, CodecConfig, Mp4File, TrackKind};
-use crate::{Result, VideoError};
-use std::collections::VecDeque;
+use crate::{Result, VideoError, adapt_av1, adapt_dnx, adapt_h264, adapt_hevc};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 /// A random-access byte source a [`Movie`] can read from (in-memory bytes, or a file on native).
@@ -63,9 +65,10 @@ pub struct MovieInfo {
     /// Nominal frame rate (frames per second).
     pub frame_rate: f64,
     pub frame_count: usize,
-    /// Short codec id: `h264`, `prores`, `mjpeg`, `hevc`, …
+    /// Short codec id: `h264`, `hevc`, `av1`, `prores`, `dnxhd`, `mjpeg`, …
     pub codec: String,
-    /// Human-readable codec description (e.g. "H.264 High", "Apple ProRes 422 HQ").
+    /// Human-readable codec description shown on screen (e.g. "H.264 High", "PA ProRez 422 HQ",
+    /// "VC-3 (SQ, 10-bit)"); never a third-party product name.
     pub codec_detail: String,
     /// True when SoundCraft can decode this picture (otherwise frame requests return `Err`).
     pub decodable: bool,
@@ -82,32 +85,145 @@ impl MovieInfo {
     }
 }
 
+/// How many sync samples a start search may step back over (open GOPs, unreliable sync flags).
+pub(crate) const MAX_START_STEPS: usize = 32;
+
+/// How many pictures a decoder may output past the one asked for, with the asked-for one still not
+/// among them, before the request gives up on it (a damaged sample, or a picture the stream never
+/// outputs). The container's presentation order is what labels each picture, and a decoder's output
+/// order does not always agree with it: a B-frame stream whose `ctts` is missing or wrong, or an
+/// H.264 stream that understates its reorder depth, outputs pictures whose labels run ahead of the
+/// asked-for one before it arrives. How far ahead is the stream's real reorder depth, which is 4 or
+/// less in everyday encodes and up to 7 in deep hierarchical GOPs, so the margin is 8. It also bounds
+/// the work a missing picture costs: the loop stops about this many pictures (plus the decoder's own
+/// hold-back) after the one asked for, not at the end of the movie.
+pub(crate) const PAST_PICTURES_BEFORE_GIVING_UP: usize = 8;
+
+/// Builds a [`GopDecoder`] (test movies run on scripted decoders).
+#[cfg(test)]
+pub(crate) type GopFactory = Arc<dyn Fn() -> Result<Box<dyn GopDecoder>> + Send + Sync>;
+
+/// The track's codec and what is needed to build its decoder. Long-GOP codecs (H.264, HEVC, AV1)
+/// go through [`GopDecoder`]; ProRes, Motion JPEG and DNx decode one sample at a time.
 enum Codec {
-    H264 { avcc: Vec<u8> },
+    H264 {
+        avcc: Vec<u8>,
+    },
+    Hevc {
+        hvcc: Vec<u8>,
+    },
+    Av1 {
+        config_obus: Vec<u8>,
+    },
     ProRes,
     Jpeg,
+    Dnx,
     Unsupported(String),
+    #[cfg(test)]
+    Test(GopFactory),
 }
 
-struct H264State {
-    dec: crate::h264::Decoder,
+impl Codec {
+    /// Decoded forward from a random-access sample, with picture reordering.
+    fn is_gop(&self) -> bool {
+        match self {
+            Codec::H264 { .. } | Codec::Hevc { .. } | Codec::Av1 { .. } => true,
+            #[cfg(test)]
+            Codec::Test(_) => true,
+            Codec::ProRes | Codec::Jpeg | Codec::Dnx | Codec::Unsupported(_) => false,
+        }
+    }
+
+    /// A fresh decoder for a long-GOP codec.
+    fn new_gop(&self) -> Result<Box<dyn GopDecoder>> {
+        match self {
+            Codec::H264 { avcc } => adapt_h264::open(avcc),
+            Codec::Hevc { hvcc } => adapt_hevc::open(hvcc),
+            Codec::Av1 { config_obus } => adapt_av1::open(config_obus),
+            #[cfg(test)]
+            Codec::Test(make) => make(),
+            Codec::ProRes | Codec::Jpeg | Codec::Dnx | Codec::Unsupported(_) => Err(VideoError::Unsupported("not a long-GOP codec".into())),
+        }
+    }
+}
+
+/// An adapter's verdict on a track, as the codec to use plus the id and description to report.
+fn classified(d: Described, id: &'static str, usable: Codec) -> (Codec, &'static str, String) {
+    match d.unsupported {
+        None => (usable, id, d.detail),
+        Some(why) => (Codec::Unsupported(why), id, d.detail),
+    }
+}
+
+/// Up to `max` bytes from the start of sample `index` (a codec's header), if they can be read.
+fn sample_head(src: &dyn ByteSource, track: &isobmff::Track, index: usize, max: usize) -> Option<Vec<u8>> {
+    let s = track.samples.get(index)?;
+    let mut buf = vec![0u8; usize::try_from(s.size).ok()?.min(max)];
+    src.read_at(s.offset, &mut buf).ok()?;
+    Some(buf)
+}
+
+/// A packed picture as a [`Frame`], refusing sizes and buffers that do not add up.
+fn checked_frame(width: u32, height: u32, rgba: Vec<u8>, index: usize, time: f64) -> Result<Frame> {
+    let px = u64::from(width) * u64::from(height);
+    if px > MAX_PIXELS {
+        return Err(VideoError::Decode("picture too large".into()));
+    }
+    if px == 0 || rgba.len() as u64 != px * 4 {
+        return Err(VideoError::Decode("the decoder produced an empty picture".into()));
+    }
+    Ok(Frame { width, height, rgba, index, time })
+}
+
+/// A decoder fed forward from `start`, and the pictures it has produced but nobody asked for yet.
+struct GopState {
+    dec: Box<dyn GopDecoder>,
+    /// The sample (decode order) the decoder was started at.
+    start: usize,
     /// Next sample (decode order) to feed.
     next: usize,
     /// Last presentation index output, if any.
     last_out: Option<usize>,
     /// Output pictures not requested yet (presentation index → picture).
-    ready: std::collections::BTreeMap<usize, crate::h264::Picture>,
+    ready: BTreeMap<usize, Yuv>,
 }
 
-/// A tiny LRU of decoded frames.
+/// Most bytes of decoded RGBA pictures the full-size frame cache keeps: 1 GiB (Gil, decision 5, then
+/// V4 decision 6, 2026-10-23). The cache is an LRU by bytes: about 129 frames at 1080p, 32 at 4K UHD,
+/// 8 at 8K UHD and 4 at 8192 x 8192. It is separate from the decoder's own working-memory budget. One
+/// [`FrameCache`] of this size is shared by every movie an app opens with
+/// [`Movie::open_source_with_cache`], so the 1 GiB is for the whole app; a movie opened without a cache
+/// has a private one of this size.
+pub const DEFAULT_CACHE_BYTES: usize = 1 << 30;
+
+/// Most frames one movie keeps in its frame cache. This is a ceiling for tiny pictures (it bounds the
+/// bookkeeping), not the bound: the byte budget is, from 480p up. [`Movie::set_cache_frames`] lowers it.
+pub const DEFAULT_CACHE_FRAMES: usize = 512;
+
+/// Most bytes the thumbnail cache keeps (a timeline thumbnail is a few tens of kilobytes, so this
+/// only bites if someone asks for very tall ones).
+const THUMB_CACHE_BYTES: usize = 256 << 20;
+
+/// Most pictures, and most bytes of them, a running decoder keeps for requests that have not come
+/// yet. In practice it is the reorder depth (a few pictures); the byte bound is for 8K pictures, which
+/// are about 100 MB each in 10-bit 4:2:0.
+const READY_MAX_PICTURES: usize = 32;
+const READY_MAX_BYTES: usize = 256 << 20;
+
+/// A tiny LRU of decoded pictures, bounded by count and by bytes of picture data, for one movie's
+/// timeline thumbnails (the full-size frames are in the shared [`FrameCache`]). The newest entry is
+/// always kept, even when it alone is over the byte bound. (Callers that still hold an evicted frame
+/// keep it alive; the bound covers what the cache itself holds.)
 struct Lru<K: PartialEq + Copy> {
     cap: usize,
+    byte_cap: usize,
+    bytes: usize,
     items: VecDeque<(K, Arc<Frame>)>,
 }
 
 impl<K: PartialEq + Copy> Lru<K> {
-    fn new(cap: usize) -> Self {
-        Lru { cap: cap.max(1), items: VecDeque::new() }
+    fn new(cap: usize, byte_cap: usize) -> Self {
+        Lru { cap: cap.max(1), byte_cap: byte_cap.max(1), bytes: 0, items: VecDeque::new() }
     }
     fn get(&mut self, k: K) -> Option<Arc<Frame>> {
         let i = self.items.iter().position(|(x, _)| *x == k)?;
@@ -117,18 +233,40 @@ impl<K: PartialEq + Copy> Lru<K> {
         Some(f)
     }
     fn put(&mut self, k: K, f: Arc<Frame>) {
-        self.items.retain(|(x, _)| *x != k);
+        if let Some(i) = self.items.iter().position(|(x, _)| *x == k)
+            && let Some((_, old)) = self.items.remove(i)
+        {
+            self.bytes = self.bytes.saturating_sub(old.rgba.len());
+        }
+        self.bytes = self.bytes.saturating_add(f.rgba.len());
         self.items.push_back((k, f));
-        while self.items.len() > self.cap {
-            self.items.pop_front();
+        self.trim();
+    }
+    /// Drop the oldest entries until the count and byte bounds hold (the newest one stays).
+    fn trim(&mut self) {
+        while self.items.len() > 1 && (self.items.len() > self.cap || self.bytes > self.byte_cap) {
+            let Some((_, old)) = self.items.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(old.rgba.len());
         }
     }
+    #[cfg(test)]
     fn contains(&self, k: K) -> bool {
         self.items.iter().any(|(x, _)| *x == k)
     }
 }
 
-/// An opened movie: container index plus decoder state and frame caches.
+/// Drop the highest-numbered pictures of `ready` until at most `max_pictures` and `max_bytes` are
+/// held. The lowest-numbered one always stays (it is the next one a sequential reader asks for).
+fn trim_ready(ready: &mut BTreeMap<usize, Yuv>, max_pictures: usize, max_bytes: usize) {
+    let mut bytes: usize = ready.values().fold(0, |a, y| a.saturating_add(y.byte_len()));
+    while ready.len() > 1 && (ready.len() > max_pictures || bytes > max_bytes) {
+        let Some((_, y)) = ready.pop_last() else { break };
+        bytes = bytes.saturating_sub(y.byte_len());
+    }
+}
+
+/// An opened movie: container index plus decoder state, its place in a frame cache (shared with the
+/// other open movies, or private) and its thumbnail cache.
 pub struct Movie {
     src: SharedSource,
     mp4: Mp4File,
@@ -141,8 +279,9 @@ pub struct Movie {
     rank: Vec<usize>,
     /// Presentation index → time in seconds.
     times: Vec<f64>,
-    h264: Option<H264State>,
-    cache: Lru<usize>,
+    gop: Option<GopState>,
+    /// This movie's place in the frame cache; dropping the movie gives its frames' bytes back.
+    cache: Lease,
     thumbs: Lru<(usize, u32)>,
     /// Decoded frames since open (statistics for tests and the UI).
     pub decoded: u64,
@@ -155,15 +294,29 @@ impl std::fmt::Debug for Movie {
 }
 
 impl Movie {
-    /// Open a movie held in memory.
+    /// Open a movie held in memory, with a frame cache of its own ([`DEFAULT_CACHE_BYTES`]).
     pub fn open(bytes: impl Into<Arc<[u8]>>) -> Result<Movie> {
+        Movie::open_with_cache(bytes, FrameCache::private())
+    }
+
+    /// Open a movie held in memory whose decoded frames go in `cache`, which other movies can share.
+    pub fn open_with_cache(bytes: impl Into<Arc<[u8]>>, cache: FrameCache) -> Result<Movie> {
         let b: Arc<[u8]> = bytes.into();
-        Movie::open_source(Arc::new(b))
+        Movie::open_source_with_cache(Arc::new(b), cache)
     }
 
     /// Open a movie from any random-access source (e.g. a `std::fs::File` on native targets, so
-    /// large movies are not read into memory).
+    /// large movies are not read into memory), with a frame cache of its own ([`DEFAULT_CACHE_BYTES`]).
     pub fn open_source(src: SharedSource) -> Result<Movie> {
+        Movie::open_source_with_cache(src, FrameCache::private())
+    }
+
+    /// Open a movie from any random-access source whose decoded frames go in `cache`. Give every
+    /// movie of an app the same [`FrameCache`] (clone the handle) and they share one byte budget, with
+    /// the least recently used frame going first whichever movie it belongs to; see [`FrameCache`]. The
+    /// decoder keeps its own working-memory budget. Dropping the movie removes its frames from the
+    /// cache.
+    pub fn open_source_with_cache(src: SharedSource, cache: FrameCache) -> Result<Movie> {
         let mp4 = isobmff::open(&*src).map_err(|e| VideoError::Container(e.to_string()))?;
         let track = mp4
             .tracks
@@ -245,12 +398,18 @@ impl Movie {
                     b"ap4x" => "4444 XQ",
                     _ => "",
                 };
-                (Codec::ProRes, "prores", format!("Apple ProRes {flavour}"))
+                (Codec::ProRes, "prores", format!("PA ProRez {flavour}").trim_end().to_string())
             }
             Some(CodecConfig::Jpeg { fourcc }) if &fourcc.0 != b"mjpb" => (Codec::Jpeg, "mjpeg", "Motion JPEG".to_string()),
+            Some(CodecConfig::Hevc(c)) => classified(adapt_hevc::describe(c), "hevc", Codec::Hevc { hvcc: c.to_bytes() }),
+            Some(CodecConfig::Av1(c)) => classified(adapt_av1::describe(c), "av1", Codec::Av1 { config_obus: c.config_obus.clone() }),
+            Some(CodecConfig::Dnx { fourcc }) => {
+                let head = sample_head(&*src, t, 0, 1024);
+                classified(adapt_dnx::describe(fourcc.0, head.as_deref()), "dnxhd", Codec::Dnx)
+            }
             Some(other) => {
-                let nm = other.name();
-                (Codec::Unsupported(format!("{nm} pictures are not supported yet (H.264, ProRes and Motion JPEG are)")), nm, nm.to_ascii_uppercase())
+                let d = Described::not_yet(&other.name().to_ascii_uppercase());
+                (Codec::Unsupported(d.unsupported.unwrap_or_default()), other.name(), d.detail)
             }
             None => (Codec::Unsupported("the video track has no sample description".into()), "unknown", "unknown".into()),
         };
@@ -270,16 +429,69 @@ impl Movie {
             has_audio,
             quicktime: mp4.is_quicktime,
         };
-        Ok(Movie { src, mp4, track, info, codec, order, rank, times, h264: None, cache: Lru::new(12), thumbs: Lru::new(256), decoded: 0 })
+        Ok(Movie {
+            src,
+            mp4,
+            track,
+            info,
+            codec,
+            order,
+            rank,
+            times,
+            gop: None,
+            cache: cache.lease(),
+            thumbs: Lru::new(256, THUMB_CACHE_BYTES),
+            decoded: 0,
+        })
     }
 
     pub fn info(&self) -> &MovieInfo {
         &self.info
     }
 
-    /// Frames kept decoded (full size). Thumbnails have their own cache.
+    /// Test seam: decode this movie's samples with the DNx adapter (which has no decoder yet).
+    #[cfg(test)]
+    pub(crate) fn with_dnx_adapter(mut self) -> Movie {
+        self.codec = Codec::Dnx;
+        self.info.decodable = true;
+        self
+    }
+
+    /// Test seam: decode this movie's samples with a scripted long-GOP decoder.
+    #[cfg(test)]
+    pub(crate) fn with_test_gop(mut self, make: GopFactory) -> Movie {
+        self.codec = Codec::Test(make);
+        self.info.decodable = true;
+        self
+    }
+
+    /// Most frames this movie keeps decoded (full size), up to [`DEFAULT_CACHE_FRAMES`]; its oldest go
+    /// first. Thumbnails have their own cache. The byte budget of the [`FrameCache`] applies as well,
+    /// so a large count of large frames is still held to it.
     pub fn set_cache_frames(&mut self, n: usize) {
-        self.cache.cap = n.clamp(1, 512);
+        self.cache.set_frame_cap(n.clamp(1, DEFAULT_CACHE_FRAMES));
+    }
+
+    /// Change the byte budget of the frame cache this movie uses (default [`DEFAULT_CACHE_BYTES`],
+    /// 1 GiB). **A shared cache has one budget, so this changes it for every movie sharing it**; use
+    /// [`FrameCache::set_budget_bytes`] on the app's handle to do that on purpose. The oldest frames are
+    /// dropped first. The bound is exact: a single picture larger than the whole budget is decoded and
+    /// returned but not cached. It bounds the cache only: decoder state, the pictures a running decoder
+    /// holds for coming requests, and frames the caller keeps are on top (see `docs/video-codecs.md`).
+    pub fn set_cache_bytes(&mut self, bytes: usize) {
+        self.cache.cache().set_budget_bytes(bytes);
+    }
+
+    /// Bytes of picture data this movie holds in the frame cache now (the frames of the other movies
+    /// sharing the cache are not counted; [`FrameCache::cached_bytes`] counts them all).
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.bytes()
+    }
+
+    /// A handle on the frame cache this movie stores its frames in (shared with the movies opened
+    /// with the same cache).
+    pub fn frame_cache(&self) -> FrameCache {
+        self.cache.cache().clone()
     }
 
     /// The frame shown at `secs` (presentation index), or `None` before the first / after the
@@ -318,14 +530,16 @@ impl Movie {
         if let Some(f) = self.cache.get(index) {
             return Ok(f);
         }
-        let f = match &self.codec {
-            Codec::Unsupported(why) => return Err(VideoError::Unsupported(why.clone())),
-            Codec::ProRes | Codec::Jpeg => {
-                let s = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
-                Arc::new(self.decode_intra(s, index)?)
-            }
-            Codec::H264 { .. } => self.decode_h264(index)?,
+        if let Codec::Unsupported(why) = &self.codec {
+            return Err(VideoError::Unsupported(why.clone()));
+        }
+        let f = if self.codec.is_gop() {
+            self.decode_gop(index)?
+        } else {
+            let s = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
+            Arc::new(self.decode_intra(s, index)?)
         };
+        // A frame larger than the whole cache budget is returned all the same, and not cached.
         self.cache.put(index, Arc::clone(&f));
         Ok(f)
     }
@@ -335,13 +549,12 @@ impl Movie {
     pub fn thumbnail_at(&mut self, secs: f64, max_h: u32) -> Result<Arc<Frame>> {
         let i = self.frame_index_at(secs).ok_or(VideoError::OutOfRange)?;
         let max_h = max_h.clamp(4, 1080);
-        let key = match self.codec {
-            Codec::H264 { .. } => {
-                let s = self.order.get(i).copied().ok_or(VideoError::OutOfRange)?;
-                let k = self.mp4.tracks.get(self.track).map_or(0, |t| t.sync_sample_before(s));
-                self.rank.get(k).copied().unwrap_or(i)
-            }
-            _ => i,
+        let key = if self.codec.is_gop() {
+            let s = self.order.get(i).copied().ok_or(VideoError::OutOfRange)?;
+            let k = self.start_sample(s, i);
+            self.rank.get(k).copied().unwrap_or(i)
+        } else {
+            i
         };
         if let Some(f) = self.thumbs.get((key, max_h)) {
             return Ok(f);
@@ -349,18 +562,11 @@ impl Movie {
         let full = if let Some(f) = self.cache.get(key) {
             f
         } else {
-            match &self.codec {
-                Codec::Unsupported(why) => return Err(VideoError::Unsupported(why.clone())),
-                Codec::H264 { avcc } => {
-                    let avcc = avcc.clone();
-                    let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
-                    Arc::new(self.decode_h264_single(&avcc, s, key)?)
-                }
-                _ => {
-                    let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
-                    Arc::new(self.decode_intra(s, key)?)
-                }
+            if let Codec::Unsupported(why) = &self.codec {
+                return Err(VideoError::Unsupported(why.clone()));
             }
+            let s = self.order.get(key).copied().ok_or(VideoError::OutOfRange)?;
+            if self.codec.is_gop() { Arc::new(self.decode_gop_single(s, i)?) } else { Arc::new(self.decode_intra(s, key)?) }
         };
         let w = (f64::from(max_h) * self.info.display_aspect()).round().clamp(1.0, 4096.0) as u32;
         let t = Arc::new(full.fit(w, max_h));
@@ -423,47 +629,105 @@ impl Movie {
                 }
                 Ok(Frame { width, height, rgba: rgba.into_raw(), index, time })
             }
+            Codec::Dnx => {
+                let p = adapt_dnx::decode(&data, &self.info)?;
+                checked_frame(p.width, p.height, p.rgba, index, time)
+            }
             _ => Err(VideoError::Unsupported("not an intra-frame codec".into())),
         }
     }
 
-    fn h264_to_frame(&self, p: &crate::h264::Picture, index: usize) -> Frame {
-        let m = Matrix::for_code(p.color.matrix, p.height, p.color.full_range);
-        let rgba = planar_to_rgba(p.width as usize, p.height as usize, &p.y, p.y_stride, &p.u, &p.v, p.uv_stride, 2, 2, &m);
-        Frame { width: p.width, height: p.height, rgba, index, time: self.times.get(index).copied().unwrap_or(0.0) }
+    /// A decoded long-GOP picture as a frame at presentation index `index`.
+    fn yuv_frame(&self, yuv: &Yuv, index: usize) -> Result<Frame> {
+        checked_frame(yuv.width, yuv.height, yuv.to_rgba(), index, self.times.get(index).copied().unwrap_or(0.0))
     }
 
-    /// Decode one sample with a fresh decoder (keyframe thumbnails).
-    fn decode_h264_single(&mut self, avcc: &[u8], sample: usize, index: usize) -> Result<Frame> {
-        let mut dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
+    /// The sample (decode order) to start a decoder at to reach presentation index `index`, whose
+    /// sample is `target`: the latest sync sample whose own presentation index is not after
+    /// `index`. A sync sample can follow the target in presentation order (the leading pictures of
+    /// an open-GOP random-access point are decoded after it but shown before it), and starting
+    /// there would leave the target without its references; that sync sample is skipped. The
+    /// search steps back over at most [`MAX_START_STEPS`] sync samples.
+    fn start_sample(&self, target: usize, index: usize) -> usize {
+        let Some(t) = self.mp4.tracks.get(self.track) else { return 0 };
+        let mut s = t.sync_sample_before(target);
+        for _ in 0..MAX_START_STEPS {
+            if s == 0 || self.rank.get(s).is_none_or(|&r| r <= index) {
+                break;
+            }
+            s = t.sync_sample_before(s - 1);
+        }
+        s
+    }
+
+    /// For codecs whose sync flag cannot be trusted: steps back from `start` while the decoder says
+    /// the sample is not a real random-access point (at most [`MAX_START_STEPS`] times).
+    fn confirm_start(&self, dec: &dyn GopDecoder, mut start: usize, index: usize) -> usize {
+        if !dec.checks_random_access() {
+            return start;
+        }
+        for _ in 0..MAX_START_STEPS {
+            let ok = match self.read(start) {
+                Ok(au) => dec.is_random_access(&au),
+                // An unreadable sample fails the decode itself, with the real error.
+                Err(_) => true,
+            };
+            if ok || start == 0 {
+                break;
+            }
+            start = self.start_sample(start - 1, index);
+        }
+        start
+    }
+
+    /// Decode one sample with a fresh decoder (keyframe thumbnails). `index` is the presentation
+    /// index asked for; the picture comes from the random-access sample at or before `sample`.
+    fn decode_gop_single(&mut self, sample: usize, index: usize) -> Result<Frame> {
+        let mut dec = self.codec.new_gop()?;
+        let sample = self.confirm_start(&*dec, sample, index);
+        let key = self.rank.get(sample).copied().unwrap_or(index);
         let data = self.read(sample)?;
-        let mut pics = dec.decode(&data, index as i64).map_err(|e| VideoError::Decode(e.to_string()))?;
+        let mut pics = dec.decode(&data, key as i64)?;
         pics.extend(dec.flush());
         self.decoded += 1;
-        let p = pics.iter().find(|p| p.pts == index as i64).or(pics.first()).ok_or_else(|| VideoError::Decode("no picture decoded".into()))?;
-        Ok(self.h264_to_frame(p, index))
+        let p = pics.iter().find(|p| p.pts == key as i64).or(pics.first()).ok_or_else(|| VideoError::Decode("no picture decoded".into()))?;
+        self.yuv_frame(&p.yuv, key)
     }
 
-    fn decode_h264(&mut self, index: usize) -> Result<Arc<Frame>> {
-        let Codec::H264 { avcc } = &self.codec else { return Err(VideoError::Unsupported("not H.264".into())) };
+    /// Decode presentation index `index` of a long-GOP codec: continue the running decoder when it
+    /// is positioned before the picture, else start a new one at a random-access sample.
+    fn decode_gop(&mut self, index: usize) -> Result<Arc<Frame>> {
         let target = self.order.get(index).copied().ok_or(VideoError::OutOfRange)?;
-        let key = self.mp4.tracks.get(self.track).map_or(0, |t| t.sync_sample_before(target));
-        let resume = self
-            .h264
-            .as_ref()
-            .is_some_and(|st| st.ready.contains_key(&index) || (key < st.next && st.next != usize::MAX && st.last_out.is_none_or(|lo| lo < index)));
+        let key = self.start_sample(target, index);
+        let resume = self.gop.as_ref().is_some_and(|st| {
+            st.ready.contains_key(&index) || (key >= st.start && key < st.next && st.next != usize::MAX && st.last_out.is_none_or(|lo| lo < index))
+        });
         if !resume {
-            let dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
-            self.h264 = Some(H264State { dec, next: key, last_out: None, ready: std::collections::BTreeMap::new() });
+            let dec = self.codec.new_gop()?;
+            let start = self.confirm_start(&*dec, key, index);
+            self.gop = Some(GopState { dec, start, next: start, last_out: None, ready: BTreeMap::new() });
         }
         let total = self.order.len();
         let mut last_err: Option<String> = None;
+        // Pictures this request has seen output with a presentation index past `index`.
+        let mut past = 0usize;
         // Bounded: each iteration feeds one sample, or flushes once at the end.
         for _ in 0..=total.saturating_add(1) {
-            let Some(st) = self.h264.as_mut() else { break };
+            let Some(st) = self.gop.as_mut() else { break };
             st.ready.retain(|q, _| *q >= index);
-            if let Some(p) = st.ready.remove(&index) {
-                return Ok(Arc::new(self.h264_to_frame(&p, index)));
+            if let Some(yuv) = st.ready.remove(&index) {
+                return Ok(Arc::new(self.yuv_frame(&yuv, index)?));
+            }
+            // Decoders output in presentation order, so once output has gone well past `index`
+            // without producing it the picture is not coming (a damaged sample, or a picture the
+            // stream does not output). Stop here rather than decode the rest of the movie, and leave
+            // the decoder where it is: the pictures after `index` that it already output wait in
+            // `ready`, so the next frame still comes from this decoder. "Well past" is
+            // [`PAST_PICTURES_BEFORE_GIVING_UP`] pictures, not one: output order can disagree with
+            // the container's presentation order by the stream's reorder depth, and giving up at the
+            // first picture past `index` failed frames that were about to arrive.
+            if past >= PAST_PICTURES_BEFORE_GIVING_UP {
+                break;
             }
             if st.next == usize::MAX {
                 break;
@@ -479,33 +743,137 @@ impl Movie {
                         continue;
                     }
                 };
-                let Some(st) = self.h264.as_mut() else { break };
+                let Some(st) = self.gop.as_mut() else { break };
                 match st.dec.decode(&data, pts) {
                     Ok(p) => p,
-                    Err(e) => {
+                    Err(VideoError::Decode(why)) => {
                         // Corrupt access unit: skip it (the decoder conceals what it can).
-                        last_err = Some(e.to_string());
+                        last_err = Some(why);
                         Vec::new()
+                    }
+                    Err(e) => {
+                        // Valid but beyond this decoder (or a broken container): no sample will do better.
+                        self.gop = None;
+                        return Err(e);
                     }
                 }
             } else {
                 st.next = usize::MAX;
                 st.dec.flush()
             };
-            let Some(st) = self.h264.as_mut() else { break };
+            let Some(st) = self.gop.as_mut() else { break };
             for p in pics {
                 let q = usize::try_from(p.pts).unwrap_or(usize::MAX);
-                st.last_out = Some(q);
+                st.last_out = Some(st.last_out.map_or(q, |lo| lo.max(q)));
                 self.decoded += 1;
+                if q > index {
+                    past += 1;
+                }
                 if q >= index {
-                    st.ready.insert(q, p);
+                    st.ready.insert(q, p.yuv);
                 }
             }
-            // Pictures waiting for a later request (bounded by the reorder depth in practice).
-            while st.ready.len() > 32 {
-                st.ready.pop_last();
-            }
+            // Pictures waiting for a later request: bounded by count and by bytes.
+            trim_ready(&mut st.ready, READY_MAX_PICTURES, READY_MAX_BYTES);
         }
-        Err(VideoError::Decode(last_err.unwrap_or_else(|| format!("frame {index} was not produced"))))
+        Err(VideoError::Decode(last_err.unwrap_or_else(|| format!("frame {index} could not be decoded"))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::Planes;
+
+    fn frame(bytes: usize, index: usize) -> Arc<Frame> {
+        Arc::new(Frame { width: 1, height: 1, rgba: vec![0; bytes], index, time: 0.0 })
+    }
+
+    fn yuv(bytes: usize, wide: bool) -> Yuv {
+        let planes = if wide {
+            Planes::U16 { y: vec![0; bytes / 2], u: Vec::new(), v: Vec::new() }
+        } else {
+            Planes::U8 { y: vec![0; bytes], u: Vec::new(), v: Vec::new() }
+        };
+        Yuv {
+            width: 1,
+            height: 1,
+            planes,
+            y_stride: 1,
+            uv_stride: 1,
+            cx: 2,
+            cy: 2,
+            bit_depth: if wide { 10 } else { 8 },
+            matrix: 1,
+            full_range: false,
+        }
+    }
+
+    #[test]
+    fn the_thumbnail_lru_evicts_the_oldest_entries_by_bytes() {
+        let mut c: Lru<usize> = Lru::new(100, 1000);
+        for i in 0..5 {
+            c.put(i, frame(400, i));
+        }
+        // 400-byte frames under a 1000-byte bound: only the two newest fit
+        assert_eq!((c.items.len(), c.bytes), (2, 800));
+        assert!(!c.contains(2) && c.contains(3) && c.contains(4));
+        // a hit makes a frame the newest, so it outlives an older one
+        assert!(c.get(3).is_some());
+        c.put(5, frame(400, 5));
+        assert!(c.contains(3) && c.contains(5) && !c.contains(4));
+        // replacing a key swaps its bytes instead of adding them
+        c.put(5, frame(100, 5));
+        assert_eq!(c.bytes, 500);
+        // the count cap still applies when the bytes are small
+        let mut small: Lru<usize> = Lru::new(3, 1 << 30);
+        for i in 0..10 {
+            small.put(i, frame(10, i));
+        }
+        assert_eq!((small.items.len(), small.bytes), (3, 30));
+    }
+
+    #[test]
+    fn a_picture_over_the_byte_bound_is_still_kept_alone() {
+        let mut c: Lru<usize> = Lru::new(12, 100);
+        c.put(0, frame(50, 0));
+        c.put(1, frame(5000, 1));
+        assert_eq!((c.items.len(), c.bytes), (1, 5000));
+        assert!(c.contains(1));
+        c.put(2, frame(60, 2));
+        assert!(c.contains(2) && !c.contains(1) && c.bytes == 60, "the huge frame goes once a newer one arrives");
+    }
+
+    #[test]
+    fn the_default_budget_is_one_gibibyte_and_holds_eight_k_frames() {
+        assert_eq!(DEFAULT_CACHE_BYTES, 1 << 30);
+        // RGBA frames the byte budget holds (the count ceiling is far above all of these)
+        let held = |w: usize, h: usize| (DEFAULT_CACHE_BYTES / (w * h * 4)).min(DEFAULT_CACHE_FRAMES);
+        assert_eq!(held(1920, 1080), 129);
+        assert_eq!(held(3840, 2160), 32);
+        assert_eq!(held(7680, 4320), 8);
+        assert_eq!(held(8192, 8192), 4);
+        assert_eq!(held(64, 64), DEFAULT_CACHE_FRAMES, "tiny pictures meet the count ceiling first");
+    }
+
+    #[test]
+    fn ready_pictures_are_bounded_by_count_and_bytes_and_the_lowest_stays() {
+        let mut r: BTreeMap<usize, Yuv> = (10..20).map(|i| (i, yuv(1000, false))).collect();
+        trim_ready(&mut r, 32, 3500);
+        assert_eq!(r.keys().copied().collect::<Vec<_>>(), [10, 11, 12], "the highest numbers go first");
+        trim_ready(&mut r, 2, usize::MAX);
+        assert_eq!(r.len(), 2);
+        // 16-bit pictures count two bytes a sample
+        let mut w: BTreeMap<usize, Yuv> = (0..4).map(|i| (i, yuv(1000, true))).collect();
+        assert_eq!(w[&0].byte_len(), 1000);
+        trim_ready(&mut w, 32, 2500);
+        assert_eq!(w.len(), 2);
+        // one picture over the bound is kept: it is the one being asked for
+        let mut one: BTreeMap<usize, Yuv> = BTreeMap::from([(7, yuv(10_000, false)), (8, yuv(10_000, false))]);
+        trim_ready(&mut one, 32, 5);
+        assert_eq!(one.keys().copied().collect::<Vec<_>>(), [7]);
+        let mut empty: BTreeMap<usize, Yuv> = BTreeMap::new();
+        trim_ready(&mut empty, 0, 0);
+        assert!(empty.is_empty());
     }
 }

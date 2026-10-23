@@ -53,7 +53,7 @@ processing and the rest.
   </tr>
   <tr>
     <td><b>Automation and markers.</b> Breakpoint automation for volume, pan, mute, sends and every plugin parameter, written live in Write, Touch and Latch, plus memory locations and a big counter.</td>
-    <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes and Motion JPEG in pure Rust, with timecode burn-in and sync offset.</td>
+    <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes, VC-3 (DNxHD / DNxHR) and Motion JPEG in pure Rust (HEVC and AV1 decoders are written too but compiled out of shipped builds; see [docs/video-codecs.md](docs/video-codecs.md)), with timecode burn-in and sync offset.</td>
   </tr>
   <tr>
     <td width="50%"></td>
@@ -135,8 +135,7 @@ round.
 
 ## Build from source
 
-Requirements: **Rust 1.95 or newer** for the desktop and web UI (the core workspace's declared
-minimum is 1.90), and network access: Cargo fetches two small git dependencies, `craft-ui` and
+Requirements: **Rust 1.95 or newer** (the workspace's declared minimum), and network access: Cargo fetches two small git dependencies, `craft-ui` and
 `craft-docpath`, from `github.com/storytold/craft-libs` (both MIT OR Apache-2.0; see `UPSTREAM.md`).
 
 ```sh
@@ -147,8 +146,8 @@ cargo run --release -p soundcraft -- --demo     # builds the `pa-tools` binary a
 
 The Cargo packages keep their upstream names (`soundcraft`, `soundcraft-cli`, `soundcraft-web`), so
 `-p soundcraft` selects the desktop app; the binaries it produces are **`pa-tools`** and
-**`pa-tools-cli`**. `cargo xtask ci` runs formatting, clippy, the tests, the asset and layering
-checks and the WebAssembly build.
+**`pa-tools-cli`**. `cargo xtask ci` runs formatting, clippy, the tests (the video crate also with its
+`hevc-decode` and `av1-decode` features on, and again with `threads`), the asset and layering checks and the WebAssembly build.
 
 ### macOS: Intel, Apple silicon, universal
 
