@@ -163,7 +163,7 @@ fn transcribes_a_fixture_when_a_model_is_present() {
 
 #[test]
 fn the_gate_skips_only_without_a_fixture() {
-    let missing = || Err(SpeechError::ModelUnavailable("speech model `whisper-base` not found (searched: nowhere)".into()));
+    let missing = || Err(SpeechError::ModelUnavailable { model: "whisper-base".into(), searched: "nowhere".into() });
     let dir = PathBuf::from("/models");
     let clip = PathBuf::from("/clip.f32");
 

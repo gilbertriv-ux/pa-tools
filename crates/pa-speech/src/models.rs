@@ -194,6 +194,16 @@ pub fn find(id: &str) -> Option<&'static ModelInfo> {
     CATALOGUE.iter().find(|m| m.id == id)
 }
 
+/// What to call a model that is not in the catalogue.
+pub const GENERIC_NAME: &str = "Speech model";
+
+/// The name to show people for model `id`: the catalogue's neutral display name (`"Speech model,
+/// base (multilingual)"`), else [`GENERIC_NAME`]. The id is a file-system name and an identifier
+/// for agents; it is never part of what a person reads, so this never echoes it.
+pub fn label(id: &str) -> &'static str {
+    find(id).map_or(GENERIC_NAME, |m| m.name)
+}
+
 /// Where model `m` lives under `models_dir`.
 pub fn model_dir(models_dir: &Path, m: &ModelInfo) -> PathBuf {
     models_dir.join(m.id)
@@ -556,6 +566,16 @@ mod tests {
             assert!(m.license.contains("MIT") && m.license_url.starts_with("https://"));
             assert!(m.source.starts_with("https://"));
         }
+    }
+
+    #[test]
+    fn label_is_the_neutral_display_name_and_never_the_id() {
+        for m in catalogue() {
+            assert_eq!(label(m.id), m.name);
+        }
+        assert_eq!(label("whisper-base"), "Speech model, base (multilingual)");
+        assert_eq!(label("whisper-nope"), GENERIC_NAME, "an unknown id is not echoed");
+        assert_eq!(label(""), GENERIC_NAME);
     }
 
     #[test]

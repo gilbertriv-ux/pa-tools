@@ -59,3 +59,45 @@ fn load_without_model_reports_not_installed() {
     // An unknown id is a distinct error.
     assert_eq!(load(&dir, "whisper-nope").err(), Some(SpeechError::UnknownModel("whisper-nope".into())));
 }
+
+/// Every message `load` and discovery can hand to a status line names the model by its catalogue
+/// display name and leaves out the model's id (a folder name) and any folder it searched.
+#[test]
+fn load_and_discovery_messages_name_no_third_party_product() {
+    use soundcraft_pa_speech::{ModelSearch, models, resolve_models_dir};
+
+    let check = |what: &str, e: &SpeechError| {
+        for text in [e.to_string(), e.summary()] {
+            let lower = text.to_lowercase();
+            assert!(!["whisper", "openai", "hugging"].iter().any(|n| lower.contains(n)), "{what}: {text:?}");
+        }
+        assert!(!e.summary().contains('\n'), "{what}: the summary is one line");
+    };
+
+    // Not installed.
+    let dir = std::env::temp_dir().join(format!("pa-speech-names-{}", std::process::id()));
+    let not_installed = load(&dir, models::DEFAULT_MODEL).err().expect("nothing installed");
+    assert_eq!(not_installed, SpeechError::NotInstalled(models::DEFAULT_MODEL.into()));
+    check("not installed", &not_installed);
+    assert_eq!(not_installed.to_string(), "Speech model, base (multilingual) is not installed");
+
+    // Not found anywhere (the folders searched are in the full text only).
+    let search = ModelSearch { env: Some(dir.join("env")), bundle_resources: None, app_support: Some(dir.join("support")) };
+    let not_found = resolve_models_dir(&search, models::DEFAULT_MODEL).expect_err("nothing installed");
+    check("not found", &not_found);
+    assert!(not_found.to_string().contains("env") && !not_found.summary().contains("support"), "{not_found}");
+
+    // Present on disk but not loadable: without the speech feature "unavailable", with it the
+    // placeholder files are rejected. Either way the text is clean.
+    let m = models::find(models::DEFAULT_MODEL).expect("in the catalogue");
+    let installed = dir.join("installed");
+    let model_dir = models::model_dir(&installed, m);
+    std::fs::create_dir_all(&model_dir).expect("create model folder");
+    for f in m.files {
+        std::fs::File::create(model_dir.join(f.name)).and_then(|file| file.set_len(f.size)).expect("sparse file");
+    }
+    let unloadable = load(&installed, models::DEFAULT_MODEL).err().expect("placeholder files cannot load");
+    check("unloadable", &unloadable);
+    assert_eq!(matches!(unloadable, SpeechError::Unavailable(_)), !soundcraft_pa_speech::available(), "{unloadable}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

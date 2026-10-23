@@ -107,11 +107,15 @@ impl Transcript {
 pub enum SpeechError {
     #[error("stopped")]
     Cancelled,
-    #[error("the speech model `{0}` is not installed")]
+    /// The model with this catalogue id is not on disk. The message shows the catalogue's display
+    /// name ([`models::label`]), never the id: the id is a folder name for agents, not UI text.
+    #[error("{} is not installed", models::label(.0))]
     NotInstalled(String),
-    /// No searched folder has the model; the text names the model and every place looked in.
-    #[error("{0}")]
-    ModelUnavailable(String),
+    /// No searched folder has the model. The message names the model (by its display name) and
+    /// every place looked in. That is for agents and logs: the folders are the user's own paths,
+    /// which a status line does not repeat (see [`SpeechError::summary`]).
+    #[error("{} not found (searched: {searched})", models::label(.model))]
+    ModelUnavailable { model: String, searched: String },
     #[error("unknown speech model `{0}`")]
     UnknownModel(String),
     #[error("speech-to-text is not available in this build ({0})")]
@@ -125,6 +129,18 @@ pub enum SpeechError {
     Download(String),
     #[error("{0}")]
     Io(String),
+}
+
+impl SpeechError {
+    /// One line fit for a status line: the message cut at its first line break (a backtrace the
+    /// underlying library appended stays out), and for [`SpeechError::ModelUnavailable`] without the
+    /// folders searched. The full text is `to_string()`.
+    pub fn summary(&self) -> String {
+        match self {
+            SpeechError::ModelUnavailable { model, .. } => format!("{} was not found", models::label(model)),
+            other => other.to_string().lines().next().unwrap_or_default().trim().to_string(),
+        }
+    }
 }
 
 impl From<std::io::Error> for SpeechError {
@@ -271,6 +287,40 @@ mod tests {
         assert!(matches!(err, SpeechError::TooLong(_)));
         assert!(err.to_string().contains("4.0 hours; the limit is 4 hours"), "{err}");
         assert!(check_length(usize::MAX).is_err(), "no overflow on absurd lengths");
+    }
+
+    /// What people read must not name a third-party product: the messages that can reach a status
+    /// line name the model by its catalogue display name, never by its id.
+    #[test]
+    fn error_texts_name_no_third_party_product() {
+        let errors = [
+            SpeechError::NotInstalled(models::DEFAULT_MODEL.into()),
+            SpeechError::NotInstalled("whisper-tiny".into()),
+            SpeechError::ModelUnavailable {
+                model: models::DEFAULT_MODEL.into(),
+                searched: "application data /home/me/.local/share/patools/models".into(),
+            },
+            SpeechError::Unavailable("this build does not include the speech feature".into()),
+            SpeechError::TooLong("4.1 hours; the limit is 4 hours".into()),
+            SpeechError::Cancelled,
+        ];
+        for e in &errors {
+            for text in [e.to_string(), e.summary()] {
+                let lower = text.to_lowercase();
+                assert!(!["whisper", "openai", "hugging"].iter().any(|n| lower.contains(n)), "{e:?}: {text:?}");
+            }
+        }
+        assert_eq!(errors[0].to_string(), "Speech model, base (multilingual) is not installed");
+        assert_eq!(errors[2].summary(), "Speech model, base (multilingual) was not found");
+        assert!(errors[2].to_string().contains("searched: application data"), "agents still get the places searched");
+        assert!(!errors[2].summary().contains("/home"), "the summary leaves the user's folders out");
+    }
+
+    #[test]
+    fn summary_is_one_line() {
+        let e = SpeechError::Model("tensor shape mismatch\n   0: backtrace frame\n   1: another frame".into());
+        assert_eq!(e.summary(), "model: tensor shape mismatch");
+        assert_eq!(SpeechError::Io("\n".into()).summary(), "");
     }
 
     #[test]
