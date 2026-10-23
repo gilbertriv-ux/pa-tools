@@ -1,0 +1,125 @@
+# Speech-to-text, checked with the real model on every push, every pull request and once a day.
+#
+# Self-contained (no upstream reusable workflows). It downloads the pinned speech model
+# (openai/whisper-base, MIT) and a public-domain 11 s speech clip (JFK inaugural address, from
+# OpenAI's MIT-licensed whisper repository), verifies both against pinned SHA-256 hashes, then:
+#   1. runs the speech crate + engine tests with the speech features, including the real-model
+#      test, which must RUN (a configured fixture with no model is a failure, never a skip);
+#   2. builds the CLI with the speech feature and transcribes the clip end to end
+#      (import -> track.transcribe -> saved session), checking the stored words.
+# Nothing downloaded here is committed to the repository. ffmpeg is used only on the runner to
+# convert the clip; no GPL code enters the repository or the build.
+name: Pa Tools Speech (real model)
+
+on:
+  push:
+    branches: [pa-tools, "feat/**", "ci/**"]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speech-real-model-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  MODEL_REV: e37978b90ca9030d5170a5c07aadb050351a65bb
+  CLIP_REV: 86098128c0b4f24f0e2aa2994de830614b474227
+  MODELS_DIR: ${{ github.workspace }}/.speech-models
+  FIXTURES_DIR: ${{ github.workspace }}/.speech-fixtures
+  REFERENCE: "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+
+jobs:
+  real-model:
+    name: Real speech model (JFK clip)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libudev-dev pkg-config ffmpeg jq
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: speech-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: speech-${{ runner.os }}-
+
+      - name: Speech model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: .speech-models
+          key: whisper-base-${{ env.MODEL_REV }}
+
+      - name: Download the speech model (pinned revision)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$MODELS_DIR/whisper-base"
+          for f in config.json generation_config.json tokenizer.json model.safetensors; do
+            curl -fsSL --retry 5 --retry-delay 5 -o "$MODELS_DIR/whisper-base/$f" \
+              "https://huggingface.co/openai/whisper-base/resolve/$MODEL_REV/$f"
+          done
+
+      - name: Verify the speech model (pinned SHA-256)
+        working-directory: .speech-models/whisper-base
+        run: |
+          sha256sum -c - <<'EOF'
+          a153c53883a6799b6f056b4a8d1a515c9926d03994682ba88a7616618d7da0c1  config.json
+          444b3f636d2fff89dd9ecf549e2a085b61f7ff0fa0246d4628bac6a3b8cc9ba4  generation_config.json
+          27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566  tokenizer.json
+          07cadb9f25677c8d50df603e66a98fbd842cce45047139baeb16e6219a1e807b  model.safetensors
+          EOF
+
+      - name: Fetch and verify the public-domain speech clip
+        run: |
+          mkdir -p "$FIXTURES_DIR"
+          curl -fsSL --retry 5 -o "$FIXTURES_DIR/jfk.flac" \
+            "https://raw.githubusercontent.com/openai/whisper/$CLIP_REV/tests/jfk.flac"
+          echo "63a4b1e4c1dc655ac70961ffbf518acd249df237e5a0152faae9a4a836949715  $FIXTURES_DIR/jfk.flac" | sha256sum -c -
+          ffmpeg -hide_banner -loglevel error -i "$FIXTURES_DIR/jfk.flac" -ac 1 -ar 16000 -f f32le "$FIXTURES_DIR/jfk-16k-mono.f32"
+          ffmpeg -hide_banner -loglevel error -i "$FIXTURES_DIR/jfk.flac" -ac 1 -ar 48000 -c:a pcm_s24le "$FIXTURES_DIR/jfk-48k.wav"
+          ls -l "$FIXTURES_DIR"
+
+      - name: Speech crate and engine tests, with the real model
+        env:
+          PA_SPEECH_MODELS_DIR: ${{ env.MODELS_DIR }}
+          PA_SPEECH_FIXTURE: ${{ env.FIXTURES_DIR }}/jfk-16k-mono.f32
+          PA_SPEECH_FIXTURE_KEYWORD: country
+          PA_SPEECH_FIXTURE_REFERENCE: ${{ env.REFERENCE }}
+        run: |
+          cargo test -p soundcraft-pa-speech -p soundcraft-engine \
+            --features soundcraft-engine/whisper,soundcraft-engine/download -- --nocapture 2>&1 | tee speech-tests.log
+          # The real-model test must have run, not skipped.
+          grep -q "transcribes_a_fixture_when_a_model_is_present ... ok" speech-tests.log
+          if grep -q "SKIPPED" speech-tests.log; then echo "::error::the real-model test skipped"; exit 1; fi
+          grep "transcript (" speech-tests.log
+
+      - name: End to end through the CLI (import, transcribe, save)
+        run: |
+          cargo build -p soundcraft-cli --features whisper
+          unset PA_SPEECH_MODELS_DIR
+          ./target/debug/pa-tools-cli run \
+            --cmd "file.import_audio={\"path\":\"$FIXTURES_DIR/jfk-48k.wav\"}" \
+            --cmd "track.transcribe={\"models_dir\":\"$MODELS_DIR\"}" \
+            --save "$RUNNER_TEMP/jfk-transcribed.scraft" | tee cli.log
+          python3 .github/scripts/check_transcript.py "$RUNNER_TEMP/jfk-transcribed.scraft" "$REFERENCE"
