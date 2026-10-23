@@ -392,7 +392,11 @@ fn codecs_without_a_decoder_open_but_say_so() {
 
 #[test]
 fn the_codec_stubs_return_clean_errors() {
+    // Without the decoder the stub says so; with it, an empty record is damaged input (a skipped sample).
+    #[cfg(not(feature = "hevc-decode"))]
     assert!(matches!(crate::adapt_hevc::open(&[]), Err(VideoError::Unsupported(why)) if why.contains(hevc_phrase())));
+    #[cfg(feature = "hevc-decode")]
+    assert!(matches!(crate::adapt_hevc::open(&[]), Err(VideoError::Decode(_))));
     assert!(matches!(crate::adapt_av1::open(&[0x0a, 0x0b]), Err(VideoError::Unsupported(why)) if why.contains(av1_phrase())));
     assert!(crate::adapt_hevc::describe(&HevcConfig::default()).unsupported.is_some_and(|w| w.contains(hevc_phrase())));
     assert!(crate::adapt_av1::describe(&Av1Config::default()).unsupported.is_some_and(|w| w.contains(av1_phrase())));
