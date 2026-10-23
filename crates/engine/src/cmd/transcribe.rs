@@ -11,17 +11,20 @@
 //! Two ways in, one code path:
 //! - `track.transcribe` does everything on the calling thread (CLI, MCP, control channel, scripts):
 //!   the call returns when the transcript is stored, and may take minutes for a long track.
-//! - [`transcribe_job`] reads the session on the calling thread (the render, which is quick: a
-//!   fraction of a second for ten minutes) and [`TranscribeJob::run`] does the rest on any thread,
-//!   so a UI stays responsive (like [`super::bounce_job`]): the sample-rate conversion, which takes
-//!   tens of seconds for an hour of audio, and the recognition. The UI then stores the result with
+//! - [`transcribe_job`] only checks the request and takes a snapshot of the session (an `Arc`, as
+//!   [`super::bounce_job`] does), then returns: it renders nothing. [`TranscribeJob::run`] does all of
+//!   the work on any thread, so a UI stays responsive however long the track is: the render of the
+//!   track's clips (about 10 s an hour of audio with clip effects), the sample-rate conversion
+//!   (tens of seconds an hour) and the recognition. Both of the first two look at the stop flag
+//!   between small pieces of work (render ranges, stretches of converted audio), so a Cancel takes
+//!   effect within moments, not after the whole track. The UI then stores the result with
 //!   `track.set_transcript`, which agents can also call with a transcript they bring themselves.
 //!   The app's own menu entry and command palette take this way (the Transcript window's
 //!   background job), never the synchronous command.
 //!
-//! The audio: the track's clips are rendered in ranges of [`RENDER_CHUNK_SECS`] and downmixed to
-//! one mono buffer at the session rate, which is what the job carries; [`TranscribeJob::run`]
-//! resamples it once to the recogniser's 16 kHz. Rendering a long track in one call would run into
+//! The audio: [`TranscribeJob::run`] renders the track's clips in ranges of [`RENDER_CHUNK_SECS`] from
+//! the snapshot and downmixes them to one mono buffer at the session rate, then converts it once to
+//! the recogniser's 16 kHz. Rendering a long track in one call would run into
 //! `soundcraft_mix::MAX_RENDER_SAMPLES` (2^29 samples summed over channels, which `render_clips`
 //! answers by silently cutting the render short); ranges that small never do. Each range is
 //! rendered after a run-in that settles the clip effects (see `soundcraft_mix::render_clips_settled`),
@@ -59,6 +62,15 @@ pub const MAX_MONO_SAMPLES: usize = 1 << 29;
 
 /// Seconds of a track rendered in one call while its audio is gathered.
 pub const RENDER_CHUNK_SECS: usize = 60;
+
+/// Seconds of 16 kHz audio converted between two looks at the stop flag: the longest a Cancel waits
+/// for the conversion (a fraction of a second, even in a slow build).
+const CONVERT_CHUNK_SECS: usize = 5;
+
+/// How much of the progress bar the two stages before the recogniser take: rendering up to
+/// [`RENDER_SHARE`], converting up to [`PREPARE_SHARE`]; the recogniser's own 0..1 fills the rest.
+const RENDER_SHARE: f32 = 0.03;
+const PREPARE_SHARE: f32 = 0.10;
 
 /// Most words one stored transcript may hold (about 100 hours of speech); more is refused.
 pub const MAX_TRANSCRIPT_WORDS: usize = 2_000_000;
@@ -109,15 +121,39 @@ enum Recogniser {
     Given(SharedTranscriber),
 }
 
-/// `track.transcribe`'s inputs, gathered on the calling thread: the track's audio as mono at the
-/// session's sample rate, and where the recogniser comes from. [`TranscribeJob::run`] does the
-/// (slow) resampling and recognition and may run on any thread; it never touches the session.
+/// The track to render, as the worker will find it: a snapshot of the session taken when the job was
+/// made (later edits do not reach it, and it does not stop them: the session is copied on write),
+/// where the track ends, and how long a range to render at a time. Holds no audio.
+struct Snapshot {
+    session: Arc<Session>,
+    /// The track's length in samples at the session rate (checked against the limits).
+    end: Samples,
+    /// Samples per render call ([`chunk_samples`]).
+    chunk: usize,
+}
+
+impl Snapshot {
+    /// The track's length in samples at the session rate.
+    fn samples(&self) -> usize {
+        usize::try_from(self.end.max(0)).unwrap_or(usize::MAX)
+    }
+
+    /// Renders the track to one mono buffer (see [`render_mono_until`]). Takes the snapshot, so the
+    /// session is let go the moment the audio is gathered, not held through the minutes of recognition.
+    fn render(self, track: TrackId, go_on: &mut dyn FnMut(usize, usize) -> bool) -> Result<Option<Vec<f32>>> {
+        render_mono_until(&self.session, track, self.end, self.chunk, go_on)
+    }
+}
+
+/// `track.transcribe`'s inputs: which track, a snapshot of the session to render it from, and where
+/// the recogniser comes from. Making one costs next to nothing; [`TranscribeJob::run`] does the
+/// (slow) rendering, resampling and recognition and may run on any thread.
 pub struct TranscribeJob {
     /// The track being transcribed.
     pub track: TrackId,
     sample_rate: SampleRate,
-    /// The track downmixed to mono, at `sample_rate` (not yet at the recogniser's 16 kHz).
-    audio: Vec<f32>,
+    /// The track, not yet rendered.
+    snapshot: Snapshot,
     recogniser: Recogniser,
     opts: soundcraft_pa_speech::Options,
 }
@@ -130,9 +166,10 @@ pub struct TranscribeOutcome {
     pub transcript: Option<Transcript>,
 }
 
-/// Gather what `track.transcribe` needs for `p`, without recognising anything yet. The model is
-/// looked for where the running program would find it ([`ModelSearch::from_environment`], with the
-/// brand's folder names), when the job runs.
+/// Gather what `track.transcribe` needs for `p`, without rendering or recognising anything: the
+/// request is checked (the track exists and is not too long) and a snapshot of the session is taken,
+/// which is quick however long the track. The model is looked for where the running program would
+/// find it ([`ModelSearch::from_environment`], with the brand's folder names), when the job runs.
 pub fn transcribe_job(e: &Engine, p: &Value) -> Result<TranscribeJob> {
     let search = ModelSearch::from_environment(soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG);
     transcribe_job_limits(e, p, Source::Search(&search), &Limits::DEFAULT)
@@ -203,22 +240,21 @@ fn transcribe_job_limits(e: &Engine, p: &Value, source: Source, limits: &Limits)
         }
     };
 
-    // Gather the track's clips as mono at the session rate, refusing a track that is too long
-    // before rendering any of it. The conversion to 16 kHz is `run`'s: it is the slow part, and
-    // this runs on the thread the person is waiting on.
+    // Refuse a track that is too long before rendering any of it, and take the snapshot the worker
+    // will render from. Nothing is rendered here: this runs on the thread the person is waiting on.
     let sr = e.session().sample_rate;
     let end = track_end(e.session(), track);
     check_length_with(end, sr, limits)?;
     let channels = e.session().track(track).map_or(1, |t| t.channels());
     let reserve = soundcraft_mix::clip_fx_preroll_samples(e.session(), track);
-    let audio = render_mono(e.session(), track, end, chunk_samples(sr, channels, limits.chunk_secs, reserve))?;
+    let snapshot = Snapshot { session: e.session_arc(), end, chunk: chunk_samples(sr, channels, limits.chunk_secs, reserve) };
 
     let opts = soundcraft_pa_speech::Options {
         language: str_param(p, "language").map(str::to_string),
         diarize: p.get("diarize").and_then(Value::as_bool).unwrap_or(true),
         max_speakers: 6,
     };
-    Ok(TranscribeJob { track, sample_rate: sr, audio, recogniser, opts })
+    Ok(TranscribeJob { track, sample_rate: sr, snapshot, recogniser, opts })
 }
 
 /// Where `track`'s audio ends, in samples from the session start (0 for a track with no clips).
@@ -247,14 +283,28 @@ fn chunk_samples(sr: SampleRate, channels: usize, chunk_secs: usize, run_in: usi
 /// anything, and the result equals one render of the whole track. The caller has checked `end`
 /// against the limits (the buffer is sized from it). Errors rather than return fewer than `end`
 /// samples.
-fn render_mono(s: &Session, track: TrackId, end: Samples, chunk: usize) -> Result<Vec<f32>> {
+///
+/// `go_on(done, total)` is asked before each range, with the samples rendered so far and the total;
+/// `false` stops the render there and the answer is `Ok(None)`.
+fn render_mono_until(
+    s: &Session,
+    track: TrackId,
+    end: Samples,
+    chunk: usize,
+    go_on: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<Option<Vec<f32>>> {
     let total = usize::try_from(end.max(0)).unwrap_or(usize::MAX);
     let chunk = chunk.max(1);
     let mut mono: Vec<f32> = Vec::with_capacity(total);
     let mut start = 0usize;
     while start < total {
+        if !go_on(start, total) {
+            return Ok(None);
+        }
         let len = chunk.min(total - start);
         let range = Range::new(i64::try_from(start).unwrap_or(i64::MAX), i64::try_from(start + len).unwrap_or(i64::MAX));
+        #[cfg(test)]
+        RANGES_RENDERED.with(|n| n.set(n.get() + 1));
         let part = soundcraft_pa_speech::downmix(&soundcraft_mix::render_clips_settled(s, track, range));
         if part.len() != len {
             return Err(bad(TRANSCRIBE, format!("rendering stopped early ({} of {len} samples at {start}); nothing was transcribed", part.len())));
@@ -262,7 +312,43 @@ fn render_mono(s: &Session, track: TrackId, end: Samples, chunk: usize) -> Resul
         mono.extend_from_slice(&part);
         start += len;
     }
-    Ok(mono)
+    Ok(Some(mono))
+}
+
+/// [`render_mono_until`] with no one to stop it.
+#[cfg(test)]
+fn render_mono(s: &Session, track: TrackId, end: Samples, chunk: usize) -> Result<Vec<f32>> {
+    render_mono_until(s, track, end, chunk, &mut |_, _| true)?.ok_or_else(|| bad(TRANSCRIBE, "rendering stopped"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many ranges the current thread has rendered for a transcription: lets a test show which
+    /// thread does the rendering (the worker's, never the caller's).
+    static RANGES_RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `audio` (mono, at `from_hz`) converted to the recogniser's 16 kHz, `step` output samples at a time
+/// ([`soundcraft_dsp::offline::Resampler`], which gives exactly the samples a one-shot
+/// `resample` does). `go_on(done, total)` is asked before each stretch, with the output samples made
+/// so far and the total; `false` stops the conversion there and the answer is `None`.
+fn convert_to_recogniser_rate(audio: &[f32], from_hz: u32, step: usize, go_on: &mut dyn FnMut(usize, usize) -> bool) -> Option<Vec<f32>> {
+    let conversion = soundcraft_dsp::offline::Resampler::new(audio.len(), from_hz, soundcraft_pa_speech::SAMPLE_RATE);
+    let total = conversion.out_len();
+    let mut out: Vec<f32> = Vec::with_capacity(total);
+    while out.len() < total {
+        if !go_on(out.len(), total) {
+            return None;
+        }
+        conversion.render_into(audio, out.len(), step.max(1), &mut out);
+    }
+    Some(out)
+}
+
+/// Where `done` of `total` puts the progress bar for a stage that starts at `from` and takes `share`.
+fn bar(from: f32, share: f32, done: usize, total: usize) -> f32 {
+    let part = if total == 0 { 0.0 } else { (done as f64 / total as f64).clamp(0.0, 1.0) as f32 };
+    from + share * part
 }
 
 /// Why a `model_unavailable` outcome happened, as a code a UI can act on: `not_found` (put the
@@ -337,13 +423,14 @@ fn samples_at_recogniser_rate(len: usize, from_hz: u32) -> usize {
 impl TranscribeJob {
     /// Length of the audio to recognise, in seconds.
     pub fn duration_secs(&self) -> f64 {
-        self.audio.len() as f64 / self.sample_rate.as_f64().max(1.0)
+        self.snapshot.samples() as f64 / self.sample_rate.as_f64().max(1.0)
     }
 
-    /// How many samples the job carries: the track at the session's rate, mono. The conversion to
-    /// the recogniser's rate has not happened yet; [`TranscribeJob::run`] does it.
-    pub fn gathered_samples(&self) -> usize {
-        self.audio.len()
+    /// How many samples the track has at the session's rate (mono): what [`TranscribeJob::run`]
+    /// will render. The job holds none of it yet: rendering and the conversion to the recogniser's
+    /// rate are `run`'s.
+    pub fn track_samples(&self) -> usize {
+        self.snapshot.samples()
     }
 
     /// Recognise the speech. `progress(fraction, status)` is called as it goes; returning `false`
@@ -351,12 +438,14 @@ impl TranscribeJob {
     /// the outcome's `status` is `model_unavailable`, its `error` says why (and lists the places
     /// searched), and it carries no transcript.
     ///
-    /// The audio is converted to the recogniser's 16 kHz here, after the model has been found (a
-    /// missing model is reported at once, not after minutes of conversion), so that this is the one
-    /// place the slow work happens and the caller's thread never does it.
+    /// All of the work is here, so that the thread that made the job never does it: after the model
+    /// has been found (a missing model is reported at once, not after minutes of rendering) the
+    /// track is rendered from the snapshot, converted to the recogniser's 16 kHz, and recognised.
+    /// `progress` is asked between render ranges and between stretches of the conversion, as well as
+    /// by the recogniser, so stopping takes effect within moments in every stage. The snapshot of the
+    /// session is let go as soon as the audio is rendered.
     pub fn run(self, progress: soundcraft_pa_speech::ProgressFn) -> Result<TranscribeOutcome> {
-        let TranscribeJob { track, sample_rate: sr, audio, recogniser, opts } = self;
-        let failed = |err: SpeechError| bad(TRANSCRIBE, format!("transcription failed: {err}"));
+        let TranscribeJob { track, sample_rate: sr, snapshot, recogniser, opts } = self;
 
         // A model must be on disk (and the speech feature built in) to recognise speech.
         let transcriber = match recogniser {
@@ -370,21 +459,35 @@ impl TranscribeJob {
                     let result = json!({
                         "status": "model_unavailable", "track": track.0, "model": model, "model_name": soundcraft_pa_speech::models::label(&model),
                         "reason": unavailable_reason(&err), "why": err.summary(), "error": err.to_string(),
-                        "samples_16k": samples_at_recogniser_rate(audio.len(), sr.hz()), "hint": model_hint()
+                        "samples_16k": samples_at_recogniser_rate(snapshot.samples(), sr.hz()), "hint": model_hint()
                     });
                     return Ok(TranscribeOutcome { result, transcript: None });
                 }
             },
         };
+        let stopped = || recogniser_failure(SpeechError::Cancelled);
 
-        if !progress(0.0, "Preparing audio") {
-            return Err(failed(SpeechError::Cancelled));
-        }
-        // High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's
-        // 16 kHz. The session-rate buffer is dropped as soon as it has been converted.
-        let audio = soundcraft_dsp::offline::resample(&[audio], sr.hz(), soundcraft_pa_speech::SAMPLE_RATE).into_iter().next().unwrap_or_default();
+        // 1. Render the track's clips (the snapshot goes with it).
+        let Some(mono) = snapshot.render(track, &mut |done, total| progress(bar(0.0, RENDER_SHARE, done, total), "Rendering audio"))? else {
+            return Err(stopped());
+        };
 
-        let produced = transcriber.transcribe(&audio, &opts, progress).map_err(failed)?;
+        // 2. High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's
+        // 16 kHz, a few seconds of output at a time. The session-rate buffer is dropped as soon as it
+        // has been converted.
+        let step = CONVERT_CHUNK_SECS * soundcraft_pa_speech::SAMPLE_RATE as usize;
+        let converted = convert_to_recogniser_rate(&mono, sr.hz(), step, &mut |done, total| {
+            progress(bar(RENDER_SHARE, PREPARE_SHARE - RENDER_SHARE, done, total), "Converting audio")
+        });
+        drop(mono);
+        let Some(audio) = converted else { return Err(stopped()) };
+
+        // 3. Recognise. The recogniser reports 0..1 over its own work; that is the rest of the bar.
+        let mut recognising = |fraction: f32, stage: &str| {
+            let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+            progress(PREPARE_SHARE + (1.0 - PREPARE_SHARE) * fraction, stage)
+        };
+        let produced = transcriber.transcribe(&audio, &opts, &mut recognising).map_err(recogniser_failure)?;
 
         let words = session_words(&produced.words, sr);
         let count = words.len();
@@ -393,6 +496,31 @@ impl TranscribeJob {
         let result = json!({"status": "ok", "track": track.0, "words": count, "language": language, "source": source, "text": text});
         Ok(TranscribeOutcome { result, transcript: Some(Transcript { track, words, language, source, speaker_names: Vec::new() }) })
     }
+}
+
+/// What the recogniser's model says when it is asked for a language it does not have.
+const UNKNOWN_LANGUAGE: &str = "does not know the language";
+/// What a recogniser that cannot find the next word says when it gives up.
+const DECODING_STOPPED: &str = "decoding stopped";
+
+/// The error for a recogniser that stopped or failed while it ran. It is the recogniser's, so it is
+/// worded as that and never as a complaint about the caller's parameters: a stop reads "Transcription
+/// stopped"; a model whose files are damaged says so and says where to look, on one line a status
+/// line can carry (the recogniser's own text follows on the next line, for agents and logs); any other
+/// failure is "Transcription failed: " and what the recogniser said.
+fn recogniser_failure(err: SpeechError) -> crate::EngineError {
+    let text = match &err {
+        SpeechError::Cancelled => "Transcription stopped".to_string(),
+        // A request the model cannot serve, or a decode that went nowhere: not the files' fault.
+        SpeechError::Model(why) if why.contains(UNKNOWN_LANGUAGE) || why.contains(DECODING_STOPPED) => format!("Transcription failed: {err}"),
+        // Everything else a running model reports (numbers that are not numbers, tensors of the wrong
+        // shape, a tokenizer that does not parse) means the model's files cannot be used.
+        SpeechError::Model(_) => {
+            format!("Transcription failed: the speech model's files are damaged — check the speech model's folder.\n{err}")
+        }
+        other => format!("Transcription failed: {other}"),
+    };
+    crate::EngineError::Io(text)
 }
 
 /// The recogniser's words as session words (origin: session start), held to exactly the rules
@@ -963,7 +1091,7 @@ mod tests {
         let recorder = Recorder::new(&[("hello", 0.5, 1.0), ("world", 1.25, 2.0)]);
         let job = transcribe_job_with_transcriber(&e, &json!({"track": t.0}), recorder.clone()).unwrap();
 
-        assert_eq!(job.gathered_samples() as i64, end, "the job carries the track as rendered: session rate, mono, not yet resampled");
+        assert_eq!(job.track_samples() as i64, end, "the job knows the track's length at the session rate");
         assert!((job.duration_secs() - end as f64 / sr.as_f64()).abs() < 1e-9);
         assert!(recorder.heard().is_empty(), "nothing has been recognised yet");
 
@@ -988,16 +1116,10 @@ mod tests {
         assert_eq!((stored.words[1].start, stored.words[1].end), (sr.samples(1.25), sr.samples(2.0)));
     }
 
-    /// The report: `transcribe_job` ran the sample-rate conversion (about 40 s for an hour of audio)
-    /// on the thread the menu or palette was waiting on. It must return having done only the render.
-    /// Structure first (the job holds 48 kHz audio, three times what 16 kHz would be), then, since
-    /// the two are measured in one process on one machine, that gathering costs less than the
-    /// conversion alone.
-    #[test]
-    fn a_long_track_is_gathered_without_being_converted() {
-        let seconds = 240usize;
+    /// A session with one mono track holding `seconds` of a tone at 48 kHz (and no clip effects).
+    fn tone_engine(seconds: usize) -> (Engine, TrackId, Vec<f32>) {
         let n = seconds * 48_000;
-        let tone: Vec<f32> = (0..n).map(|i| 0.3 * (i as f32 * 0.031).sin()).collect();
+        let tone: Vec<f32> = (0..n).map(|i| 0.3 * (i as f32 * 0.031).sin() + 0.05 * (i as f32 * 0.0071).cos()).collect();
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
         s.pool.insert(
@@ -1014,26 +1136,287 @@ mod tests {
             n as i64,
         ));
         assert_eq!(s.sample_rate.hz(), 48_000);
-        let e = Engine::new(s);
+        (Engine::new(s), t, tone)
+    }
 
-        let recorder = Recorder::new(&[]);
-        let started = std::time::Instant::now();
+    /// Ranges the current thread has rendered since [`reset_ranges`].
+    fn ranges() -> usize {
+        RANGES_RENDERED.with(std::cell::Cell::get)
+    }
+
+    fn reset_ranges() {
+        RANGES_RENDERED.with(|n| n.set(0));
+    }
+
+    fn limits_with_chunk(chunk_secs: usize) -> Limits {
+        Limits { chunk_secs, ..Limits::DEFAULT }
+    }
+
+    /// A transcriber that records the audio it heard, and how many holders the session had at the
+    /// time (`watch` is a handle on the session the test keeps, so its count is the engine's, the
+    /// test's and, while the job holds its snapshot, the job's).
+    struct Probe {
+        heard: std::sync::Mutex<Vec<f32>>,
+        watch: Arc<Session>,
+        holders: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl soundcraft_pa_speech::Transcriber for Probe {
+        fn id(&self) -> String {
+            "probe".into()
+        }
+        fn transcribe(
+            &self,
+            audio: &[f32],
+            _: &soundcraft_pa_speech::Options,
+            _: soundcraft_pa_speech::ProgressFn,
+        ) -> std::result::Result<soundcraft_pa_speech::Transcript, SpeechError> {
+            *self.heard.lock().unwrap() = audio.to_vec();
+            *self.holders.lock().unwrap() = Some(Arc::strong_count(&self.watch));
+            Ok(soundcraft_pa_speech::Transcript { words: Vec::new(), language: "en".into(), source: self.id() })
+        }
+    }
+
+    /// The report: `transcribe_job` rendered the track's clips (15.7 s an hour in a debug build, 9 to
+    /// 13 s in release, with clip effects) on the thread the menu or palette was waiting on, so a
+    /// three-hour track froze the app for 30 to 40 s. Making the job must render nothing: the job
+    /// holds a snapshot of the session and no audio, and every range is rendered on the thread that
+    /// runs it. Structural, not a stopwatch: the count of ranges rendered on this thread stays at 0
+    /// through `transcribe_job`, and the worker thread's count is the whole track.
+    #[test]
+    fn making_a_job_renders_nothing_and_the_worker_renders_all_of_it() {
+        let (e, t, _) = tone_engine(30);
+        let probe = Arc::new(Probe { heard: Default::default(), watch: e.session_arc(), holders: Default::default() });
+        let without_job = Arc::strong_count(&probe.watch);
+
+        reset_ranges();
+        let limits = limits_with_chunk(4);
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), Source::Given(probe.clone()), &limits).unwrap();
+        assert_eq!(ranges(), 0, "making the job rendered a range on the calling thread");
+        assert_eq!(Arc::strong_count(&probe.watch), without_job + 1, "the job holds a snapshot of the session (and no audio)");
+        assert_eq!(job.track_samples(), 30 * 48_000);
+        assert!(probe.heard.lock().unwrap().is_empty());
+
+        let worker = std::thread::spawn(move || {
+            reset_ranges();
+            let outcome = job.run(&mut |_, _| true);
+            (outcome.map(|o| o.result["status"].clone()), ranges())
+        });
+        let (status, worker_ranges) = worker.join().unwrap();
+        assert_eq!(status.unwrap(), "ok");
+        assert_eq!(worker_ranges, 8, "30 s in ranges of 4 s: the worker rendered every one");
+        assert_eq!(ranges(), 0, "and the calling thread still has not rendered any");
+        assert_eq!(probe.heard.lock().unwrap().len(), 30 * 16_000);
+        // The snapshot was let go when the audio was gathered, before the recogniser ran.
+        assert_eq!(*probe.holders.lock().unwrap(), Some(without_job), "the recogniser ran with the session already released");
+        assert_eq!(Arc::strong_count(&probe.watch), without_job);
+    }
+
+    /// A model that is missing is answered at once: nothing is rendered or converted for it.
+    #[test]
+    fn a_missing_model_is_reported_before_anything_is_rendered() {
+        let (e, t, _) = tone_engine(10);
+        reset_ranges();
+        let search = ModelSearch::default();
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), Source::Search(&search), &limits_with_chunk(1)).unwrap();
+        let out = job.run(&mut |_, _| panic!("no progress is reported before the model is found")).unwrap();
+        assert_eq!(out.result["status"], "model_unavailable");
+        assert_eq!(out.result["samples_16k"], 10 * 16_000);
+        assert_eq!(ranges(), 0);
+    }
+
+    /// The job's audio is the synchronous pipeline's audio: the recogniser hears the same samples
+    /// from a worker thread, for a track with clip effects (EQ and a compressor with lookahead,
+    /// which keep state across the render ranges), rendered in ranges that cross many seams.
+    #[test]
+    fn the_job_on_a_worker_hears_what_one_render_and_one_conversion_give() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let ids: Vec<_> = e.session().track(t).unwrap().clips().iter().map(|c| c.id).collect();
+        for id in ids {
+            for (k, v) in [("eq.mid_gain", 6.0), ("comp.threshold", -30.0), ("comp.ratio", 6.0), ("comp.release", 300.0), ("comp.lookahead", 8.0)] {
+                e.session_mut().edit.values.insert(format!("clip_fx.{}.{k}", id.0), v);
+            }
+        }
+        let sr = e.session().sample_rate;
+        let recorder = Recorder::new(&[("x", 0.0, 0.1)]);
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), Source::Given(recorder.clone()), &limits_with_chunk(1)).unwrap();
+        let before = one_shot_mono(&e, t);
+        let reference = soundcraft_dsp::offline::resample(std::slice::from_ref(&before), sr.hz(), soundcraft_pa_speech::SAMPLE_RATE).remove(0);
+        // Edits made after the job was made do not reach it: it renders the session as it was.
+        let ids: Vec<_> = e.session().track(t).unwrap().clips().iter().map(|c| c.id).collect();
+        for id in ids {
+            e.session_mut().edit.values.insert(format!("clip_fx.{}.eq.mid_gain", id.0), -20.0);
+        }
+        let moved = one_shot_mono(&e, t).iter().zip(&before).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(moved > 1e-3, "the edit changes the audio, so the check below proves something ({moved})");
+        std::thread::spawn(move || job.run(&mut |_, _| true).map(|o| o.result["status"].clone())).join().unwrap().unwrap();
+
+        let heard = recorder.heard();
+        assert_eq!(heard.len(), reference.len());
+        let worst = heard.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst <= 1e-5, "the worker's audio differs from one render and one conversion by {worst}");
+        assert!(heard.iter().any(|x| x.abs() > 0.01), "and it is not silence");
+    }
+
+    /// Stopping while the clips are rendered ends the job at the next range: the flag is looked at
+    /// before each one.
+    #[test]
+    fn stopping_while_the_clips_are_rendered_ends_the_job_between_ranges() {
+        let (e, t, _) = tone_engine(30);
+        let recorder = Recorder::new(&[("x", 0.0, 0.1)]);
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), Source::Given(recorder.clone()), &limits_with_chunk(4)).unwrap();
+        reset_ranges();
+        let mut asked = Vec::new();
+        let err = job
+            .run(&mut |fraction, stage| {
+                asked.push((fraction, stage.to_string()));
+                asked.len() < 3
+            })
+            .expect_err("stopped while rendering");
+        assert_eq!(err.to_string(), "Transcription stopped");
+        assert_eq!(asked.len(), 3, "asked before each of the first three ranges, and stopped at the third");
+        assert!(asked.iter().all(|(_, stage)| stage == "Rendering audio"), "{asked:?}");
+        assert_eq!(ranges(), 2, "the two ranges before the stop were rendered, the third was not");
+        assert!(recorder.heard().is_empty(), "the conversion and the recogniser never ran");
+    }
+
+    /// The conversion to 16 kHz looks at the flag every few seconds of audio, not once for the whole
+    /// track (the report: a Cancel left the app "stopping" for 2.4 minutes on the longest track).
+    #[test]
+    fn stopping_while_the_audio_is_converted_ends_the_job_within_a_stretch() {
+        let (e, t, _) = tone_engine(30); // 30 s: 480_000 samples at 16 kHz, six stretches of 5 s
+        let recorder = Recorder::new(&[("x", 0.0, 0.1)]);
         let job = transcribe_job_with_transcriber(&e, &json!({"track": t.0}), recorder.clone()).unwrap();
-        let gathered_in = started.elapsed();
-        assert_eq!(job.gathered_samples(), n, "{seconds} s at 48 kHz, not the {} samples it would be at 16 kHz", n / 3);
-        assert!((job.duration_secs() - seconds as f64).abs() < 1e-9);
+        let mut converting = 0;
+        let mut last = 0.0f32;
+        let err = job
+            .run(&mut |fraction, stage| {
+                if stage == "Converting audio" {
+                    converting += 1;
+                    last = fraction;
+                    return converting < 3;
+                }
+                true
+            })
+            .expect_err("stopped while converting");
+        assert_eq!(err.to_string(), "Transcription stopped");
+        assert_eq!(converting, 3, "asked before each stretch; the third said stop, so two stretches were converted");
+        assert!(last > RENDER_SHARE && last < PREPARE_SHARE, "the bar is inside the conversion's share: {last}");
+        assert!(recorder.heard().is_empty(), "the recogniser never ran");
+    }
 
-        let started = std::time::Instant::now();
-        let converted = soundcraft_dsp::offline::resample(&[tone], 48_000, soundcraft_pa_speech::SAMPLE_RATE);
-        let conversion = started.elapsed();
-        assert_eq!(converted[0].len(), n / 3);
+    /// Converting in stretches gives exactly the one-shot conversion, across stretch boundaries that
+    /// are aligned, unaligned and one big one, at the rates a session has.
+    #[test]
+    fn the_conversion_in_stretches_equals_the_one_shot_conversion() {
+        let x: Vec<f32> = (0..50_021).map(|i| 0.3 * (i as f32 * 0.037).sin() + 0.1 * (i as f32 * i as f32 * 1e-4).cos()).collect();
+        for hz in [8_000u32, 16_000, 22_050, 44_100, 48_000, 96_000, 192_000] {
+            let reference = soundcraft_dsp::offline::resample(std::slice::from_ref(&x), hz, soundcraft_pa_speech::SAMPLE_RATE).remove(0);
+            for step in [1_000usize, 4_093, 16_000, 80_000, usize::MAX] {
+                let mut stretches = 0;
+                let got = convert_to_recogniser_rate(&x, hz, step, &mut |_, _| {
+                    stretches += 1;
+                    true
+                })
+                .expect("not stopped");
+                assert_eq!(got.len(), reference.len(), "{hz} Hz, steps of {step}");
+                assert!(got == reference, "{hz} Hz, steps of {step}: not the same samples as one conversion");
+                if step == 4_093 && reference.len() > 3 * step {
+                    assert!(stretches >= 3, "{hz} Hz: several boundaries were crossed ({stretches} stretches)");
+                }
+            }
+        }
+        // An empty track converts to nothing, and asks nobody.
+        assert_eq!(convert_to_recogniser_rate(&[], 48_000, 1_000, &mut |_, _| panic!("nothing to convert")), Some(Vec::new()));
+    }
+
+    /// The conversion stops where it is told to: no more stretches are converted after the stop.
+    #[test]
+    fn the_conversion_stops_at_the_next_stretch() {
+        let x = vec![0.1f32; 48_000 * 20];
+        let mut asked = Vec::new();
+        let out = convert_to_recogniser_rate(&x, 48_000, 16_000, &mut |done, total| {
+            asked.push((done, total));
+            asked.len() < 4
+        });
+        assert!(out.is_none());
+        assert_eq!(asked, [(0, 320_000), (16_000, 320_000), (32_000, 320_000), (48_000, 320_000)]);
+    }
+
+    /// The bar only moves forward through the stages: render, convert, then the recogniser's own.
+    #[test]
+    fn progress_runs_forward_through_render_convert_and_recognise() {
+        let (e, t, _) = tone_engine(12);
+        let job = transcribe_job_limits(&e, &json!({"track": t.0}), Source::Given(Recorder::new(&[])), &limits_with_chunk(3)).unwrap();
+        let mut seen: Vec<(f32, String)> = Vec::new();
+        job.run(&mut |fraction, stage| {
+            seen.push((fraction, stage.to_string()));
+            true
+        })
+        .unwrap();
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "the bar never goes back: {seen:?}");
+        assert!(seen.iter().all(|(f, _)| (0.0..=1.0).contains(f)), "{seen:?}");
+        let stages: Vec<&str> = seen.iter().map(|(_, s)| s.as_str()).collect();
+        let first = |name: &str| stages.iter().position(|s| *s == name).unwrap_or_else(|| panic!("no `{name}` in {stages:?}"));
+        assert!(first("Rendering audio") < first("Converting audio") && first("Converting audio") < first("Recording"), "{stages:?}");
+        let recording = seen.iter().find(|(_, s)| s == "Recording").unwrap().0;
         assert!(
-            gathered_in < conversion,
-            "gathering took {gathered_in:?}, the conversion alone {conversion:?}: the job is doing the conversion up front"
+            (recording - (PREPARE_SHARE + (1.0 - PREPARE_SHARE) * 0.5)).abs() < 1e-6,
+            "the recogniser's 0.5 lands mid-way through the rest: {recording}"
         );
-        // `run` is where it happens.
-        job.run(&mut |_, _| true).unwrap();
-        assert_eq!(recorder.heard().len(), n / 3);
+    }
+
+    /// The report: a damaged model read "bad parameters for `track.transcribe`: transcription failed:
+    /// model: ...". A recogniser that fails is not a bad request, and the wording says what is wrong
+    /// and where to look.
+    #[test]
+    fn a_recogniser_that_fails_gets_its_own_wording_not_bad_parameters() {
+        let damaged = SpeechError::Model(
+            "the speech model produced invalid numbers in its audio analysis (not a number, or too large); its files may be damaged, so nothing was transcribed"
+                .into(),
+        );
+        let text = recogniser_failure(damaged.clone()).to_string();
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, "Transcription failed: the speech model's files are damaged — check the speech model's folder.");
+        assert!(text.contains("invalid numbers"), "the recogniser's own words follow, for agents and logs: {text}");
+        assert!(!text.contains("bad parameters") && !text.to_lowercase().contains("whisper"), "{text}");
+
+        assert_eq!(recogniser_failure(SpeechError::Cancelled).to_string(), "Transcription stopped");
+        for fine in [
+            SpeechError::Model("the model does not know the language `xx`".into()),
+            SpeechError::Model("decoding stopped: 8 windows in a row advanced by less than 0.1 s".into()),
+        ] {
+            let said = recogniser_failure(fine.clone()).to_string();
+            assert!(said.starts_with("Transcription failed: ") && !said.contains("damaged") && !said.contains('\n'), "{said}");
+        }
+        assert_eq!(
+            recogniser_failure(SpeechError::TooLong("5.0 hours".into())).to_string(),
+            "Transcription failed: the audio is too long to transcribe (5.0 hours)"
+        );
+
+        // And through a job: whatever a failing recogniser says, the error is not a parameter error.
+        struct Failing(SpeechError);
+        impl soundcraft_pa_speech::Transcriber for Failing {
+            fn id(&self) -> String {
+                "failing".into()
+            }
+            fn transcribe(
+                &self,
+                _: &[f32],
+                _: &soundcraft_pa_speech::Options,
+                _: soundcraft_pa_speech::ProgressFn,
+            ) -> std::result::Result<soundcraft_pa_speech::Transcript, SpeechError> {
+                Err(self.0.clone())
+            }
+        }
+        let e = demo_engine();
+        let t = first_audio(&e);
+        let err = transcribe_job_with_transcriber(&e, &json!({"track": t.0}), Arc::new(Failing(damaged))).unwrap().run(&mut |_, _| true).unwrap_err();
+        assert!(matches!(err, crate::EngineError::Io(_)), "{err:?}");
+        assert!(err.to_string().starts_with("Transcription failed: the speech model's files are damaged"), "{err}");
+        // A refused request still is one.
+        assert!(matches!(bad(TRANSCRIBE, "x"), crate::EngineError::BadParams(..)));
     }
 
     /// A job built with `transcribe_job_with_transcriber` never looks for a model, whatever
@@ -1060,6 +1443,7 @@ mod tests {
         let job = transcribe_job_with_transcriber(&e, &json!({"track": t.0}), recorder.clone()).unwrap();
         let err = job.run(&mut |_, _| false).expect_err("stopped");
         assert!(err.to_string().contains("stopped"), "{err}");
+        assert!(!err.to_string().contains("bad parameters"), "{err}");
         assert!(recorder.heard().is_empty(), "the conversion and the recogniser never ran");
     }
 

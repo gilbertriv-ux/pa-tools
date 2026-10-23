@@ -183,36 +183,44 @@ impl SincTable {
     }
 }
 
+/// Output sample `n` of a conversion by `ratio`, read at input time `n / ratio`. Every output
+/// sample depends on the input alone (never on another output sample), which is what lets
+/// [`Resampler`] produce any stretch of the output without the rest and still equal [`resample`]
+/// to the last bit.
+fn resample_sample(x: &[f32], ratio: f64, n: usize, table: &SincTable) -> f32 {
+    let len = x.len() as i64;
+    let hw = table.half_width;
+    let t = n as f64 / ratio;
+    let lo = (t - hw).ceil().max(0.0) as i64;
+    let hi = ((t + hw).floor() as i64).min(len - 1);
+    let mut acc = 0.0f32;
+    let mut j = lo;
+    while j <= hi {
+        if let Some(&v) = x.get(j as usize) {
+            acc += v * table.at(t - j as f64);
+        }
+        j += 1;
+    }
+    acc
+}
+
 /// Resamples one channel to exactly `out_len` samples, where output sample `n` is read at input
 /// time `n / ratio`.
 fn resample_channel(x: &[f32], ratio: f64, out_len: usize, table: &SincTable) -> Vec<f32> {
-    let len = x.len() as i64;
-    let hw = table.half_width;
-    (0..out_len)
-        .map(|n| {
-            let t = n as f64 / ratio;
-            let lo = (t - hw).ceil().max(0.0) as i64;
-            let hi = ((t + hw).floor() as i64).min(len - 1);
-            let mut acc = 0.0f32;
-            let mut j = lo;
-            while j <= hi {
-                if let Some(&v) = x.get(j as usize) {
-                    acc += v * table.at(t - j as f64);
-                }
-                j += 1;
-            }
-            acc
-        })
-        .collect()
+    (0..out_len).map(|n| resample_sample(x, ratio, n, table)).collect()
+}
+
+/// The anti-aliasing kernel for a conversion by `ratio` (below the lower of the two Nyquists, with
+/// a little transition room).
+fn kernel_for(ratio: f64) -> SincTable {
+    SincTable::new(if ratio < 1.0 { ratio * 0.94 } else { 0.97 })
 }
 
 fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> {
     if !ratio.is_finite() || ratio <= 0.0 {
         return ch.iter().map(|_| vec![0.0; out_len]).collect();
     }
-    // Anti-alias below the lower of the two Nyquists, with a little transition room.
-    let cutoff = if ratio < 1.0 { ratio * 0.94 } else { 0.97 };
-    let table = SincTable::new(cutoff);
+    let table = kernel_for(ratio);
     ch.iter().map(|c| resample_channel(c, ratio, out_len, &table)).collect()
 }
 
@@ -228,6 +236,61 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
             resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default()
         })
         .collect()
+}
+
+/// [`resample`] for one channel, read a stretch of the output at a time, so that a caller with a
+/// long recording can look at a stop button (or report progress) between stretches instead of
+/// waiting for the whole conversion. Each output sample is computed from the input alone, by the
+/// same arithmetic as [`resample`], so any split into stretches gives exactly the samples
+/// `resample` gives (the same bits, not just close): there is no seam to overlap or trim.
+///
+/// ```
+/// use soundcraft_dsp::offline::{Resampler, resample};
+/// let x: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin()).collect();
+/// let conv = Resampler::new(x.len(), 48_000, 16_000);
+/// let mut out = Vec::new();
+/// while out.len() < conv.out_len() {
+///     conv.render_into(&x, out.len(), 700, &mut out);
+/// }
+/// assert_eq!(out, resample(std::slice::from_ref(&x), 48_000, 16_000)[0]);
+/// ```
+pub struct Resampler {
+    ratio: f64,
+    out_len: usize,
+    /// `None` when the two rates are equal (or one is 0): the output is the input, as `resample` does.
+    table: Option<SincTable>,
+}
+
+impl Resampler {
+    /// A conversion of `in_len` samples at `from` Hz to `to` Hz. Rates that are equal or 0 give a
+    /// conversion that returns its input unchanged.
+    pub fn new(in_len: usize, from: u32, to: u32) -> Resampler {
+        if from == 0 || to == 0 || from == to {
+            return Resampler { ratio: 1.0, out_len: in_len, table: None };
+        }
+        let ratio = f64::from(to) / f64::from(from);
+        let out_len = ((in_len as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+        Resampler { ratio, out_len, table: Some(kernel_for(ratio)) }
+    }
+
+    /// How many samples the whole conversion produces (what `resample` returns).
+    pub fn out_len(&self) -> usize {
+        self.out_len
+    }
+
+    /// Appends output samples `start .. start + len` of the conversion of `x` to `out`, fewer if
+    /// that runs past [`Resampler::out_len`], none if `start` does. `x` is the whole input the
+    /// resampler was made for.
+    pub fn render_into(&self, x: &[f32], start: usize, len: usize, out: &mut Vec<f32>) {
+        let end = start.saturating_add(len).min(self.out_len);
+        if start >= end {
+            return;
+        }
+        match &self.table {
+            None => out.extend((start..end).map(|n| x.get(n).copied().unwrap_or(0.0))),
+            Some(table) => out.extend((start..end).map(|n| resample_sample(x, self.ratio, n, table))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -669,5 +732,88 @@ mod tests {
         assert_eq!(ch[0][99], 0.0);
         assert_eq!(ch[0][50], 1.0);
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
+    }
+
+    /// A signal with energy at every frequency and no repeats, so a wrong sample shows.
+    fn busy(n: usize) -> Vec<f32> {
+        let mut state = 0x9E37_79B9u32;
+        (0..n)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                0.4 * (i as f32 * 0.031).sin() + 0.2 * ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+            })
+            .collect()
+    }
+
+    /// The whole output of `conv` read `step` samples at a time.
+    fn in_steps(conv: &Resampler, x: &[f32], step: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        while out.len() < conv.out_len() {
+            let before = out.len();
+            conv.render_into(x, before, step, &mut out);
+            assert!(out.len() > before, "every step makes progress");
+        }
+        out
+    }
+
+    /// Reading the conversion in stretches gives exactly what the one-shot `resample` gives: the same
+    /// bits, for stretches that are aligned, unaligned, one sample long, and as long as the output,
+    /// across the rates the app converts (the recogniser's 16 kHz and the common session rates).
+    #[test]
+    fn a_conversion_read_in_stretches_equals_the_one_shot_conversion() {
+        let x = busy(30_011);
+        for (from, to) in [(48_000, 16_000), (44_100, 16_000), (96_000, 16_000), (192_000, 16_000), (8_000, 16_000), (16_000, 48_000)] {
+            let reference = resample(std::slice::from_ref(&x), from, to).remove(0);
+            let conv = Resampler::new(x.len(), from, to);
+            assert_eq!(conv.out_len(), reference.len(), "{from} -> {to}");
+            for step in [1, 7, 512, 4_096, 5_000, reference.len(), reference.len() + 9, usize::MAX] {
+                // One-sample steps over the whole input would be slow; one stretch is enough there.
+                if step == 1 {
+                    let mut head = Vec::new();
+                    for n in 0..300 {
+                        conv.render_into(&x, n, 1, &mut head);
+                    }
+                    assert_eq!(head, reference[..300], "{from} -> {to}, one sample at a time");
+                    continue;
+                }
+                assert_eq!(in_steps(&conv, &x, step), reference, "{from} -> {to}, steps of {step}");
+            }
+        }
+    }
+
+    /// Equal or zero rates return the input, as `resample` does, in stretches too.
+    #[test]
+    fn a_conversion_between_equal_rates_is_the_input() {
+        let x = busy(1_000);
+        for (from, to) in [(16_000, 16_000), (0, 16_000), (16_000, 0)] {
+            let conv = Resampler::new(x.len(), from, to);
+            assert_eq!(conv.out_len(), x.len());
+            assert_eq!(in_steps(&conv, &x, 333), x, "{from} -> {to}");
+            assert_eq!(resample(std::slice::from_ref(&x), from, to)[0], x);
+        }
+    }
+
+    /// Nothing a caller asks for can panic or run past the end of the conversion.
+    #[test]
+    fn a_stretch_outside_the_conversion_is_empty_or_cut() {
+        let x = busy(4_800);
+        let conv = Resampler::new(x.len(), 48_000, 16_000);
+        let mut out = Vec::new();
+        conv.render_into(&x, conv.out_len(), 10, &mut out);
+        conv.render_into(&x, usize::MAX, usize::MAX, &mut out);
+        conv.render_into(&x, 5, 0, &mut out);
+        assert!(out.is_empty());
+        conv.render_into(&x, conv.out_len() - 3, 100, &mut out);
+        assert_eq!(out.len(), 3, "cut at the end");
+        // An empty input converts to an empty output; an input shorter than claimed reads as silence.
+        let empty = Resampler::new(0, 48_000, 16_000);
+        assert_eq!(empty.out_len(), 0);
+        empty.render_into(&[], 0, 10, &mut out);
+        assert_eq!(out.len(), 3);
+        let liar = Resampler::new(4_800, 48_000, 16_000);
+        let mut quiet = Vec::new();
+        liar.render_into(&[], 0, usize::MAX, &mut quiet);
+        assert_eq!(quiet.len(), liar.out_len());
+        assert!(quiet.iter().all(|v| *v == 0.0));
     }
 }

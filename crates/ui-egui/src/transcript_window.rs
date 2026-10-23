@@ -3,7 +3,10 @@
 //! a speaker to name them.
 //!
 //! The speech model runs on a background thread (`track.transcribe`'s own job, see
-//! [`soundcraft_engine::cmd::transcribe_job`]) so the app keeps drawing; [`step`] collects its result
+//! [`soundcraft_engine::cmd::transcribe_job`]) so the app keeps drawing. Starting the job only takes a
+//! snapshot of the session: rendering the track's clips, converting the audio and recognising it all
+//! happen on that thread, and a Cancel is noticed between render ranges and conversion stretches too,
+//! not only by the recogniser. [`step`] collects its result
 //! on every frame, even while the window is hidden, and stores it with `track.set_transcript` like
 //! any other edit. Everything else the window does goes through commands too (`transport.locate`,
 //! `edit.select`, `track.rename_speaker`).
@@ -409,6 +412,8 @@ fn job_params(track: TrackId, models_dir: &str, language: Option<String>) -> Val
 
 /// What the window says while a stopped transcription is still winding down.
 const STOPPING: &str = "Stopping the previous transcription…";
+/// What it says once the stopped transcription's thread has ended.
+const STOPPED: &str = "Transcription stopped";
 
 /// Starts transcribing `track` on a worker thread.
 fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
@@ -480,7 +485,7 @@ pub(crate) fn cancel(app: &mut SoundApp) -> bool {
     if app.transcript.stopping.is_some() {
         set_status(app, STOPPING);
     } else {
-        set_status(app, "Transcription stopped");
+        set_status(app, STOPPED);
     }
     true
 }
@@ -498,9 +503,15 @@ fn reap_stopped(app: &mut SoundApp, ctx: &egui::Context) {
     {
         log::warn!("transcription: the stopped worker thread panicked");
     }
-    // Only replace the message it belongs to: something else may have been said since.
+    // Only replace the message it belongs to: something else may have been said since. The window's
+    // own status is the window's to change. The app's main status line is not: a stopped
+    // transcription that ends minutes after Recover or Open (which stop it) must not wipe their
+    // "Recovered ..." message, so the line is touched only while it still shows this very message.
     if app.transcript.status == STOPPING {
-        set_status(app, "Transcription stopped");
+        app.transcript.status = STOPPED.to_string();
+    }
+    if app.ui.status == STOPPING {
+        app.ui.status = STOPPED.to_string();
     }
     ctx.request_repaint();
 }
@@ -1497,6 +1508,39 @@ mod tests {
         start(&mut app, &ctx, track);
         assert!(app.transcript.job.is_some(), "Transcribe works again");
         step_until(&mut app, &ctx, |app| app.transcript.job.is_none());
+    }
+
+    /// The report: when a stopped thread ended, the window said "Transcription stopped" on the main
+    /// status line too, wiping the "Recovered ..." (or any other) message said since. Only the
+    /// window's own status line changes; the main one changes only while it still shows "Stopping...".
+    #[test]
+    fn a_stopped_thread_ending_leaves_the_main_status_line_alone() {
+        for said_since in [true, false] {
+            let (mut app, ctx) = (app(), egui::Context::default());
+            let track = first_audio(&app);
+            let (_tx, _) = fake_job(&mut app, track);
+            let (release, thread) = slow_worker();
+            if let Some(job) = &mut app.transcript.job {
+                job.thread = Some(thread);
+            }
+            assert!(cancel(&mut app));
+            assert!(app.transcript.is_stopping());
+            assert_eq!(app.ui.status, STOPPING);
+            let recovered = "Recovered “Song”. Save it to keep the changes.";
+            if said_since {
+                // What Recover and Open say once they have stopped the job and replaced the session.
+                app.ui.status = recovered.to_string();
+            }
+            drop(release);
+            step_until(&mut app, &ctx, |app| !app.transcript.is_stopping());
+            step(&mut app, &ctx);
+            assert_eq!(app.transcript.status, STOPPED, "the window says it stopped");
+            if said_since {
+                assert_eq!(app.ui.status, recovered, "the main line keeps what was said after the stop");
+            } else {
+                assert_eq!(app.ui.status, STOPPED, "the main line still showed `Stopping...`, so it moves on with the window");
+            }
+        }
     }
 
     /// A stopped job whose thread has already ended is not "stopping" at all.

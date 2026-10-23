@@ -164,3 +164,28 @@ two `xtask/src/main.rs` layer lines. The `transcribe` command + MCP tool, transc
   always searches.
 - Cancel keeps the worker's `JoinHandle`. Until that thread has ended the window says "Stopping the
   previous transcription…", the Transcribe button is off, and no new job starts.
+
+## Addendum — long tracks (what differs again)
+- `transcribe_job` (the menu, the palette, the Transcript window) now renders nothing. It checks the
+  request, refuses a track that is too long, and takes a snapshot of the session (`Engine::session_arc`,
+  as `bounce_job` does); the job holds that snapshot and no audio. `TranscribeJob::run` renders the
+  track's clips (in the same 60 s ranges, with the same run-in), converts to 16 kHz and recognises, all
+  on the worker, so a three-hour track no longer freezes the app for 30–40 s while it starts. The
+  snapshot is let go as soon as the audio is rendered, not held through the recognition. Edits made
+  after the job was made do not reach it. `track.transcribe` (synchronous) and the CLI behave as before.
+  `TranscribeJob::gathered_samples` is now `track_samples` (the length the worker will render).
+- Stopping is noticed in every stage. `run`'s progress callback is asked before each render range
+  ("Rendering audio") and before each 5 s stretch of the conversion ("Converting audio"), as well as
+  by the recogniser; `false` ends the job with "Transcription stopped". The conversion uses the new
+  `soundcraft_dsp::offline::Resampler`, which produces any stretch of the output from the input alone
+  by the arithmetic `resample` uses, so a conversion in stretches is bit-identical to the one-shot one
+  (there is no seam to overlap or trim). The bar runs 0–3 % rendering, 3–10 % converting, then the
+  recogniser's own 0–1 over the rest.
+- A recogniser that fails while it runs is not a bad request. The error is `Transcription stopped` for
+  a stop, `Transcription failed: the speech model's files are damaged — check the speech model's
+  folder.` (the recogniser's own text on the next line) for a model that fails on its own files, and
+  `Transcription failed: <what the recogniser said>` for a language it does not have, a decode that
+  went nowhere or any other failure. None of them reads "bad parameters for `track.transcribe`".
+- When a stopped transcription's thread ends, the window sets its own status ("Transcription stopped")
+  and touches the app's main status line only while that still reads "Stopping the previous
+  transcription…", so a "Recovered …" message said since stays.

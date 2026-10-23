@@ -752,7 +752,7 @@ fn painted(rig: &Rig) -> String {
 fn assert_no_third_party_names(rig: &Rig, state: &str) {
     let text = painted(rig);
     assert!(!text.is_empty(), "{state}: nothing was painted");
-    for name in ["whisper", "openai", "hugging face"] {
+    for name in ["whisper", "openai", "hugging face", "huggingface"] {
         assert!(!text.contains(name), "{state}: the window paints `{name}`:\n{text}");
     }
 }
@@ -811,4 +811,112 @@ fn the_window_paints_no_third_party_names_with_a_stored_transcript() {
         };
         assert!(text.contains(expect), "hovering {label:?} should show `{expect}`:\n{text}");
     }
+}
+
+// ---- the error states ---------------------------------------------------------------------
+
+/// A recogniser whose model runs and then fails the way a model with damaged files does.
+struct Damaged;
+
+impl soundcraft_pa_speech::Transcriber for Damaged {
+    fn id(&self) -> String {
+        "damaged".into()
+    }
+    fn transcribe(
+        &self,
+        _: &[f32],
+        _: &soundcraft_pa_speech::Options,
+        _: soundcraft_pa_speech::ProgressFn,
+    ) -> Result<Transcript, soundcraft_pa_speech::SpeechError> {
+        Err(soundcraft_pa_speech::SpeechError::Model(
+            "the speech model produced invalid numbers in its audio analysis (not a number, or too large); its files may be damaged, so nothing was transcribed"
+                .into(),
+        ))
+    }
+}
+
+/// What every error state must be: a sentence for people, painted in the window and on the main
+/// status line, naming no third-party product and no command, parameter or internal error.
+fn assert_error_state_reads_well(rig: &Rig, state: &str, expect: &[&str]) {
+    let status = rig.app.transcript.status.clone();
+    assert_eq!(rig.app.ui.status, status, "{state}: the main status line says it too");
+    assert!(rig.find(&status).is_some(), "{state}: the window paints its status `{status}`: {:?}", rig.texts());
+    for part in expect {
+        assert!(status.contains(part), "{state}: `{status}` should contain `{part}`");
+    }
+    let text = painted(rig);
+    for bad in ["bad parameters", "track.transcribe", "internal error", "panicked", "failed: model"] {
+        assert!(!text.contains(bad), "{state}: the window paints `{bad}`:\n{text}");
+    }
+    assert_no_third_party_names(rig, state);
+}
+
+#[test]
+fn the_window_paints_no_third_party_names_in_its_error_states() {
+    // 1. The model is missing.
+    let mut rig = Rig::new();
+    no_models(&mut rig, "error-missing");
+    open(&mut rig);
+    let at = rig.at("Transcribe Track");
+    rig.click(at);
+    finish_job(&mut rig);
+    assert_error_state_reads_well(&rig, "model missing", &["Speech model, base (multilingual)", "Models folder"]);
+
+    // 2. The model's files are there and cannot be used (only a build that can recognise speech
+    //    looks inside them; the other build says what it cannot do, covered by `model missing`).
+    if soundcraft_pa_speech::available() {
+        let mut rig = Rig::new();
+        let dir = std::env::temp_dir().join(format!("pa-tools-transcript-error-placeholder-{}", std::process::id()));
+        let model = soundcraft_pa_speech::models::find(soundcraft_pa_speech::models::DEFAULT_MODEL).expect("the default model is in the catalogue");
+        let model_dir = soundcraft_pa_speech::models::model_dir(&dir, model);
+        std::fs::create_dir_all(&model_dir).expect("scratch folder");
+        for f in model.files {
+            std::fs::File::create(model_dir.join(f.name)).and_then(|file| file.set_len(f.size)).expect("placeholder file");
+        }
+        rig.app.transcript.models_dir = dir.to_string_lossy().into_owned();
+        open(&mut rig);
+        let at = rig.at("Transcribe Track");
+        rig.click(at);
+        finish_job(&mut rig);
+        assert_error_state_reads_well(&rig, "model files unusable", &["Check the speech model's folder"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 3. The model loads and fails while it runs: its files are damaged.
+    let mut rig = Rig::new();
+    rig.app.transcript.inject_transcriber(Arc::new(Damaged));
+    open(&mut rig);
+    let at = rig.at("Transcribe Track");
+    rig.click(at);
+    finish_job(&mut rig);
+    assert_error_state_reads_well(
+        &rig,
+        "damaged model",
+        &["Transcription failed", "the speech model's files are damaged", "check the speech model's folder"],
+    );
+    assert_eq!(rig.app.transcript.status, "Transcription failed: the speech model's files are damaged — check the speech model's folder.");
+    assert!(rig.app.engine.session().transcripts.is_empty(), "nothing was stored");
+
+    // 4. Cancelled while the recogniser is busy: first "Stopping...", then "Transcription stopped".
+    let mut rig = Rig::new();
+    let (release, gate) = std::sync::mpsc::channel();
+    rig.app.transcript.inject_transcriber(Arc::new(Gated { release: std::sync::Mutex::new(gate) }));
+    open(&mut rig);
+    let at = rig.at("Transcribe Track");
+    rig.click(at);
+    rig.frames(2);
+    let at = rig.at("Cancel");
+    rig.click(at);
+    assert!(rig.app.transcript.is_stopping());
+    assert_error_state_reads_well(&rig, "stopping", &["Stopping the previous transcription"]);
+    drop(release);
+    let until = Instant::now() + Duration::from_secs(10);
+    while rig.app.transcript.is_stopping() && Instant::now() < until {
+        rig.frame(vec![]);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    rig.frames(3);
+    assert!(!rig.app.transcript.is_stopping());
+    assert_error_state_reads_well(&rig, "cancelled", &["Transcription stopped"]);
+    assert_eq!(rig.app.transcript.status, "Transcription stopped");
 }
