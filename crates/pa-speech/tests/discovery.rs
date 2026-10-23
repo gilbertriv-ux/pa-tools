@@ -124,44 +124,61 @@ fn env_of(pairs: &[(&'static str, String)]) -> impl Fn(&str) -> Option<OsString>
     move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(v))
 }
 
+/// A path built the way the code under test builds one (`PathBuf::join`), so that an expectation
+/// holds on every host. The simulated platforms differ in *which* folders they use; the separator
+/// and the notion of "absolute" are the host's, because that is what `PathBuf` is. The exact text of
+/// a path as spelled on this host is pinned by the `#[cfg]` tests below.
+fn joined(base: &str, parts: &[&str]) -> PathBuf {
+    parts.iter().fold(PathBuf::from(base), |path, part| path.join(part))
+}
+
+/// A folder that is absolute on this host: `/data` has no root on Windows (it needs a drive), so
+/// a test of "an absolute `XDG_DATA_HOME` is honoured" must not hard-code the Unix spelling.
+fn absolute(name: &str) -> String {
+    if cfg!(windows) { format!("C:\\{name}") } else { format!("/{name}") }
+}
+
 #[test]
 fn locations_follow_each_platforms_conventions() {
     let none: Option<&Path> = None;
 
-    let mac = ModelSearch::from_parts(Platform::Mac, "Pa Tools", "patools", env_of(&[("HOME", "/Users/gil".into())]), none);
-    assert_eq!(mac.app_support, Some(PathBuf::from("/Users/gil/Library/Application Support/Pa Tools/models")));
+    let mac = ModelSearch::from_parts(Platform::Mac, "Pa Tools", "patools", env_of(&[("HOME", "/Users/user".into())]), none);
+    assert_eq!(mac.app_support, Some(joined("/Users/user", &["Library", "Application Support", "Pa Tools", "models"])));
     assert_eq!((mac.env, mac.bundle_resources), (None, None));
 
     // Windows: the local (non-roaming) folder first, the roaming one only as the fallback.
-    let both = [("LOCALAPPDATA", "C:\\Users\\gil\\AppData\\Local".to_string()), ("APPDATA", "C:\\Users\\gil\\AppData\\Roaming".to_string())];
+    let both = [("LOCALAPPDATA", "C:\\Users\\user\\AppData\\Local".to_string()), ("APPDATA", "C:\\Users\\user\\AppData\\Roaming".to_string())];
     let win = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both), none);
-    assert_eq!(win.app_support, Some(PathBuf::from("C:\\Users\\gil\\AppData\\Local").join("Pa Tools").join("models")));
+    assert_eq!(win.app_support, Some(joined("C:\\Users\\user\\AppData\\Local", &["Pa Tools", "models"])));
     let roaming_only = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both[1..]), none);
-    assert_eq!(roaming_only.app_support, Some(PathBuf::from("C:\\Users\\gil\\AppData\\Roaming").join("Pa Tools").join("models")));
+    assert_eq!(roaming_only.app_support, Some(joined("C:\\Users\\user\\AppData\\Roaming", &["Pa Tools", "models"])));
     let empty_local = [("LOCALAPPDATA", String::new()), both[1].clone()];
     let ignores_empty = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&empty_local), none);
     assert_eq!(ignores_empty.app_support, roaming_only.app_support, "an empty LOCALAPPDATA counts as unset");
 
+    // Elsewhere: an absolute XDG_DATA_HOME, else ~/.local/share.
+    let data = absolute("data");
     let xdg = ModelSearch::from_parts(
         Platform::Other,
         "Pa Tools",
         "patools",
-        env_of(&[("XDG_DATA_HOME", "/data".into()), ("HOME", "/home/gil".into())]),
+        env_of(&[("XDG_DATA_HOME", data.clone()), ("HOME", "/home/user".into())]),
         none,
     );
-    assert_eq!(xdg.app_support, Some(PathBuf::from("/data/patools/models")));
-    let home = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("HOME", "/home/gil".into())]), none);
-    assert_eq!(home.app_support, Some(PathBuf::from("/home/gil/.local/share/patools/models")));
+    assert_eq!(xdg.app_support, Some(joined(&data, &["patools", "models"])));
+    let home_share = joined("/home/user", &[".local", "share", "patools", "models"]);
+    let home = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("HOME", "/home/user".into())]), none);
+    assert_eq!(home.app_support, Some(home_share.clone()));
     // A relative or empty XDG_DATA_HOME is ignored (as the XDG rules say).
     for bad in ["relative/dir", ""] {
         let s = ModelSearch::from_parts(
             Platform::Other,
             "Pa Tools",
             "patools",
-            env_of(&[("XDG_DATA_HOME", bad.into()), ("HOME", "/home/gil".into())]),
+            env_of(&[("XDG_DATA_HOME", bad.into()), ("HOME", "/home/user".into())]),
             none,
         );
-        assert_eq!(s.app_support, Some(PathBuf::from("/home/gil/.local/share/patools/models")), "XDG_DATA_HOME={bad:?}");
+        assert_eq!(s.app_support, Some(home_share.clone()), "XDG_DATA_HOME={bad:?}");
     }
 
     // No home folder, no location: the tier is absent, not a guess.
@@ -169,8 +186,45 @@ fn locations_follow_each_platforms_conventions() {
         assert_eq!(ModelSearch::from_parts(platform, "Pa Tools", "patools", env_of(&[]), none), ModelSearch::default(), "{platform:?}");
     }
     // The Linux folder is the name the caller passes, not something derived from the product name.
-    let named = ModelSearch::from_parts(Platform::Other, "Pa Tools", "some-other-name", env_of(&[("HOME", "/home/gil".into())]), none);
-    assert_eq!(named.app_support, Some(PathBuf::from("/home/gil/.local/share/some-other-name/models")));
+    let named = ModelSearch::from_parts(Platform::Other, "Pa Tools", "some-other-name", env_of(&[("HOME", "/home/user".into())]), none);
+    assert_eq!(named.app_support, Some(joined("/home/user", &[".local", "share", "some-other-name", "models"])));
+}
+
+/// The text of a path is the host's: on Windows the real folder is `%LOCALAPPDATA%\Pa Tools\models`
+/// (drive, backslashes), and the program's own search on this machine reads the Windows variables.
+/// `PathBuf` equality compares components, so these compare the spelled-out text, which is what the
+/// user sees in the "searched" list of the error.
+#[cfg(windows)]
+#[test]
+fn on_windows_the_models_folder_is_a_backslash_path_under_the_local_app_data_folder() {
+    let both = [("LOCALAPPDATA", r"C:\Users\user\AppData\Local".to_string()), ("APPDATA", r"C:\Users\user\AppData\Roaming".to_string())];
+    let win = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both), None);
+    assert_eq!(win.app_support.as_deref().and_then(Path::to_str), Some(r"C:\Users\user\AppData\Local\Pa Tools\models"));
+    let roaming = ModelSearch::from_parts(Platform::Windows, "Pa Tools", "patools", env_of(&both[1..]), None);
+    assert_eq!(roaming.app_support.as_deref().and_then(Path::to_str), Some(r"C:\Users\user\AppData\Roaming\Pa Tools\models"));
+
+    // The search for this machine: the platform is Windows, and it reads this machine's variables.
+    assert_eq!(Platform::current(), Platform::Windows);
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let expected = var("LOCALAPPDATA").or_else(|| var("APPDATA")).map(|base| PathBuf::from(base).join("Pa Tools").join("models"));
+    let real = ModelSearch::from_environment("Pa Tools", "patools");
+    assert_eq!(real.app_support, expected);
+    if let Some(text) = real.app_support.as_deref().and_then(Path::to_str) {
+        assert!(text.ends_with(r"\Pa Tools\models"), "{text}");
+    }
+}
+
+/// Everywhere else the folders are spelled with forward slashes (compared as text, not components).
+#[cfg(not(windows))]
+#[test]
+fn off_windows_the_models_folders_are_forward_slash_paths() {
+    let text = |s: ModelSearch| s.app_support.as_deref().and_then(Path::to_str).map(str::to_string);
+    let mac = ModelSearch::from_parts(Platform::Mac, "Pa Tools", "patools", env_of(&[("HOME", "/Users/user".into())]), None);
+    assert_eq!(text(mac).as_deref(), Some("/Users/user/Library/Application Support/Pa Tools/models"));
+    let xdg = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("XDG_DATA_HOME", "/data".into())]), None);
+    assert_eq!(text(xdg).as_deref(), Some("/data/patools/models"));
+    let home = ModelSearch::from_parts(Platform::Other, "Pa Tools", "patools", env_of(&[("HOME", "/home/user".into())]), None);
+    assert_eq!(text(home).as_deref(), Some("/home/user/.local/share/patools/models"));
 }
 
 #[test]

@@ -114,7 +114,8 @@ fn read_fixture(path: &std::path::Path) -> Vec<f32> {
         path.display(),
         bytes.len()
     );
-    let audio: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let (samples, _) = bytes.as_chunks::<4>();
+    let audio: Vec<f32> = samples.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert!(audio.iter().all(|v| v.is_finite()), "fixture {} holds non-finite samples", path.display());
     audio
 }

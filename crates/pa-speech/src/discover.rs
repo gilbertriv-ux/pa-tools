@@ -76,6 +76,10 @@ impl ModelSearch {
 
     /// [`from_environment`](Self::from_environment) with the environment lookup, the executable's
     /// path and the platform given. An unset or empty variable counts as absent.
+    ///
+    /// `platform` chooses which variables and folders are used. The spelling of the paths is the
+    /// host's (`PathBuf`'s separator, and what counts as an absolute `XDG_DATA_HOME`), so naming a
+    /// platform other than [`Platform::current`] is for tests of the conventions only.
     pub fn from_parts(
         platform: Platform,
         product_folder: &str,

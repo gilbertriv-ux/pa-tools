@@ -317,10 +317,10 @@ fn check_finite(weights: &[u8]) -> Result<()> {
         let data = view.data();
         // The exponent field all ones is infinity (mantissa zero) or NaN (mantissa not): not finite.
         let non_finite = match DType::try_from(view.dtype()) {
-            Ok(DType::F32) => data.chunks_exact(4).any(|c| <[u8; 4]>::try_from(c).map_or(true, |b| !f32::from_le_bytes(b).is_finite())),
-            Ok(DType::F64) => data.chunks_exact(8).any(|c| <[u8; 8]>::try_from(c).map_or(true, |b| !f64::from_le_bytes(b).is_finite())),
-            Ok(DType::F16) => data.chunks_exact(2).any(|c| <[u8; 2]>::try_from(c).map_or(true, |b| (u16::from_le_bytes(b) >> 10) & 0x1F == 0x1F)),
-            Ok(DType::BF16) => data.chunks_exact(2).any(|c| <[u8; 2]>::try_from(c).map_or(true, |b| (u16::from_le_bytes(b) >> 7) & 0xFF == 0xFF)),
+            Ok(DType::F32) => data.as_chunks::<4>().0.iter().any(|b| !f32::from_le_bytes(*b).is_finite()),
+            Ok(DType::F64) => data.as_chunks::<8>().0.iter().any(|b| !f64::from_le_bytes(*b).is_finite()),
+            Ok(DType::F16) => data.as_chunks::<2>().0.iter().any(|b| (u16::from_le_bytes(*b) >> 10) & 0x1F == 0x1F),
+            Ok(DType::BF16) => data.as_chunks::<2>().0.iter().any(|b| (u16::from_le_bytes(*b) >> 7) & 0xFF == 0xFF),
             _ => false,
         };
         if non_finite {

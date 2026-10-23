@@ -572,9 +572,28 @@ fn without_an_injected_recogniser_the_window_looks_for_the_model() {
 }
 
 /// A recogniser that does not answer until it is released, and then notices it was stopped: the
-/// shape of a model that takes a while to see the Cancel.
+/// shape of a model that takes a while to see the Cancel. It tells the test the moment it is entered
+/// (`entered`), because a job renders and converts the audio on its worker first, and a Cancel that
+/// lands before that stops the job there, without ever reaching the recogniser: how long that takes
+/// depends on the machine, so a test that needs the worker to be *inside* the recogniser waits for
+/// this signal instead of assuming it from a count of frames.
 struct Gated {
+    entered: std::sync::mpsc::Sender<()>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Gated {
+    /// The recogniser, the sender that releases it, and the receiver that says it was entered.
+    fn new() -> (Arc<Gated>, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+        let (release, gate) = std::sync::mpsc::channel();
+        let (entered, was_entered) = std::sync::mpsc::channel();
+        (Arc::new(Gated { entered, release: std::sync::Mutex::new(gate) }), release, was_entered)
+    }
+}
+
+/// Waits (up to thirty seconds) until the worker of a job is inside a [`Gated`] recogniser.
+fn wait_until_entered(was_entered: &std::sync::mpsc::Receiver<()>) {
+    was_entered.recv_timeout(Duration::from_secs(30)).expect("the job's worker reached the recogniser");
 }
 
 impl soundcraft_pa_speech::Transcriber for Gated {
@@ -587,6 +606,7 @@ impl soundcraft_pa_speech::Transcriber for Gated {
         _: &soundcraft_pa_speech::Options,
         progress: soundcraft_pa_speech::ProgressFn,
     ) -> Result<Transcript, soundcraft_pa_speech::SpeechError> {
+        let _ = self.entered.send(());
         // Blocks until the test sends or drops its end; either way the job then looks at its stop flag.
         let _ = self.release.lock().map(|r| r.recv());
         if progress(0.5, "Working") {
@@ -602,12 +622,15 @@ impl soundcraft_pa_speech::Transcriber for Gated {
 #[test]
 fn after_cancel_a_new_job_waits_for_the_old_thread_then_runs() {
     let (mut rig, track) = rig_with_recogniser();
-    let (release, gate) = std::sync::mpsc::channel();
-    rig.app.transcript.inject_transcriber(Arc::new(Gated { release: std::sync::Mutex::new(gate) }));
+    let (gated, release, was_entered) = Gated::new();
+    rig.app.transcript.inject_transcriber(gated);
     open(&mut rig);
     let at = rig.at("Transcribe Track");
     rig.click(at);
     assert!(rig.app.transcript.is_running(), "the first job is under way");
+    // Cancel only once the worker is parked inside the recogniser: until then it is still rendering
+    // and would end at the Cancel by itself, which on a slow machine happens before the checks below.
+    wait_until_entered(&was_entered);
 
     rig.frames(2);
     let at = rig.at("Cancel");
@@ -656,6 +679,54 @@ fn rig_recogniser_swap(rig: &mut Rig) {
     rig.app.transcript.inject_transcriber(fixed_recogniser());
 }
 
+/// The report behind the window's status line: a stopped job's thread that ends *after* a new job
+/// was started (it had finished, but the window had not noticed yet) must not touch the new job's
+/// status. Nothing here waits on a clock: the old worker is held in its recogniser until the test
+/// releases it, the new one likewise, and each step happens only once the one before has.
+#[test]
+fn a_stopped_thread_that_is_noticed_after_a_new_job_started_leaves_that_job_alone() {
+    let (mut rig, track) = rig_with_recogniser();
+    let name = rig.app.engine.session().track(track).map(|t| t.name.clone()).expect("the track has a name");
+    let (old, release_old, old_entered) = Gated::new();
+    rig.app.transcript.inject_transcriber(old);
+    open(&mut rig);
+    let at = rig.at("Transcribe Track");
+    rig.click(at);
+    wait_until_entered(&old_entered);
+    let at = rig.at("Cancel");
+    rig.click(at);
+    assert!(rig.app.transcript.is_stopping());
+    assert_eq!(rig.app.transcript.status, "Stopping the previous transcription…");
+
+    // The old worker ends, and no frame runs, so the window has not noticed.
+    drop(release_old);
+    let until = Instant::now() + Duration::from_secs(10);
+    while rig.app.transcript.is_stopping() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!rig.app.transcript.is_stopping(), "the old worker ended");
+    assert_eq!(rig.app.transcript.status, "Stopping the previous transcription…", "no frame has run since");
+
+    // A new job starts in that gap, and is held inside its recogniser.
+    let (new, release_new, new_entered) = Gated::new();
+    rig.app.transcript.inject_transcriber(new);
+    menus::invoke_menu(&mut rig.app, "track.transcribe", "Track > Transcribe Track");
+    assert!(rig.app.transcript.is_running(), "the old thread had ended, so the new job started");
+    assert_eq!(rig.app.transcript.status, format!("Transcribing {name}..."));
+    wait_until_entered(&new_entered);
+
+    // Now the window notices the old thread. The new job's status stays the new job's.
+    rig.frames(3);
+    assert!(rig.app.transcript.is_running());
+    assert_eq!(rig.app.transcript.status, format!("Transcribing {name}..."), "the old thread's `stopped` did not replace it");
+
+    // The new job runs to the end and its own result is the last word.
+    drop(release_new);
+    finish_job(&mut rig);
+    assert_eq!(rig.app.transcript.status, "Transcribed 1 word");
+    assert_eq!(rig.app.engine.session().transcript(track).map(|t| t.text()).as_deref(), Some("late"));
+}
+
 // ---- the real model, through the window ----------------------------------------------------
 
 /// With `$PA_SPEECH_MODELS_DIR` and `$PA_SPEECH_FIXTURE` (a mono 16 kHz f32 raw clip) set, in a
@@ -676,7 +747,8 @@ fn the_real_model_transcribes_a_track_through_the_window() {
     }
     let keyword = env("PA_SPEECH_FIXTURE_KEYWORD").expect("PA_SPEECH_FIXTURE_KEYWORD names a word the clip says").to_lowercase();
     let raw = std::fs::read(&fixture).expect("read the fixture");
-    let clip: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let (samples, _) = raw.as_chunks::<4>();
+    let clip: Vec<f32> = samples.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert!(!clip.is_empty());
 
     // The clip as a 48 kHz WAV on disk, imported like a person would.
@@ -903,11 +975,12 @@ fn the_window_paints_no_third_party_names_in_its_error_states() {
 
     // 4. Cancelled while the recogniser is busy: first "Stopping...", then "Transcription stopped".
     let mut rig = Rig::new();
-    let (release, gate) = std::sync::mpsc::channel();
-    rig.app.transcript.inject_transcriber(Arc::new(Gated { release: std::sync::Mutex::new(gate) }));
+    let (gated, release, was_entered) = Gated::new();
+    rig.app.transcript.inject_transcriber(gated);
     open(&mut rig);
     let at = rig.at("Transcribe Track");
     rig.click(at);
+    wait_until_entered(&was_entered);
     rig.frames(2);
     let at = rig.at("Cancel");
     rig.click(at);

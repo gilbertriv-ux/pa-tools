@@ -182,7 +182,7 @@ impl Whisper {
         let end = seek.saturating_add(N_FRAMES).min(frames);
         if seek < end {
             // one mel band per row: `frames` values in the spectrogram, `N_FRAMES` in the window
-            for (dst, src) in w.chunks_exact_mut(N_FRAMES).zip(mel.chunks_exact(frames.max(1))) {
+            for (dst, src) in w.as_chunks_mut::<N_FRAMES>().0.iter_mut().zip(mel.chunks_exact(frames.max(1))) {
                 if let (Some(d), Some(s)) = (dst.get_mut(..end - seek), src.get(seek..end)) {
                     d.copy_from_slice(s);
                 }
