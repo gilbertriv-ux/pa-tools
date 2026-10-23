@@ -66,10 +66,10 @@ impl<'a> BitReader<'a> {
         self.pos = pos;
     }
 
-    /// Peek up to 32 bits without consuming (zero-padded past the end).
+    /// Peek up to 32 bits without consuming (zero-padded past the end). A larger `n` reads 32.
     #[inline]
     pub fn peek(&self, n: u32) -> u32 {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return 0;
         }
@@ -185,8 +185,9 @@ impl BitWriter {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Append the low `n` bits of `value` (at most 32; a larger `n` writes 32).
     pub fn write_bits(&mut self, value: u32, n: u32) {
-        debug_assert!(n <= 32);
+        let n = n.min(32);
         if n == 0 {
             return;
         }
@@ -363,6 +364,21 @@ mod tests {
         assert_eq!(r.read_bits(8).unwrap(), 0b1100_0101);
         assert_eq!(r.bits_left(), 4);
         assert_eq!(r.read_bits(5), Err(BitError::Eof));
+    }
+
+    /// No debug-only assertions in this crate: an over-long request is a checked path (it reads or writes 32
+    /// bits), never a panic in a debug build and a silent wrong shift in a release one.
+    #[test]
+    fn over_long_bit_counts_are_clamped_not_asserted() {
+        let d = [0xff, 0x00, 0xff, 0x00, 0xff, 0x00];
+        let r = BitReader::new(&d);
+        assert_eq!(r.peek(32), 0xff00_ff00);
+        assert_eq!(r.peek(33), r.peek(32));
+        assert_eq!(r.peek(u32::MAX), r.peek(32));
+        let mut w = BitWriter::new();
+        w.write_bits(0xdead_beef, 40);
+        w.write_bits(1, u32::MAX);
+        assert_eq!(w.finish(), [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x01]);
     }
 
     #[test]

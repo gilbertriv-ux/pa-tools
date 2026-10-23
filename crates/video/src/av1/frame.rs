@@ -313,7 +313,10 @@ impl MiInfo {
     #[inline(always)]
     pub fn idx(&self, row: usize, col: usize) -> usize {
         // The tile decoder only asks for positions inside the region; a violation fails the bounds check of
-        // the access that follows (and is contained at the frame boundary), never reads outside.
+        // the access that follows (never reads outside) and is contained at the frame boundary by
+        // `run_job`'s `catch_unwind`, which does nothing under `panic = "abort"` or on wasm32 (see
+        // docs/video-codecs.md). There is deliberately no `debug_assert!` here or anywhere in this
+        // crate: an invariant a file can reach is a checked path, not a debug-only panic.
         (row - self.oy) * self.stride + col - self.ox
     }
 
