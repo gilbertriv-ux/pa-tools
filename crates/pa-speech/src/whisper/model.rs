@@ -28,31 +28,74 @@ pub struct Config {
     pub vocab_size: usize,
 }
 
+/// Largest values a `config.json` may declare. Real models are far inside these (the biggest has
+/// 1280 channels, 32 layers, 20 heads, 128 mel bins, about 52 000 tokens); they exist so that a
+/// damaged or hostile file cannot size a table, a loop or a division from its numbers.
+pub const MAX_MELS: usize = 256;
+pub const MAX_WIDTH: usize = 4096;
+pub const MAX_HEADS: usize = 128;
+pub const MAX_LAYERS: usize = 64;
+pub const MAX_POSITIONS: usize = 16_384;
+/// The decoder needs room for its prompt, the longest window of text and the end marker.
+pub const MIN_TARGET_POSITIONS: usize = 16;
+
+impl Config {
+    /// Refuse a configuration that cannot describe a Whisper network (see the limits above).
+    /// Returns what is wrong, ready to follow `config.json: `.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let within = |name: &str, v: usize, lo: usize, hi: usize| {
+            if (lo..=hi).contains(&v) { Ok(()) } else { Err(format!("{name} is {v}, outside {lo}..={hi}")) }
+        };
+        within("num_mel_bins", self.num_mel_bins, 1, MAX_MELS)?;
+        within("d_model", self.d_model, 1, MAX_WIDTH)?;
+        within("encoder_layers", self.encoder_layers, 1, MAX_LAYERS)?;
+        within("decoder_layers", self.decoder_layers, 1, MAX_LAYERS)?;
+        within("encoder_attention_heads", self.encoder_attention_heads, 1, MAX_HEADS)?;
+        within("decoder_attention_heads", self.decoder_attention_heads, 1, MAX_HEADS)?;
+        // The encoder always sees 30 s: 3000 mel frames, halved by the stride-2 convolution.
+        within("max_source_positions", self.max_source_positions, super::N_FRAMES / 2, MAX_POSITIONS)?;
+        within("max_target_positions", self.max_target_positions, MIN_TARGET_POSITIONS, MAX_POSITIONS)?;
+        within("vocab_size", self.vocab_size, 1, super::tokenizer::MAX_VOCAB)?;
+        for (name, heads) in [("encoder_attention_heads", self.encoder_attention_heads), ("decoder_attention_heads", self.decoder_attention_heads)] {
+            if self.d_model % heads != 0 {
+                return Err(format!("d_model {} is not a multiple of {name} {heads}", self.d_model));
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Attention {
     q: Linear,
     k: Linear,
     v: Linear,
     out: Linear,
     heads: usize,
+    /// Channels per head (`d / heads`, checked at construction: never zero, never a remainder).
+    head_dim: usize,
     /// cached keys/values (self-attention: grows; cross-attention: the audio's, computed once)
     cache: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
     fn new(d: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
+        if heads == 0 || d % heads != 0 {
+            candle_core::bail!("{heads} attention heads do not divide the model width {d}");
+        }
         Ok(Self {
             q: candle_nn::linear(d, d, vb.pp("q_proj"))?,
             k: candle_nn::linear_no_bias(d, d, vb.pp("k_proj"))?,
             v: candle_nn::linear(d, d, vb.pp("v_proj"))?,
             out: candle_nn::linear(d, d, vb.pp("out_proj"))?,
             heads,
+            head_dim: d / heads,
             cache: None,
         })
     }
 
     fn split(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, t, d) = x.dims3()?;
-        x.reshape((b, t, self.heads, d / self.heads))?.transpose(1, 2)?.contiguous()
+        let (b, t, _) = x.dims3()?;
+        x.reshape((b, t, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
     }
 
     /// `x`: queries (b, t, d). `kv`: None = self-attention on `x` (appending to the cache when
@@ -60,8 +103,7 @@ impl Attention {
     /// `cached`). Returns the output and the attention logits (b, heads, t, tk).
     fn forward(&mut self, x: &Tensor, kv: Option<&Tensor>, mask: Option<&Tensor>, cached: bool) -> Result<(Tensor, Tensor)> {
         let (_, t, d) = x.dims3()?;
-        let dh = d / self.heads;
-        let q = (self.split(&self.q.forward(x)?)? * (dh as f64).powf(-0.5))?;
+        let q = (self.split(&self.q.forward(x)?)? * (self.head_dim as f64).powf(-0.5))?;
         let (k, v) = match kv {
             None => {
                 let k = self.split(&self.k.forward(x)?)?;
@@ -273,6 +315,53 @@ impl Model {
 
     pub fn last_logits(logits: &Tensor) -> Result<Vec<f32>> {
         let t = logits.dim(1)?;
-        logits.get(0)?.get(t - 1)?.to_dtype(DType::F32)?.to_vec1()
+        let Some(last) = t.checked_sub(1) else { candle_core::bail!("the decoder returned no logits") };
+        logits.get(0)?.get(last)?.to_dtype(DType::F32)?.to_vec1()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn tiny() -> Config {
+        Config {
+            num_mel_bins: 80,
+            d_model: 384,
+            encoder_layers: 4,
+            encoder_attention_heads: 6,
+            decoder_layers: 4,
+            decoder_attention_heads: 6,
+            max_source_positions: 1500,
+            max_target_positions: 448,
+            vocab_size: 51_865,
+        }
+    }
+
+    #[test]
+    fn a_real_shaped_config_validates() {
+        tiny().validate().unwrap();
+    }
+
+    #[test]
+    fn zero_heads_and_indivisible_widths_are_refused() {
+        for edit in [
+            |c: &mut Config| c.decoder_attention_heads = 0,
+            |c: &mut Config| c.encoder_attention_heads = 0,
+            |c: &mut Config| c.decoder_attention_heads = 5,
+            |c: &mut Config| c.d_model = 0,
+            |c: &mut Config| c.d_model = usize::MAX,
+            |c: &mut Config| c.num_mel_bins = 0,
+            |c: &mut Config| c.encoder_layers = usize::MAX,
+            |c: &mut Config| c.max_source_positions = 1499,
+            |c: &mut Config| c.max_target_positions = 3,
+            |c: &mut Config| c.vocab_size = 0,
+            |c: &mut Config| c.vocab_size = usize::MAX,
+        ] {
+            let mut c = tiny();
+            edit(&mut c);
+            assert!(c.validate().is_err(), "{c:?}");
+        }
     }
 }

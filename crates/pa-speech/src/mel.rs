@@ -30,6 +30,24 @@ fn mel_to_hz(m: f64) -> f64 {
     if m >= min_log_mel { min_log_hz * (logstep * (m - min_log_mel)).exp() } else { f_sp * m }
 }
 
+/// The loudest sample the front end accepts (60 dB over full scale). Real audio is within ±1; the
+/// clamp keeps a damaged buffer from overflowing the squared spectrum into infinity.
+pub const MAX_SAMPLE: f32 = 1000.0;
+
+/// A sample fit for the front end: NaN and infinities become silence, the rest is clamped to
+/// ±[`MAX_SAMPLE`].
+pub fn clean_sample(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(-MAX_SAMPLE, MAX_SAMPLE) } else { 0.0 }
+}
+
+/// `audio` cleaned by [`clean_sample`], followed by `pad` samples of silence.
+pub fn sanitized(audio: &[f32], pad: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(audio.len().saturating_add(pad));
+    out.extend(audio.iter().map(|&v| clean_sample(v)));
+    out.resize(audio.len().saturating_add(pad), 0.0);
+    out
+}
+
 /// Mel filterbank, `n_mels × N_BINS` row-major, for 16 kHz audio and a 400-point FFT.
 pub fn mel_filters(n_mels: usize) -> Vec<f32> {
     let sr = 16_000.0;
@@ -54,18 +72,15 @@ pub fn power_spectrum(audio: &[f32]) -> (usize, Vec<f32>) {
     let n = audio.len();
     // reflect padding (numpy "reflect": the edge sample is not repeated)
     let at = |i: isize| -> f32 {
-        if n == 0 {
-            return 0.0;
-        }
-        if n == 1 {
-            return audio[0];
+        if n <= 1 {
+            return audio.first().copied().unwrap_or(0.0);
         }
         let p = 2 * (n as isize - 1);
         let mut j = i.rem_euclid(p);
         if j >= n as isize {
             j = p - j;
         }
-        audio[j as usize]
+        audio.get(j as usize).copied().unwrap_or(0.0)
     };
     let frames = n / HOP; // the last centred frame (n / HOP + 1) is dropped
     let window: Vec<f32> = (0..N_FFT).map(|i| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N_FFT as f64).cos()) as f32).collect();
@@ -127,11 +142,78 @@ pub fn mel_energies(audio: &[f32], n_mels: usize) -> (usize, Vec<f32>) {
 pub fn log_mel(audio: &[f32], n_mels: usize) -> (usize, Vec<f32>) {
     let (frames, mut m) = mel_energies(audio, n_mels);
     for v in &mut m {
-        *v = v.max(1e-10).log10();
+        // `min` keeps an infinite energy (a buffer that was not cleaned) from becoming the maximum
+        *v = v.max(1e-10).min(f32::MAX).log10();
     }
     let max = m.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in &mut m {
         *v = (v.max(max - 8.0) + 4.0) / 4.0;
     }
     (frames, m)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // The first two tests are ported from the donor's `mel.rs` (filmcraft-speech, MIT OR Apache-2.0).
+
+    #[test]
+    fn filterbank_shape_and_coverage() {
+        let w = mel_filters(80);
+        assert_eq!(w.len(), 80 * N_BINS);
+        // every band has weight, nothing is negative
+        for m in 0..80 {
+            let row = &w[m * N_BINS..(m + 1) * N_BINS];
+            assert!(row.iter().all(|v| *v >= 0.0));
+            assert!(row.iter().sum::<f32>() > 0.0, "band {m}");
+        }
+        // Slaney scale is linear below 1 kHz
+        assert!((hz_to_mel(500.0) - 7.5).abs() < 1e-9);
+        assert!((mel_to_hz(hz_to_mel(3000.0)) - 3000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_tone_lands_in_its_band() {
+        let audio: Vec<f32> = (0..16_000).map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin()).collect();
+        let (frames, m) = log_mel(&audio, 80);
+        assert_eq!(frames, 100);
+        let f = 50;
+        let col: Vec<f32> = (0..80).map(|b| m[b * frames + f]).collect();
+        let peak = col.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let w = mel_filters(80);
+        let k = 1000 * N_FFT / 16_000; // bin 25
+        let best = (0..80).max_by(|a, b| w[a * N_BINS + k].total_cmp(&w[b * N_BINS + k])).unwrap();
+        assert_eq!(peak, best);
+    }
+
+    #[test]
+    fn non_finite_samples_become_silence_and_the_spectrogram_stays_finite() {
+        let mut audio: Vec<f32> = (0..16_000).map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin()).collect();
+        audio[8_000] = f32::INFINITY;
+        audio[8_001] = f32::NEG_INFINITY;
+        audio[8_002] = f32::NAN;
+        audio[8_003] = f32::MAX;
+        let clean = sanitized(&audio, 4_000);
+        assert_eq!(clean.len(), audio.len() + 4_000);
+        assert!(clean.iter().all(|v| v.is_finite() && v.abs() <= MAX_SAMPLE));
+        assert_eq!((clean[8_000], clean[8_001], clean[8_002]), (0.0, 0.0, 0.0));
+        assert_eq!(clean[8_003], MAX_SAMPLE, "a finite but absurd sample is clamped, not zeroed");
+        assert!(clean[audio.len()..].iter().all(|v| *v == 0.0), "the padding is silence");
+        assert_eq!(clean[..8_000], audio[..8_000], "ordinary samples are untouched");
+
+        let (frames, m) = log_mel(&clean, 80);
+        assert_eq!(frames, clean.len() / HOP);
+        assert!(m.iter().all(|v| v.is_finite()), "one bad sample must not poison the global maximum");
+    }
+
+    #[test]
+    fn an_uncleaned_infinity_still_cannot_make_the_log_mel_non_finite() {
+        // Defence in depth: `log_mel` itself bounds the energies it takes the maximum of.
+        let mut audio = vec![0.1f32; 8_000];
+        audio[100] = f32::INFINITY;
+        let (_, m) = log_mel(&audio, 80);
+        assert!(m.iter().all(|v| v.is_finite()));
+    }
 }

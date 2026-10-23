@@ -77,32 +77,70 @@ pub struct Whisper {
     begin_suppress: Vec<u32>,
 }
 
+/// The largest JSON file `load` will read (the real ones are at most 2.5 MB).
+const MAX_JSON_BYTES: u64 = 16 << 20;
+/// The largest weights file `load` will read (the biggest catalogue model is under 1 GB).
+const MAX_WEIGHT_BYTES: u64 = 8 << 30;
+
+/// Read `path`, refusing a file larger than `max` bytes.
+fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, SpeechError> {
+    use std::io::Read;
+    let fail = |why: String| SpeechError::Model(format!("{}: {why}", path.display()));
+    let file = std::fs::File::open(path).map_err(|e| fail(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| fail(e.to_string()))?;
+    if u64::try_from(bytes.len()).is_ok_and(|n| n > max) {
+        return Err(fail(format!("larger than {max} bytes")));
+    }
+    Ok(bytes)
+}
+
+/// The `(layer, head)` pairs whose cross-attention gives word timing: those the model lists, else
+/// the second half of the decoder. A listed pair that does not exist is an error, not a skip.
+fn alignment_heads(gen_cfg: &serde_json::Value, cfg: &Config) -> Result<Vec<(usize, usize)>, SpeechError> {
+    let index = |v: &serde_json::Value| v.as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let listed: Vec<(usize, usize)> =
+        gen_cfg["alignment_heads"].as_array().map(|a| a.iter().filter_map(|p| Some((index(&p[0])?, index(&p[1])?))).collect()).unwrap_or_default();
+    if listed.is_empty() {
+        return Ok((cfg.decoder_layers / 2..cfg.decoder_layers).flat_map(|l| (0..cfg.decoder_attention_heads).map(move |h| (l, h))).collect());
+    }
+    if let Some((l, h)) = listed.iter().find(|&&(l, h)| l >= cfg.decoder_layers || h >= cfg.decoder_attention_heads) {
+        return Err(SpeechError::Model(format!(
+            "generation_config.json: alignment head ({l}, {h}) does not exist in a decoder of {} layers with {} heads",
+            cfg.decoder_layers, cfg.decoder_attention_heads
+        )));
+    }
+    Ok(listed)
+}
+
+/// Token ids listed in `gen_cfg[key]`, ignoring entries that are not ids.
+fn token_list(gen_cfg: &serde_json::Value, key: &str) -> Option<Vec<u32>> {
+    gen_cfg[key].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().and_then(|v| u32::try_from(v).ok())).collect())
+}
+
 impl Whisper {
     /// Load a model directory (`config.json`, `generation_config.json`, `tokenizer.json`,
     /// `model.safetensors`).
+    ///
+    /// The folder's contents are untrusted: the catalogue's size check says nothing about them. So
+    /// everything that can be checked without the weights is checked first (the configuration's
+    /// ranges, every token id against the vocabulary, the alignment heads), and only then are the
+    /// weights read. A folder that fails any check is an `Err`, never a panic or a huge allocation.
     pub fn load(dir: &Path, id: &str) -> Result<Self, SpeechError> {
-        let read = |n: &str| std::fs::read(dir.join(n)).map_err(|e| SpeechError::Model(format!("{}: {e}", dir.join(n).display())));
+        let read = |n: &str| read_capped(&dir.join(n), MAX_JSON_BYTES);
         let cfg: Config = serde_json::from_slice(&read("config.json")?).map_err(|e| SpeechError::Model(format!("config.json: {e}")))?;
+        cfg.validate().map_err(|e| SpeechError::Model(format!("config.json: {e}")))?;
         let gen_cfg: serde_json::Value = serde_json::from_slice(&read("generation_config.json")?).unwrap_or_default();
-        let tok = Tokenizer::from_json(&String::from_utf8_lossy(&read("tokenizer.json")?))?;
-        let weights = read("model.safetensors")?;
-        let alignment_heads = gen_cfg["alignment_heads"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|p| Some((p[0].as_u64()? as usize, p[1].as_u64()? as usize))).collect::<Vec<_>>())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                (cfg.decoder_layers / 2..cfg.decoder_layers).flat_map(|l| (0..cfg.decoder_attention_heads).map(move |h| (l, h))).collect()
-            });
-        let mut suppress: Vec<u32> =
-            gen_cfg["suppress_tokens"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect()).unwrap_or_default();
+        let tok = Tokenizer::from_json(&String::from_utf8_lossy(&read("tokenizer.json")?), cfg.vocab_size)?;
+        let alignment_heads = alignment_heads(&gen_cfg, &cfg)?;
+        let mut suppress = token_list(&gen_cfg, "suppress_tokens").unwrap_or_default();
         suppress.extend(tok.non_text_specials());
         suppress.sort_unstable();
         suppress.dedup();
-        let begin_suppress = gen_cfg["begin_suppress_tokens"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect())
-            .unwrap_or_else(|| vec![220, tok.eot]);
-        let model = Model::load(cfg, weights).map_err(merr)?;
+        let begin_suppress = token_list(&gen_cfg, "begin_suppress_tokens").unwrap_or_else(|| vec![220, tok.eot]);
+        // Everything above is validated without the weights, which are read last.
+        let weights = read_capped(&dir.join("model.safetensors"), MAX_WEIGHT_BYTES)?;
+        let model = Model::load(cfg, weights).map_err(|e| SpeechError::Model(format!("model.safetensors: {e}")))?;
         Ok(Self { id: id.to_string(), model: Mutex::new(model), tok, alignment_heads, suppress, begin_suppress })
     }
 
@@ -112,10 +150,13 @@ impl Whisper {
 
     fn window(mel: &[f32], n_mels: usize, frames: usize, seek: usize) -> Vec<f32> {
         let mut w = vec![0f32; n_mels * N_FRAMES];
-        for m in 0..n_mels {
-            let end = (seek + N_FRAMES).min(frames);
-            if seek < end {
-                w[m * N_FRAMES..m * N_FRAMES + end - seek].copy_from_slice(&mel[m * frames + seek..m * frames + end]);
+        let end = seek.saturating_add(N_FRAMES).min(frames);
+        if seek < end {
+            // one mel band per row: `frames` values in the spectrogram, `N_FRAMES` in the window
+            for (dst, src) in w.chunks_exact_mut(N_FRAMES).zip(mel.chunks_exact(frames.max(1))) {
+                if let (Some(d), Some(s)) = (dst.get_mut(..end - seek), src.get(seek..end)) {
+                    d.copy_from_slice(s);
+                }
             }
         }
         w
@@ -125,14 +166,17 @@ impl Whisper {
         m.decoder.reset();
         let (logits, _) = m.decoder.forward(&[self.tok.sot], xa, false, None).map_err(merr)?;
         let l = Model::last_logits(&logits).map_err(merr)?;
-        let best = self.tok.languages.iter().max_by(|a, b| l[a.1 as usize].total_cmp(&l[b.1 as usize])).map(|x| x.0.clone());
+        let score = |id: u32| l.get(id as usize).copied().unwrap_or(f32::NEG_INFINITY);
+        let best = self.tok.languages.iter().max_by(|a, b| score(a.1).total_cmp(&score(b.1))).map(|x| x.0.clone());
         Ok(best.unwrap_or_else(|| "en".into()))
     }
 
     /// Apply the timestamp rules and suppression to `logits` for the next token after `seq`
-    /// (sampled tokens of this window, prompt excluded).
+    /// (sampled tokens of this window, prompt excluded). Token ids are checked against the
+    /// vocabulary when the model is loaded, but nothing here indexes by one: ranges are clamped.
     fn constrain(&self, logits: &mut [f32], seq: &[u32], max_ts: Option<u32>) {
         let tb = self.tok.timestamp_begin as usize;
+        let eot = self.tok.eot as usize;
         let ninf = f32::NEG_INFINITY;
         for &s in &self.suppress {
             if let Some(v) = logits.get_mut(s as usize) {
@@ -147,23 +191,22 @@ impl Whisper {
             }
         }
         let last_ts = seq.last().is_some_and(|&t| self.tok.is_timestamp(t));
-        let penult_ts = seq.len() < 2 || self.tok.is_timestamp(seq[seq.len() - 2]);
+        let penult_ts = seq.iter().rev().nth(1).is_none_or(|&t| self.tok.is_timestamp(t));
         if last_ts {
             if penult_ts {
-                logits[tb..].iter_mut().for_each(|v| *v = ninf);
+                suppress_range(logits, tb, usize::MAX);
             } else {
-                logits[..self.tok.eot as usize].iter_mut().for_each(|v| *v = ninf);
+                suppress_range(logits, 0, eot);
             }
         }
         if let Some(&last) = seq.iter().rev().find(|&&t| self.tok.is_timestamp(t)) {
-            let lim = (if last_ts && !penult_ts { last } else { last + 1 } as usize).min(logits.len());
-            logits[tb..lim].iter_mut().for_each(|v| *v = ninf);
+            let lim = if last_ts && !penult_ts { last } else { last.saturating_add(1) };
+            suppress_range(logits, tb, lim as usize);
         }
         if seq.is_empty() {
-            logits[..tb].iter_mut().for_each(|v| *v = ninf);
+            suppress_range(logits, 0, tb);
             if let Some(m) = max_ts {
-                let cut = (tb + m as usize + 1).min(logits.len());
-                logits[cut..].iter_mut().for_each(|v| *v = ninf);
+                suppress_range(logits, tb.saturating_add(m as usize).saturating_add(1), usize::MAX);
             }
         }
         // timestamps win when their total probability beats every text token
@@ -176,10 +219,10 @@ impl Whisper {
                 }
                 m + s.iter().map(|v| (v - m).exp()).sum::<f32>().ln()
             };
-            let ts = lse(&logits[tb..]);
-            let best_text = logits[..tb].iter().copied().fold(ninf, f32::max);
+            let ts = logits.get(tb..).map_or(ninf, lse);
+            let best_text = logits.get(..tb).map_or(ninf, |s| s.iter().copied().fold(ninf, f32::max));
             if ts > best_text {
-                logits[..tb].iter_mut().for_each(|v| *v = ninf);
+                suppress_range(logits, 0, tb);
             }
         }
     }
@@ -199,7 +242,7 @@ impl Whisper {
             let lp = log_softmax(&cur);
             self.constrain(&mut cur, &seq, Some(50));
             let next = argmax(&cur);
-            sum_lp += lp[next as usize];
+            sum_lp += lp.get(next as usize).copied().unwrap_or(f32::NEG_INFINITY);
             if next == self.tok.eot {
                 break;
             }
@@ -219,8 +262,10 @@ impl Whisper {
         let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let n_mels = m.cfg.num_mel_bins;
         let content_frames = audio.len() / SAMPLES_PER_FRAME;
-        let mut padded = audio.to_vec();
-        padded.extend(std::iter::repeat_n(0.0, N_FRAMES * SAMPLES_PER_FRAME));
+        // Non-finite samples become silence here, once, so no stage below (mel, level detection,
+        // speaker labelling) can be poisoned by a NaN or an infinity in the caller's buffer.
+        let padded = crate::mel::sanitized(audio, N_FRAMES * SAMPLES_PER_FRAME);
+        let audio = padded.get(..audio.len()).unwrap_or(&padded);
         if !progress(0.0, "Analysing audio") {
             return Err(SpeechError::Cancelled);
         }
@@ -253,10 +298,13 @@ impl Whisper {
             let skip = no_speech > 0.6 && avg_lp < -1.0;
             // where the next window starts
             let is_ts: Vec<bool> = toks.iter().map(|&t| self.tok.is_timestamp(t)).collect();
-            let single_ending = is_ts.len() >= 2 && !is_ts[is_ts.len() - 2] && is_ts[is_ts.len() - 1];
-            let last_pair = (1..is_ts.len()).rev().find(|&i| is_ts[i] && is_ts[i - 1]);
+            let single_ending = matches!(is_ts.as_slice(), [.., false, true]);
+            let last_pair = is_ts.windows(2).rposition(|w| w == [true, true]).map(|i| i + 1);
             let advance = match last_pair {
-                Some(i) if !single_ending => ((toks[i - 1] - self.tok.timestamp_begin) as usize * FRAMES_PER_TS).clamp(1, seg_frames),
+                Some(i) if !single_ending => {
+                    let ts = toks.get(i - 1).copied().unwrap_or(self.tok.timestamp_begin).saturating_sub(self.tok.timestamp_begin);
+                    usize::try_from(ts).unwrap_or(usize::MAX).saturating_mul(FRAMES_PER_TS).clamp(1, seg_frames.max(1))
+                }
                 _ => seg_frames,
             };
             let text: Vec<u32> = toks.iter().copied().filter(|&t| t < self.tok.eot).collect();
@@ -266,17 +314,19 @@ impl Whisper {
                     Some(i) if !single_ending => i,
                     _ => toks.len(),
                 };
-                let text: Vec<u32> = toks[..upto].iter().copied().filter(|&t| t < self.tok.eot).collect();
+                let text: Vec<u32> = toks.get(..upto).unwrap_or(&toks).iter().copied().filter(|&t| t < self.tok.eot).collect();
                 let mut aprompt = prompt.clone();
                 aprompt.push(self.tok.no_timestamps);
                 let times = align::align(&mut m, &xa, &aprompt, &text, self.tok.eot, &self.alignment_heads, seg_frames).map_err(merr)?;
-                let offset = seek * SAMPLES_PER_FRAME;
-                let limit = (seek + advance) * SAMPLES_PER_FRAME;
+                let offset = seek.saturating_mul(SAMPLES_PER_FRAME);
+                let limit = seek.saturating_add(advance).saturating_mul(SAMPLES_PER_FRAME);
                 for (wtext, r) in tokenizer::group_words(&self.tok, &text) {
-                    let (s, e) = (times[r.start].0, times[r.end - 1].1);
-                    let a = (offset + s * SAMPLES_PER_FRAME).min(limit);
-                    let b = (offset + e * SAMPLES_PER_FRAME).min(limit).max(a);
-                    words.push(Word::new(wtext, sample_tick(a as i64), sample_tick(b as i64)));
+                    let (Some(first), Some(last)) = (times.get(r.start), r.end.checked_sub(1).and_then(|e| times.get(e))) else { continue };
+                    let at = |frames: usize| offset.saturating_add(frames.saturating_mul(SAMPLES_PER_FRAME)).min(limit);
+                    let a = at(first.0);
+                    let b = at(last.1).max(a);
+                    let tick = |n: usize| sample_tick(i64::try_from(n).unwrap_or(i64::MAX));
+                    words.push(Word::new(wtext, tick(a), tick(b)));
                 }
             }
             seek += advance;
@@ -307,6 +357,14 @@ impl crate::Transcriber for Whisper {
     }
 }
 
+/// Set `logits[from..to]` to minus infinity, with both ends clamped to the slice.
+fn suppress_range(logits: &mut [f32], from: usize, to: usize) {
+    let to = to.min(logits.len());
+    if let Some(range) = logits.get_mut(from..to) {
+        range.iter_mut().for_each(|v| *v = f32::NEG_INFINITY);
+    }
+}
+
 fn softmax_at(x: &[f32], i: usize) -> f32 {
     let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let s: f32 = x.iter().map(|v| (v - m).exp()).sum();
@@ -320,13 +378,13 @@ fn log_softmax(x: &[f32]) -> Vec<f32> {
 }
 
 fn argmax(x: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, v) in x.iter().enumerate() {
-        if *v > x[best] {
-            best = i;
+    let mut best = (0usize, f32::NEG_INFINITY);
+    for (i, &v) in x.iter().enumerate() {
+        if v > best.1 {
+            best = (i, v);
         }
     }
-    best as u32
+    u32::try_from(best.0).unwrap_or(0)
 }
 
 /// The tail of `seq` (text tokens) repeats a short pattern many times: a decoding loop.
@@ -337,8 +395,8 @@ fn repeating(seq: &[u32], tb: u32) -> bool {
         if text.len() < n * reps {
             continue;
         }
-        let tail = &text[text.len() - n * reps..];
-        if (1..reps).all(|r| tail[r * n..(r + 1) * n] == tail[..n]) {
+        let Some(tail) = text.get(text.len() - n * reps..) else { continue };
+        if (1..reps).all(|r| tail.get(r * n..(r + 1) * n) == tail.get(..n)) {
             return true;
         }
     }
