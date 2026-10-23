@@ -370,7 +370,7 @@ fn by_default_the_frame_cache_keeps_many_small_frames() {
     }
     assert_eq!(m.cached_bytes(), n * 16, "all {n} frames (16 bytes each) are still cached");
     assert!((0..n).all(|i| m.is_cached(i)));
-    assert!(crate::DEFAULT_CACHE_FRAMES >= 512);
+    const { assert!(crate::DEFAULT_CACHE_FRAMES >= 512) };
 }
 
 #[test]
