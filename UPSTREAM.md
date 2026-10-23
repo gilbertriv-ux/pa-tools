@@ -14,6 +14,17 @@ bring upstream changes in, and what Pa Tools deliberately leaves alone so that m
 | Upstream version at that commit | 0.11.0 (tag `v0.11.0` is an ancestor) |
 | Pa Tools branch | `pa-tools` |
 
+## Last merged
+
+Pa Tools has its own version; this section records only which upstream version was merged last.
+
+| | |
+|---|---|
+| Upstream version | SoundCraft 0.12.1 |
+| Commit | `e85a480` ("Release 0.12.1"), merged by SHA, not `upstream/main` |
+| Merged on | 2026-10-23 |
+| Left out | the README icon commits (`24543e1`, `b1466e4`) and upstream's `52471b3` dependency bump |
+
 ## Merging upstream (weekly)
 
 Upstream moves fast, so merge small and often. `origin` still points at upstream in the first
@@ -23,7 +34,7 @@ checkout; once Pa Tools has its own repository, run `git remote rename origin up
 ```sh
 git fetch upstream                                  # or `origin` before the rename
 git switch pa-tools && git switch -c merge-upstream-YYYY-MM-DD
-git merge upstream/main                             # resolve conflicts as below
+git merge upstream/main                             # or a reviewed upstream commit (see "Last merged")
 ./rebrand.sh                                        # re-applies the packaging/doc brand; prints leftovers
 cargo xtask ci                                      # fmt, clippy, tests, assets, layers, wasm
 git log --oneline pa-tools..upstream/main           # what came in, for the changelog
@@ -46,8 +57,8 @@ Resolve conflicts like this:
 - **`docs/brand/`.** Must stay absent. If upstream adds or changes ArtCraft marks, do not take them
   (see "Licence requirement" below); `./rebrand.sh` warns when any `artcraft-*` file is present.
 - **`Cargo.lock`.** Take upstream's, then `cargo build --locked` once to confirm it still resolves.
-- **Version.** Pa Tools follows upstream's version number until it diverges on purpose
-  (`cargo xtask version`).
+- **Version.** Pa Tools has its own version number (`cargo xtask version`). Resolve every `version =`
+  hunk in `Cargo.toml` and `Cargo.lock` to ours; never take upstream's bump.
 
 ## Intentionally unchanged
 
