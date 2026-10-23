@@ -179,8 +179,21 @@ impl Autosave {
     /// A new folder under `root` for the session called `name`.
     fn create(root: &Path, name: &str) -> Result<Autosave> {
         let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
-        let dir = root.join(format!("{} {stamp}-{}", sanitize_name(name), std::process::id()));
-        let lock = std::fs::create_dir_all(&dir).and_then(|()| std::fs::File::create(dir.join(LOCK))).map_err(|err| io_error(&dir, err))?;
+        let base = format!("{} {stamp}-{}", sanitize_name(name), std::process::id());
+        std::fs::create_dir_all(root).map_err(|err| io_error(root, err))?;
+        // A folder that already exists is another session's, maybe one kept for the next launch with
+        // unsaved work in it: never reuse it. Folders for the same name made in the same millisecond
+        // (one session closes, the next opens) get a numeric suffix.
+        let mut dir = root.join(&base);
+        let mut n = 1;
+        while let Err(err) = std::fs::create_dir(&dir) {
+            n += 1;
+            if err.kind() != std::io::ErrorKind::AlreadyExists || n > 1000 {
+                return Err(io_error(&dir, err));
+            }
+            dir = root.join(format!("{base}-{n}"));
+        }
+        let lock = std::fs::File::create(dir.join(LOCK)).map_err(|err| io_error(&dir, err))?;
         lock.try_lock().map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
         Ok(Autosave { dir, lock: Some(lock), copies: BTreeMap::new(), next: 1, recording: false })
     }
@@ -444,6 +457,18 @@ mod tests {
     fn levels(e: &Engine) -> Vec<f32> {
         let s = e.session();
         s.sources.iter().map(|src| s.pool.get(src.id).map_or(f32::NAN, |a| a.buffer.channels[0][0])).collect()
+    }
+
+    #[test]
+    fn folders_made_in_the_same_millisecond_never_share_a_directory() {
+        let dir = folder("autosave-names");
+        let root = dir.join("Autosave");
+        // Made and released back to back, as when one session closes and the next opens: the
+        // millisecond in the name repeats, and a folder kept for the next launch must not be reused.
+        let dirs: Vec<PathBuf> = (0..50).map(|_| Autosave::create(&root, "Untitled").map(|a| a.dir.clone()).unwrap()).collect();
+        let distinct: std::collections::BTreeSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(distinct.len(), dirs.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
