@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (G-09: localisation runtime + seed catalog crate landed) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -23,7 +23,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 | G-06 | (Record-to-disk part: alpha blocker for the tracking row) Sources decoded whole into RAM; recording into RAM | Performance | [hardware-parity.md](hardware-parity.md) | 15–25 |
 | G-07 | Nothing is compared against Pro Tools' output (no fidelity harness) | Features | this file | 20–30 |
 | G-08 | Built-in plugin catalogue thin and unverified | Features | [plugin-parity.md](plugin-parity.md) | 80–120 |
-| G-09 | English only, no string catalog, no CJK/RTL rendering | Localization | [localization-parity.md](localization-parity.md) | 70–110 |
+| G-09 | Localisation runtime + seed catalog landed (`soundcraft-i18n`); UI strings not wired to it yet, no CJK/RTL fonts bundled | Localization | [localization-parity.md](localization-parity.md), [i18n.md](i18n.md) | 45–75 |
 | G-10 | No control surfaces (HUI/MCU, EUCON) | Hardware | [hardware-parity.md](hardware-parity.md) | 40–70 |
 | G-11 | No external sync (MTC, LTC, MIDI clock, video reference) | Hardware | [hardware-parity.md](hardware-parity.md) | 15–25 |
 | G-12 | Immersive delivery: no Dolby Atmos/ADM BWF, MPEG-H, binaural | Features | [file-format-parity.md](file-format-parity.md) | 50–80 |
@@ -138,8 +138,20 @@ parametric request #139. ≈ 80–120 h.
 
 ### G-09. Localization
 
-See [`localization-parity.md`](localization-parity.md): no catalog, every string literal in code;
-egui has no complex-script shaping or RTL; no CJK font fallback (PR #141 open). ≈ 70–110 h plus
+**Landed (2026-10-23):** a localisation runtime and a seed catalog as a standalone layer-0 crate,
+`soundcraft-i18n` (`crates/i18n`; design in [`docs/i18n.md`](i18n.md)): catalog lookup with English
+fallback, plurals (CLDR), language names, the system locale, right-to-left detection, a `tr!` macro
+family with runtime language switching, and a debug pseudo locale (`[!! … !!]`). Seed catalog: the
+40 most common `crates/ui-egui` strings translated into 10 locales (ar, de, es, fr, it, ja, pt-br,
+ru, zh-hans, zh-hant), reused from the donor craft-i18n where the English source matched exactly.
+
+**Still missing:** the UI's string literals are not wired to the runtime yet (a separate lane), so
+the app is still English at runtime. No translation fonts are bundled, so CJK and Arabic glyphs do
+not render even when chosen — note that egui 0.36 **does** shape complex scripts (epaint shapes with
+`harfrust`), so the blocker is glyph coverage and bidi layout, not shaping (earlier notes here that
+said "no complex-script shaping" were stale; see [`i18n.md`](i18n.md), Fonts). Right-to-left widget
+layout is not done, and most of the catalogue is untranslated and needs native-speaker review.
+≈ 45–75 h (UI string migration, font bundling and fallback, RTL layout, catalogue growth) plus
 native-speaker review.
 
 ### G-10. Control surfaces
@@ -214,6 +226,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | G-09 shrunk: `soundcraft-i18n` runtime + 40×10 seed catalog landed (docs/i18n.md); stale "no complex-script shaping" note corrected (egui 0.36 shapes with harfrust); estimate 70–110 → 45–75 |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |
