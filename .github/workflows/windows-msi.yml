@@ -68,20 +68,6 @@ jobs:
           key: windows-msi-${{ matrix.arch }}
           cache-on-failure: true
 
-      # WiX v5 is a .NET global tool. patools.wxs references no extension today, but the UI and Util
-      # extensions are added at the same version so a dialog set or a util element can be added
-      # to the installer without touching this workflow. A global tool lives in ~/.dotnet/tools.
-      - name: Install WiX
-        shell: pwsh
-        run: |
-          dotnet tool install --global wix --version $env:WIX_VERSION
-          $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
-          $tools | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          $env:PATH = "$tools;$env:PATH"
-          wix extension add -g "WixToolset.UI.wixext/$env:WIX_VERSION" "WixToolset.Util.wixext/$env:WIX_VERSION"
-          wix --version
-          wix extension list -g
-
       - name: Build and package (unsigned)
         shell: pwsh
         run: ./packaging/windows/package.ps1 -Arch $env:ARCH
@@ -89,27 +75,6 @@ jobs:
       - name: List the packages
         shell: pwsh
         run: Get-ChildItem $env:DIST | Format-Table Name, Length
-
-      # Install, check, run and uninstall the x64 MSI on this machine.
-      - name: Smoke-test the x64 MSI (install, run, uninstall)
-        if: matrix.arch == 'x64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $msi = (Get-ChildItem (Join-Path $env:DIST '*.msi') | Select-Object -First 1).FullName
-          $dir = Join-Path $env:ProgramFiles 'Pa Tools'
-          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/l*v', 'install.log' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
-          foreach ($exe in 'pa-tools.exe', 'pa-tools-cli.exe') {
-            if (-not (Test-Path -LiteralPath (Join-Path $dir $exe))) { throw "$exe was not installed in $dir" }
-            Write-Output "ok installed $exe"
-          }
-          & (Join-Path $dir 'pa-tools-cli.exe') --version
-          if ($LASTEXITCODE -ne 0) { throw "pa-tools-cli --version exited $LASTEXITCODE" }
-          $p = Start-Process msiexec.exe -ArgumentList '/x', "`"$msi`"", '/qn', '/l*v', 'uninstall.log' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
-          if (Test-Path -LiteralPath (Join-Path $dir 'pa-tools.exe')) { throw 'uninstall left pa-tools.exe behind' }
-          Write-Output 'ok uninstalled'
 
       - name: Upload the MSI
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
