@@ -8,6 +8,13 @@
 //! any other edit. Everything else the window does goes through commands too (`transport.locate`,
 //! `edit.select`, `track.rename_speaker`).
 //!
+//! The menu entry and the command palette's Transcribe Track start that same job ([`invoke`]): they
+//! open this window on the track and return at once. Only calls that come in over the control
+//! channel or MCP run `track.transcribe` synchronously, on the calling thread.
+//!
+//! Nothing here names the speech model's maker or its id: people read the catalogue's display name
+//! ("Speech model, base (multilingual)"), and the folders searched go to the log, not the status line.
+//!
 //! Time origin: a transcript's word times are samples from the session start, the same origin as
 //! markers and clip positions, never relative to a clip or to a render range.
 
@@ -177,7 +184,10 @@ impl View {
 /// The window's state, kept on [`SoundApp`].
 pub struct TranscriptState {
     pub open: bool,
-    /// Folder that holds `whisper-base/`; empty uses the app's own models folder.
+    /// The Models folder field: the folder that holds the speech model's folder. Empty (the
+    /// default) lets the engine search: `$PA_SPEECH_MODELS_DIR`, then the app bundle, then the
+    /// app's own data folder. Only what the user typed is sent as `models_dir`, so it is not
+    /// prefilled from the environment (that would turn the first tier into the only one).
     pub models_dir: String,
     /// Keep the line under the playhead in view while playing.
     pub follow: bool,
@@ -187,6 +197,8 @@ pub struct TranscriptState {
     /// What the window last had to say (progress, results, why nothing happened).
     pub status: String,
     job: Option<Running>,
+    /// A transcription asked for before there was a frame to start it in (see [`invoke`]).
+    pending: Option<TrackId>,
     view: Option<View>,
     shown: Option<TrackId>,
     editing: Option<SpeakerEdit>,
@@ -200,12 +212,13 @@ impl Default for TranscriptState {
     fn default() -> Self {
         TranscriptState {
             open: false,
-            models_dir: std::env::var("PA_SPEECH_MODELS_DIR").unwrap_or_default(),
+            models_dir: String::new(),
             follow: true,
             query: String::new(),
             track: None,
             status: String::new(),
             job: None,
+            pending: None,
             view: None,
             shown: None,
             editing: None,
@@ -293,10 +306,49 @@ pub fn run(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, Stri
     Some(Ok(json!({"value": st.open})))
 }
 
+/// The first line of `text`: all a status line shows of an error, whose later lines may be a
+/// backtrace or a list of folders.
+fn first_line(text: &str) -> &str {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// Says `msg` in the window and the main status line, one line of it. A longer message is logged
+/// in full.
 fn set_status(app: &mut SoundApp, msg: impl Into<String>) {
-    let msg = msg.into();
-    app.ui.status.clone_from(&msg);
-    app.transcript.status = msg;
+    let full = msg.into();
+    let shown = first_line(&full).to_string();
+    if shown != full.trim() {
+        log::warn!("transcription: {full}");
+    }
+    app.ui.status.clone_from(&shown);
+    app.transcript.status = shown;
+}
+
+/// `track.transcribe` as the menu and the command palette run it: open this window on the track
+/// and start its background job, then return. The synchronous command would hold the whole app for
+/// as long as the recognition takes (minutes, for a long track); calls over the control channel
+/// or MCP still run it that way, because their caller waits for the answer.
+///
+/// `p` is the command's params: `track` picks the track (else the window's pick, the Edit
+/// selection, or the first audio track).
+pub(crate) fn invoke(app: &mut SoundApp, p: &Value) {
+    let track = match track_param(&app.engine, TRANSCRIBE_CMD, p, "track") {
+        Ok(t) => t,
+        Err(e) => return set_status(app, e.to_string()),
+    };
+    app.transcript.open = true;
+    if let Some(t) = track {
+        app.transcript.track = Some(t);
+    }
+    let session = app.engine.session();
+    let Some(shown) = resolve(app.transcript.track, &candidates(session), session) else {
+        return set_status(app, "No audio track to transcribe");
+    };
+    match app.docking_context.clone() {
+        Some(ctx) => start(app, &ctx, shown),
+        // Before the first frame there is no context to repaint: the next frame starts it.
+        None => app.transcript.pending = Some(shown),
+    }
 }
 
 // ---- running the speech model --------------------------------------------------------------
@@ -306,25 +358,33 @@ fn language_flag(session: &Session) -> Option<String> {
     session.edit.flags.iter().find_map(|f| f.strip_prefix("transcription.language=")).map(str::to_string)
 }
 
+/// The params of the `track.transcribe` job for `track`. `models_dir` is sent only when the user
+/// typed a Models folder: an explicit folder is the only place the engine then looks, so an empty
+/// field must send none and leave the search (environment, app bundle, app data) to the engine.
+fn job_params(track: TrackId, models_dir: &str, language: Option<String>) -> Value {
+    let mut params = Map::new();
+    params.insert("track".into(), json!(track.0));
+    let dir = models_dir.trim();
+    if !dir.is_empty() {
+        params.insert("models_dir".into(), json!(dir));
+    }
+    if let Some(language) = language {
+        params.insert("language".into(), json!(language));
+    }
+    Value::Object(params)
+}
+
 /// Starts transcribing `track` on a worker thread.
 fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
     if app.transcript.job.is_some() {
-        return;
+        return set_status(app, "A transcription is already running");
     }
     let Some(track_name) = app.engine.session().track(track).map(|t| t.name.clone()) else {
         set_status(app, "That track no longer exists");
         return;
     };
-    let mut params = Map::new();
-    params.insert("track".into(), json!(track.0));
-    let dir = app.transcript.models_dir.trim();
-    if !dir.is_empty() {
-        params.insert("models_dir".into(), json!(dir));
-    }
-    if let Some(language) = language_flag(app.engine.session()) {
-        params.insert("language".into(), json!(language));
-    }
-    let job = match transcribe_job(&app.engine, &Value::Object(params)) {
+    let params = job_params(track, &app.transcript.models_dir, language_flag(app.engine.session()));
+    let job = match transcribe_job(&app.engine, &params) {
         Ok(job) => job,
         Err(e) => {
             set_status(app, e.to_string());
@@ -359,6 +419,8 @@ fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
 
 /// Stops a running transcription. True when there was one.
 pub(crate) fn cancel(app: &mut SoundApp) -> bool {
+    // A request that has not started yet belongs to the session being replaced too.
+    app.transcript.pending = None;
     let Some(job) = app.transcript.job.take() else { return false };
     job.cancel.store(true, Ordering::Relaxed);
     set_status(app, "Transcription stopped");
@@ -368,6 +430,10 @@ pub(crate) fn cancel(app: &mut SoundApp) -> bool {
 /// Collects the worker's progress and result. Called every frame from `logic`, so a result lands
 /// even while the window is hidden.
 pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
+    if let Some(track) = app.transcript.pending.take() {
+        // Collect its answer from the next frame on, not in the frame that starts it.
+        return start(app, ctx, track);
+    }
     let Some(job) = &mut app.transcript.job else { return };
     let mut done = None;
     loop {
@@ -401,6 +467,7 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
 fn finish(app: &mut SoundApp, job: &Running, result: Result<TranscribeOutcome, String>) {
     let outcome = match result {
         Ok(o) => o,
+        // One line in the status; `set_status` logs the rest (a backtrace, say).
         Err(e) => return set_status(app, e),
     };
     let Some(transcript) = outcome.transcript else {
@@ -430,19 +497,42 @@ fn finish(app: &mut SoundApp, job: &Running, result: Result<TranscribeOutcome, S
 fn nothing_stored(result: &Value) -> String {
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
     match status {
-        "no_models_dir" | "model_unavailable" => {
-            let mut msg =
-                String::from("The speech model is not available. Set the Models folder to the folder that holds whisper-base/, then try again.");
-            if let Some(why) = result.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
-                msg.push_str(" (");
-                msg.push_str(why);
-                msg.push(')');
-            }
-            msg
-        }
+        "no_models_dir" | "model_unavailable" => model_unavailable(result),
         "" => "Transcription finished without a transcript".to_string(),
         other => format!("Transcription finished without a transcript (status: {other})"),
     }
+}
+
+/// Why the speech model cannot be used, in words a status line can carry. The engine's `error` has
+/// the full text, with every folder it searched: that goes to the log. What is shown names the
+/// model by its display name (`model_name`), never by its id or maker, and leaves the folders out.
+fn model_unavailable(result: &Value) -> String {
+    let text = |key: &str| result.get(key).and_then(Value::as_str).map(first_line).filter(|t| !t.is_empty());
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        log::warn!("speech model unavailable: {error}");
+    }
+    let name = text("model_name").unwrap_or("The speech model");
+    let why = text("why").map_or_else(|| format!("{name} is not available"), str::to_string);
+    let advice = match text("reason").unwrap_or("not_found") {
+        "unsupported_build" => "",
+        "invalid_model" | "unknown_model" => " Check the speech model's folder, or choose another Models folder, then try again.",
+        _ => MODEL_ADVICE,
+    };
+    format!("{why}.{advice}")
+}
+
+/// What to do when the speech model was not found.
+const MODEL_ADVICE: &str =
+    " Set the Models folder to the folder that contains it, or leave it empty to use the app's own models folder, then try again.";
+
+/// The Models folder field: its hint while empty, and its tooltip. The model's own folder name is a
+/// file-system detail and stays out of them, as does the model's maker.
+const MODELS_FOLDER_HINT: &str = "App's own models folder";
+const MODELS_FOLDER_TIP: &str = "The folder that contains the speech model's folder. Leave it empty to use the app's own models folder.";
+
+/// What the tooltip over a transcript's summary says about where it came from.
+fn made_with(source: &str) -> String {
+    format!("Made with {}", soundcraft_engine::cmd::source_label(source))
 }
 
 // ---- actions -------------------------------------------------------------------------------
@@ -586,10 +676,8 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Models folder").font(regular(12.0)).color(t.text_dim));
-        ui.add(egui::TextEdit::singleline(&mut st.models_dir).hint_text("holds whisper-base/").desired_width(f32::INFINITY)).on_hover_text(
-            "Folder that holds whisper-base/ (config.json, generation_config.json, tokenizer.json, model.safetensors). \
-             Leave empty to use the app's own models folder.",
-        );
+        ui.add(egui::TextEdit::singleline(&mut st.models_dir).hint_text(MODELS_FOLDER_HINT).desired_width(f32::INFINITY))
+            .on_hover_text(MODELS_FOLDER_TIP);
     });
 
     if let Some(job) = &st.job {
@@ -638,7 +726,7 @@ fn transcript_view(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, tr: &Transc
         let meta =
             ui.label(RichText::new(format!("{words} {} · {language}", if words == 1 { "word" } else { "words" })).font(regular(12.0)).color(t.text));
         if !tr.source.is_empty() {
-            meta.on_hover_text(format!("Made with {}", tr.source));
+            meta.on_hover_text(made_with(&tr.source));
         }
         if ui.add_enabled(!view.rows.is_empty(), egui::Button::new("Copy")).on_hover_text("Copy the listed lines as time, speaker and text").clicked()
         {
@@ -1036,15 +1124,75 @@ mod tests {
         assert!(candidates(&s).iter().any(|(id, _)| *id == midi));
     }
 
+    /// What the engine's `model_unavailable` outcome carries when the model is not on disk.
+    fn not_found() -> Value {
+        json!({
+            "status": "model_unavailable", "model": "whisper-base", "model_name": "Speech model, base (multilingual)", "reason": "not_found",
+            "why": "Speech model, base (multilingual) was not found",
+            "error": "Speech model, base (multilingual) not found (searched: PA_SPEECH_MODELS_DIR /home/me/whisper-stuff, app bundle resources \
+                      (not running from an app bundle), application data /home/me/.local/share/patools/models)"
+        })
+    }
+
     #[test]
-    fn a_missing_model_is_explained_with_the_folder_to_set() {
+    fn a_missing_model_is_explained_without_its_id_or_the_folders_searched() {
         for status in ["no_models_dir", "model_unavailable"] {
-            let msg = nothing_stored(&json!({"status": status, "error": "no such file"}));
-            assert!(msg.contains("Models folder") && msg.contains("whisper-base/") && msg.contains("(no such file)"), "{msg}");
+            let mut result = not_found();
+            result["status"] = json!(status);
+            let msg = nothing_stored(&result);
+            assert_eq!(
+                msg,
+                "Speech model, base (multilingual) was not found. Set the Models folder to the folder that contains it, \
+                 or leave it empty to use the app's own models folder, then try again."
+            );
+            assert!(!msg.to_lowercase().contains("whisper") && !msg.contains("/home") && !msg.contains("PA_SPEECH"), "{msg}");
         }
-        assert!(!nothing_stored(&json!({"status": "no_models_dir"})).contains('('));
+        // An engine that says nothing more than the status still gets a sentence, and still no id.
+        let bare = nothing_stored(&json!({"status": "no_models_dir"}));
+        assert!(bare.starts_with("The speech model is not available.") && bare.contains("Models folder"), "{bare}");
+        // A build without the speech feature has no folder to fix.
+        let build = nothing_stored(&json!({"status": "model_unavailable", "reason": "unsupported_build",
+            "why": "speech-to-text is not available in this build (this build does not include the speech feature)"}));
+        assert_eq!(build, "speech-to-text is not available in this build (this build does not include the speech feature).");
+        // Files that are there but unusable: say what is wrong (one line), without the folder.
+        let invalid =
+            nothing_stored(&json!({"status": "model_unavailable", "reason": "invalid_model", "model_name": "Speech model, base (multilingual)",
+            "why": "model: tokenizer.json: <|0.00|> has id 3\n   0: backtrace frame"}));
+        assert!(invalid.starts_with("model: tokenizer.json: <|0.00|> has id 3.") && !invalid.contains("backtrace"), "{invalid}");
         assert!(nothing_stored(&json!({"status": "weird"})).contains("weird"));
         assert!(nothing_stored(&json!({})).contains("without a transcript"));
+    }
+
+    #[test]
+    fn a_status_is_one_line() {
+        assert_eq!(first_line("one\ntwo\nthree"), "one");
+        assert_eq!(first_line("\n  \n  first real line  \nnext"), "first real line");
+        assert_eq!(first_line(""), "");
+        let mut app = app();
+        set_status(&mut app, "transcription failed: out of memory\nstack backtrace:\n   0: frame\n   1: frame");
+        assert_eq!(app.transcript.status, "transcription failed: out of memory");
+        assert_eq!(app.ui.status, "transcription failed: out of memory");
+    }
+
+    #[test]
+    fn the_models_folder_is_sent_only_when_typed() {
+        let track = TrackId(7);
+        // Empty (the default, however the environment is set) or blank: no `models_dir`, so the
+        // engine's search (environment, app bundle, app data) stays in force.
+        assert_eq!(TranscriptState::default().models_dir, "");
+        for typed in ["", "   ", "\t"] {
+            assert_eq!(job_params(track, typed, None), json!({"track": 7}), "{typed:?}");
+        }
+        assert_eq!(
+            job_params(track, "  /Volumes/Models  ", Some("de".into())),
+            json!({"track": 7, "models_dir": "/Volumes/Models", "language": "de"})
+        );
+    }
+
+    #[test]
+    fn a_transcript_source_is_shown_by_its_display_name() {
+        assert_eq!(made_with("whisper-base"), "Made with Speech model, base (multilingual)");
+        assert_eq!(made_with("manual"), "Made with manual");
     }
 
     #[test]
@@ -1164,10 +1312,13 @@ mod tests {
         let track = first_audio(&app);
         for status in ["no_models_dir", "model_unavailable"] {
             let (tx, _) = fake_job(&mut app, track);
-            tx.send(done(None, json!({"status": status, "error": "model `whisper-base` is not installed"}))).unwrap();
+            let mut result = not_found();
+            result["status"] = json!(status);
+            tx.send(done(None, result)).unwrap();
             step(&mut app, &ctx);
             let shown = &app.transcript.status;
-            assert!(shown.contains("Models folder") && shown.contains("not installed"), "{shown}");
+            assert!(shown.contains("Models folder") && shown.contains("was not found"), "{shown}");
+            assert!(!shown.to_lowercase().contains("whisper") && !shown.contains("searched"), "{shown}");
         }
         let (tx, _) = fake_job(&mut app, track);
         tx.send(Msg::Done(Err("transcription failed: out of memory".into()))).unwrap();
@@ -1384,7 +1535,7 @@ mod tests {
             app.transcript.editing = Some(SpeakerEdit { row: 1, speaker: 0, text: "Speaker 0".into(), focus: true, fresh: true, seen: false });
         });
         shoot("model-missing.png", false, &|app| {
-            app.transcript.status = nothing_stored(&json!({"status": "model_unavailable", "error": "model `whisper-base` is not installed"}));
+            app.transcript.status = nothing_stored(&not_found());
         });
         shoot("empty.png", false, &|app| {
             let track = first_audio(app);

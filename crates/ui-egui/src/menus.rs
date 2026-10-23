@@ -603,6 +603,12 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         let _ = app.run(w, json!({"value": true}));
         return;
     }
+    // Menu and palette Transcribe Track: the Transcript window's background job, so the app keeps
+    // running while the speech model works. (Programmatic `track.transcribe` is synchronous.)
+    if id == "track.transcribe" {
+        crate::transcript_window::invoke(app, &params_for(path, id));
+        return;
+    }
     if id == "audiosuite.process" {
         let p = params_for(path, id);
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);

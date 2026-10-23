@@ -344,15 +344,202 @@ fn a_missing_model_is_reported_and_nothing_is_stored() {
     rig.frames(2);
     assert!(!rig.app.transcript.is_running(), "the worker did not finish in time");
     let status = rig.app.transcript.status.clone();
-    assert!(status.contains("speech model") && status.contains("Models folder") && status.contains("whisper-base/"), "{status}");
+    assert!(status.contains("Speech model, base (multilingual)") && status.contains("Models folder"), "{status}");
+    assert!(!status.to_lowercase().contains("whisper") && !status.contains(&*dir.to_string_lossy()), "{status}");
     assert_eq!(rig.app.ui.status, status, "the main status line says it too");
     assert!(rig.app.engine.session().transcript(track).is_none(), "nothing was stored");
     assert!(rig.find(&status).is_some(), "the window shows the status");
 }
 
 #[test]
-fn the_models_folder_defaults_to_the_environment_and_can_be_edited() {
+fn the_models_folder_starts_empty_whatever_the_environment_says() {
+    // Prefilling it from $PA_SPEECH_MODELS_DIR would send it as an explicit `models_dir`, which
+    // switches off the rest of the search (app bundle, app data). The engine reads the variable.
     let rig = Rig::new();
-    assert_eq!(rig.app.transcript.models_dir, std::env::var("PA_SPEECH_MODELS_DIR").unwrap_or_default());
+    assert_eq!(rig.app.transcript.models_dir, "");
     assert!(rig.app.transcript.follow, "Follow playhead starts on");
+}
+
+// ---- S2: the menu and the command palette start the background job -------------------------
+
+/// Waits for the worker to report, pumping frames.
+fn finish_job(rig: &mut Rig) {
+    let started = Instant::now();
+    while rig.app.transcript.is_running() && started.elapsed() < Duration::from_secs(10) {
+        rig.frame(vec![]);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rig.frames(2);
+    assert!(!rig.app.transcript.is_running(), "the worker did not finish in time");
+}
+
+/// A Models folder that exists nowhere, so a job ends at once with "model not found" whatever the
+/// machine has installed.
+fn no_models(rig: &mut Rig, tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pa-tools-transcript-{tag}-{}", std::process::id()));
+    rig.app.transcript.models_dir = dir.to_string_lossy().into_owned();
+    dir
+}
+
+#[test]
+fn the_menu_entry_starts_the_background_job_and_returns() {
+    let mut rig = Rig::new();
+    let track = first_audio(&rig.app);
+    no_models(&mut rig, "menu");
+    assert!(!rig.app.transcript.open && !rig.app.transcript.is_running());
+    let steps = rig.app.engine.undo_history().len();
+
+    // Exactly what clicking Track > Transcribe Track does.
+    menus::invoke_menu(&mut rig.app, "track.transcribe", "Track > Transcribe Track");
+
+    // The call has returned with the window open and the job running: nothing was recognised on
+    // this thread (the synchronous command would have stored or refused a transcript by now).
+    assert!(rig.app.transcript.open, "the window opens");
+    assert!(rig.app.transcript.is_running(), "the job is running in the background");
+    assert!(rig.app.engine.session().transcript(track).is_none());
+    assert_eq!(rig.app.engine.undo_history().len(), steps);
+    assert!(rig.app.transcript.status.starts_with("Transcribing"), "{}", rig.app.transcript.status);
+
+    // A second request while it runs does not start another.
+    menus::invoke_menu(&mut rig.app, "track.transcribe", "Track > Transcribe Track");
+    assert_eq!(rig.app.transcript.status, "A transcription is already running");
+
+    // The worker reports through the window like a click on its button: model not found.
+    finish_job(&mut rig);
+    let status = rig.app.transcript.status.clone();
+    assert!(status.contains("Models folder") && !status.to_lowercase().contains("whisper"), "{status}");
+}
+
+#[test]
+fn the_command_palette_starts_the_background_job_and_returns() {
+    let mut rig = Rig::new();
+    let track = first_audio(&rig.app);
+    no_models(&mut rig, "palette");
+    rig.app.ui.show_search = true;
+    rig.frames(2);
+    rig.frame(vec![Event::Text("Transcribe Track".into())]);
+    rig.frames(2);
+    assert!(rig.find("Transcribe Track").is_some(), "the palette lists the command: {:?}", rig.texts());
+    assert!(!rig.app.transcript.is_running());
+
+    // Enter in the palette: one frame, and the job is running behind the open window.
+    let modifiers = Modifiers::NONE;
+    rig.frame(vec![
+        Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed: true, repeat: false, modifiers },
+        Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed: false, repeat: false, modifiers },
+    ]);
+    assert!(!rig.app.ui.show_search, "the palette closes");
+    assert!(rig.app.transcript.open && rig.app.transcript.is_running(), "window open, job running");
+    assert!(rig.app.engine.session().transcript(track).is_none());
+    finish_job(&mut rig);
+}
+
+#[test]
+fn the_menu_entry_transcribes_the_selected_track() {
+    let mut rig = Rig::new();
+    no_models(&mut rig, "selected");
+    let audio: Vec<TrackId> = rig.app.engine.session().tracks.iter().filter(|t| t.kind == TrackKind::Audio).map(|t| t.id).collect();
+    let second = audio[1];
+    rig.app.run("edit.select", json!({"tracks": [second.0]})).unwrap();
+    let name = rig.app.engine.session().track(second).unwrap().name.clone();
+    menus::invoke_menu(&mut rig.app, "track.transcribe", "Track > Transcribe Track");
+    assert!(rig.app.transcript.status.contains(&name), "{}", rig.app.transcript.status);
+    finish_job(&mut rig);
+}
+
+#[test]
+fn programmatic_transcribe_stays_synchronous() {
+    // The control channel and MCP call the command itself and wait for its answer.
+    let mut rig = Rig::new();
+    let dir = no_models(&mut rig, "sync");
+    let track = first_audio(&rig.app);
+    let r = rig.app.run("track.transcribe", json!({"track": track.0, "models_dir": dir.to_string_lossy()})).unwrap();
+    assert_eq!(r["status"], "model_unavailable");
+    assert!(!rig.app.transcript.open && !rig.app.transcript.is_running(), "no window, no job");
+}
+
+// ---- S4: replacing the session stops a running transcription -------------------------------
+
+#[test]
+fn opening_a_session_from_bytes_stops_a_running_transcription() {
+    let mut rig = Rig::new();
+    no_models(&mut rig, "open-bytes");
+    menus::invoke_menu(&mut rig.app, "track.transcribe", "Track > Transcribe Track");
+    assert!(rig.app.transcript.is_running());
+    let other = soundcraft_model::Session::default().to_json().unwrap();
+    soundcraft_ui_egui::dialogs::open_session_bytes(&mut rig.app, "Other.scraft".into(), other.into_bytes());
+    assert!(!rig.app.transcript.is_running(), "the job belonged to the session that was replaced");
+    rig.frames(3);
+    assert!(rig.app.engine.session().transcripts.is_empty(), "and its answer is not stored in the new session");
+}
+
+// ---- nothing the window paints names a third-party product ---------------------------------
+
+/// Every text of the last frame, lowercased, in one string.
+fn painted(rig: &Rig) -> String {
+    rig.texts().join("\n").to_lowercase()
+}
+
+fn assert_no_third_party_names(rig: &Rig, state: &str) {
+    let text = painted(rig);
+    assert!(!text.is_empty(), "{state}: nothing was painted");
+    for name in ["whisper", "openai", "hugging face"] {
+        assert!(!text.contains(name), "{state}: the window paints `{name}`:\n{text}");
+    }
+}
+
+#[test]
+fn the_window_paints_no_third_party_names_with_the_models_folder_empty() {
+    let mut rig = Rig::new();
+    open(&mut rig);
+    assert!(rig.find("Transcribe Track").is_some() && rig.find("Models folder").is_some(), "{:?}", rig.texts());
+    // The field is empty and shows its hint.
+    assert_eq!(rig.app.transcript.models_dir, "");
+    assert!(rig.find("App's own models folder").is_some(), "{:?}", rig.texts());
+    assert_no_third_party_names(&rig, "empty Models folder");
+}
+
+#[test]
+fn the_window_paints_no_third_party_names_when_the_model_is_missing() {
+    let mut rig = Rig::new();
+    no_models(&mut rig, "paint");
+    open(&mut rig);
+    let at = rig.at("Transcribe Track");
+    rig.click(at);
+    finish_job(&mut rig);
+    let status = rig.app.transcript.status.clone();
+    assert!(status.contains("Models folder"), "{status}");
+    assert!(rig.find(&status).is_some(), "the window paints the status: {:?}", rig.texts());
+    assert_no_third_party_names(&rig, "model missing");
+}
+
+#[test]
+fn the_window_paints_no_third_party_names_with_a_stored_transcript() {
+    let mut rig = Rig::new();
+    let track = first_audio(&rig.app);
+    // The id a real transcription stores as its source.
+    rig.app.run("track.set_transcript", json!({"track": track.0, "words": words(30), "language": "en", "source": "whisper-base"})).unwrap();
+    open(&mut rig);
+    assert!(rig.find("Alpha").is_some(), "the transcript is listed: {:?}", rig.texts());
+    assert_no_third_party_names(&rig, "stored transcript");
+
+    // Hover the summary line and the Models folder field: their tooltips are painted too.
+    for label in [None, Some("30 words · en")] {
+        rig.frames(2);
+        let at = match label {
+            Some(text) => rig.at(text),
+            None => rig.at("Models folder") + vec2(120.0, 0.0),
+        };
+        rig.frame(vec![Event::PointerMoved(at)]);
+        for _ in 0..90 {
+            rig.frame(vec![]);
+        }
+        let text = painted(&rig);
+        assert_no_third_party_names(&rig, "hovering");
+        let expect = match label {
+            Some(_) => "made with speech model, base (multilingual)",
+            None => "the folder that contains the speech model's folder",
+        };
+        assert!(text.contains(expect), "hovering {label:?} should show `{expect}`:\n{text}");
+    }
 }
