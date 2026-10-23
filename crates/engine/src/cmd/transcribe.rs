@@ -33,8 +33,8 @@ const MAX_WORD_BYTES: usize = 256;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
-            noundo "track.transcribe",
-            "Transcribe Track...",
+            "track.transcribe",
+            "Transcribe Track",
             ["Track"],
             None,
             "{track?: id|name, model?: 'whisper-base', models_dir?: path, language?: 'en', diarize?: bool} — \
@@ -44,12 +44,13 @@ pub fn specs() -> Vec<CommandSpec> {
             transcribe
         ),
         cmd!(
-            noundo "track.set_transcript",
+            "track.set_transcript",
             "Set Track Transcript",
             [],
             None,
-            "{track: id|name, words: [{start, end, text, speaker?}], language?, source?} — stores a transcript, \
-             replacing the track's; `start`/`end` are samples from session start; `words: []` stores an empty one",
+            "{track: id|name, words: [{start, end, text, speaker?: 0..255}], language?, source?} — stores a transcript, \
+             replacing the track's (undoable); `start`/`end` are samples from session start; `text` must not be empty; \
+             `words: []` stores an empty one",
             always,
             set_transcript
         ),
@@ -201,12 +202,23 @@ fn set_transcript(e: &mut Engine, p: &Value) -> Result<Value> {
         if start < 0 || end < start {
             return Err(bad(SET_TRANSCRIPT, format!("words[{i}]: need 0 <= start <= end (got {start}..{end})")));
         }
-        let text = w.get("text").and_then(Value::as_str).ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].text must be a string")))?;
-        let speaker = w.get("speaker").and_then(Value::as_u64).map_or(0, |s| u8::try_from(s).unwrap_or(u8::MAX));
+        let text = w.get("text").and_then(Value::as_str).ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].text must be a string")))?.trim();
+        if text.is_empty() {
+            return Err(bad(SET_TRANSCRIPT, format!("words[{i}].text is empty")));
+        }
+        // A missing speaker is speaker 0; one that is given must be a whole number 0..=255 (it is
+        // never silently turned into 0 or clamped to 255).
+        let speaker = match w.get("speaker") {
+            None => 0,
+            Some(s) => s
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| bad(SET_TRANSCRIPT, format!("words[{i}].speaker must be a whole number from 0 to 255 (got {s})")))?,
+        };
         words.push(TranscriptWord {
             start: start.min(MAX_POSITION),
             end: end.min(MAX_POSITION),
-            text: clip_text(text.trim(), MAX_WORD_BYTES).to_string(),
+            text: clip_text(text, MAX_WORD_BYTES).to_string(),
             speaker,
         });
     }
@@ -235,13 +247,13 @@ mod tests {
         let t = first_audio(&e);
         let words = json!([
             {"start": 48_000, "end": 60_000, "text": " world ", "speaker": 1},
-            {"start": 0, "end": 12_000, "text": "hello", "speaker": 300},
+            {"start": 0, "end": 12_000, "text": "hello", "speaker": 255},
         ]);
         let r = e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": words, "language": "en", "source": "test"})).unwrap();
         assert_eq!(r["words"], 2);
         let got = e.session().transcript(t).unwrap();
         assert_eq!(got.text(), "hello world");
-        assert_eq!(got.words[0].speaker, u8::MAX, "speaker ids past 255 saturate");
+        assert_eq!(got.words[0].speaker, u8::MAX);
         assert_eq!(got.words[1].speaker, 1);
         assert_eq!((got.language.as_str(), got.source.as_str()), ("en", "test"));
         assert!(e.is_dirty());
@@ -266,6 +278,16 @@ mod tests {
             json!({"track": t.0, "words": [{"start": 1.5, "end": 5, "text": "x"}]}),
             json!({"track": t.0, "words": [{"start": 0, "end": 5}]}),
             json!({"track": t.0, "words": [{"start": 0, "end": u64::MAX, "text": "x"}]}),
+            // a speaker that is given must be a whole number 0..=255: never 0, never clamped
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 256}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 300}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": -1}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 1.5}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": "2"}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": null}]}),
+            // a word with no text is not a word
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": ""}]}),
+            json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "  \t\n "}]}),
         ] {
             assert!(e.execute(SET_TRANSCRIPT, &bad_params).is_err(), "{bad_params}");
         }
@@ -281,6 +303,51 @@ mod tests {
         let w = &e.session().transcript(t).unwrap().words[0];
         assert!(w.text.len() <= MAX_WORD_BYTES && !w.text.is_empty());
         assert!(w.text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn both_transcript_commands_are_undoable() {
+        for id in [SET_TRANSCRIPT, TRANSCRIBE] {
+            let spec = crate::cmd::find_command(id).unwrap();
+            assert!(spec.undoable, "{id} replaces document data, so it must be undoable");
+        }
+    }
+
+    #[test]
+    fn undo_restores_the_previous_transcript() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let set = |e: &mut Engine, text: &str| {
+            e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": [{"start": 0, "end": 10, "text": text}], "language": "en", "source": "test"}))
+                .unwrap();
+        };
+        assert!(e.session().transcript(t).is_none());
+
+        set(&mut e, "first");
+        set(&mut e, "second");
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+        assert_eq!(e.undo_label(), Some("Set Track Transcript"));
+
+        assert!(e.undo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "first", "undo brings back the transcript that was replaced");
+        assert!(e.undo());
+        assert!(e.session().transcript(t).is_none(), "and before that there was none");
+        assert!(e.redo() && e.redo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+
+        // Clearing is undoable too.
+        e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": []})).unwrap();
+        assert!(e.undo());
+        assert_eq!(e.session().transcript(t).unwrap().text(), "second");
+    }
+
+    #[test]
+    fn a_refused_set_transcript_adds_no_undo_step() {
+        let mut e = demo_engine();
+        let t = first_audio(&e);
+        let steps = e.undo_history().len();
+        assert!(e.execute(SET_TRANSCRIPT, &json!({"track": t.0, "words": [{"start": 0, "end": 5, "text": "x", "speaker": 999}]})).is_err());
+        assert_eq!(e.undo_history().len(), steps);
     }
 
     /// A scratch folder removed when dropped.
@@ -385,8 +452,11 @@ mod tests {
         let mut e = demo_engine();
         let t = first_audio(&e);
         let dir = std::env::temp_dir().join(format!("pa-tools-no-models-cmd-{}", std::process::id()));
+        let steps = e.undo_history().len();
         let r = e.execute(TRANSCRIBE, &json!({"track": t.0, "models_dir": dir.to_string_lossy()})).unwrap();
         assert_eq!(r["status"], "model_unavailable");
         assert!(e.session().transcript(t).is_none());
+        // Nothing was stored, so there is nothing to undo.
+        assert_eq!(e.undo_history().len(), steps);
     }
 }

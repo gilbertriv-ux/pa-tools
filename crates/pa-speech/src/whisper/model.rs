@@ -57,7 +57,7 @@ impl Config {
         within("max_target_positions", self.max_target_positions, MIN_TARGET_POSITIONS, MAX_POSITIONS)?;
         within("vocab_size", self.vocab_size, 1, super::tokenizer::MAX_VOCAB)?;
         for (name, heads) in [("encoder_attention_heads", self.encoder_attention_heads), ("decoder_attention_heads", self.decoder_attention_heads)] {
-            if self.d_model % heads != 0 {
+            if !self.d_model.is_multiple_of(heads) {
                 return Err(format!("d_model {} is not a multiple of {name} {heads}", self.d_model));
             }
         }
@@ -79,7 +79,7 @@ struct Attention {
 
 impl Attention {
     fn new(d: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
-        if heads == 0 || d % heads != 0 {
+        if heads == 0 || !d.is_multiple_of(heads) {
             candle_core::bail!("{heads} attention heads do not divide the model width {d}");
         }
         Ok(Self {

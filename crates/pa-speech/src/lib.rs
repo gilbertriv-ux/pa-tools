@@ -21,7 +21,7 @@
 //! exact ticks ([`tick`]/[`ptranscript`]) and converting to the public `f64`-seconds API at the
 //! [`Transcriber`] boundary. Feature `download` adds the verified HTTPS model downloader.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod discover;
 pub mod models;

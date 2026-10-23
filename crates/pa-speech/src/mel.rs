@@ -143,7 +143,7 @@ pub fn log_mel(audio: &[f32], n_mels: usize) -> (usize, Vec<f32>) {
     let (frames, mut m) = mel_energies(audio, n_mels);
     for v in &mut m {
         // `min` keeps an infinite energy (a buffer that was not cleaned) from becoming the maximum
-        *v = v.max(1e-10).min(f32::MAX).log10();
+        *v = if *v > 1e-10 { v.min(f32::MAX) } else { 1e-10 }.log10();
     }
     let max = m.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in &mut m {
