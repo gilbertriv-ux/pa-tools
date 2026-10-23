@@ -15,12 +15,22 @@ pub enum Error {
     /// A slice referenced a parameter set that has not been received.
     #[error("missing parameter set: {0}")]
     MissingParameterSet(String),
+    /// A bug in this decoder (a panic caught while decoding a picture). Never produced by a
+    /// well-formed or by a merely damaged stream; the hostile-input tests assert it never appears.
+    #[error("internal decoder error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn invalid<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Invalid(msg.into()))
+}
+
+/// `v + k` for a coded `*_minus*` field, or the error that field's range check would give (a
+/// value at the top of the `u32` range is out of range for every such field).
+pub(crate) fn plus(v: u32, k: u32, what: &str) -> Result<u32> {
+    v.checked_add(k).ok_or_else(|| Error::Invalid(format!("{what} out of range")))
 }
 
 pub(crate) fn unsupported<T>(msg: impl Into<String>) -> Result<T> {

@@ -142,7 +142,7 @@ impl<F: Clone> Dpb<F> {
     pub fn insert(&mut self, frame: F, poc: i32, output: bool, meta: Arc<OutputMeta>, outs: &mut Vec<Output<F>>) {
         for e in &mut self.entries {
             if e.needed_for_output {
-                e.latency += 1;
+                e.latency = e.latency.saturating_add(1);
             }
         }
         self.entries.push(Entry { frame, poc, marking: Marking::Short, needed_for_output: output, latency: 0, meta });
@@ -179,9 +179,10 @@ impl<F: Clone> Dpb<F> {
         let mut keep = vec![false; self.entries.len()];
         let mut lt_idx: Vec<(Option<usize>, i32, bool, bool)> = Vec::new(); // (entry, poc, used, msb_present)
         for &(lsb, used, msb_present, cycle) in &sh.lt {
+            // (POC arithmetic wraps: a stream that runs the counter around gets nonsense references, not a panic)
             let mut p = lsb as i32;
             if msb_present {
-                p += poc - (cycle as i32).wrapping_mul(max_poc_lsb) - (poc & (max_poc_lsb - 1));
+                p = p.wrapping_add(poc.wrapping_sub((cycle as i32).wrapping_mul(max_poc_lsb)).wrapping_sub(poc & (max_poc_lsb - 1)));
             }
             let found = self
                 .entries
@@ -192,12 +193,12 @@ impl<F: Clone> Dpb<F> {
         // Short-term entries.
         let mut st: Vec<(Option<usize>, i32, bool, bool)> = Vec::new(); // (entry, poc, used, before)
         for &(d, used) in &sh.st_rps.s0 {
-            let p = poc + d;
+            let p = poc.wrapping_add(d);
             let found = self.entries.iter().position(|e| e.marking == Marking::Short && e.poc == p);
             st.push((found, p, used, true));
         }
         for &(d, used) in &sh.st_rps.s1 {
-            let p = poc + d;
+            let p = poc.wrapping_add(d);
             let found = self.entries.iter().position(|e| e.marking == Marking::Short && e.poc == p);
             st.push((found, p, used, false));
         }
@@ -273,11 +274,11 @@ pub fn build_ref_lists<F: Clone>(sh: &SliceHeader, rps: &RefPicSet<F>) -> Result
         }
         for i in 0..sh.num_ref_idx[l] as usize {
             let idx = match &sh.list_entry[l] {
-                Some(e) => e[i] as usize,
+                Some(e) => e.get(i).map_or(usize::MAX, |&v| v as usize),
                 None => i,
             };
-            ensure!(idx < temp.len(), "list_entry out of range");
-            lists[l].push(temp[idx].clone());
+            let Some(r) = temp.get(idx) else { return Err(crate::hevc::error::Error::Invalid("list_entry out of range".into())) };
+            lists[l].push(r.clone());
         }
     }
     Ok(lists)
@@ -298,14 +299,14 @@ impl PocState {
             let prev_lsb = self.prev_tid0_poc & (max_poc_lsb - 1);
             let prev_msb = self.prev_tid0_poc - prev_lsb;
             if lsb < prev_lsb && prev_lsb - lsb >= max_poc_lsb / 2 {
-                prev_msb + max_poc_lsb
+                prev_msb.wrapping_add(max_poc_lsb)
             } else if lsb > prev_lsb && lsb - prev_lsb > max_poc_lsb / 2 {
-                prev_msb - max_poc_lsb
+                prev_msb.wrapping_sub(max_poc_lsb)
             } else {
                 prev_msb
             }
         };
-        msb + lsb
+        msb.wrapping_add(lsb)
     }
 
     /// Update after decoding a picture with the given header and POC.

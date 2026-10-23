@@ -1,7 +1,7 @@
 //! NAL unit header (7.3.1.2) and slice segment header (7.3.6).
 
 use crate::bitstream::BitReader;
-use crate::hevc::error::{Result, ensure, invalid};
+use crate::hevc::error::{Result, ensure, invalid, plus};
 use crate::hevc::params::{Pps, Sps, StRps};
 
 pub mod nal_type {
@@ -130,7 +130,6 @@ pub struct SliceHeader {
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
     pub loop_filter_across_slices: bool,
-    pub entry_points: Vec<u32>,
     /// Byte offset of slice_segment_data() in the RBSP.
     pub data_offset: usize,
 }
@@ -215,7 +214,6 @@ impl SliceHeader {
                 beta_offset_div2: pps.beta_offset_div2,
                 tc_offset_div2: pps.tc_offset_div2,
                 loop_filter_across_slices: pps.loop_filter_across_slices,
-                entry_points: Vec::new(),
                 data_offset: 0,
             }
         };
@@ -259,7 +257,7 @@ impl SliceHeader {
                     let num_lt_sps = if !sps.lt_ref_pics.is_empty() { r.read_ue()? } else { 0 };
                     ensure!(num_lt_sps as usize <= sps.lt_ref_pics.len(), "num_long_term_sps out of range");
                     let num_lt_pics = r.read_ue()?;
-                    ensure!(num_lt_sps + num_lt_pics <= 32, "too many long-term pictures");
+                    ensure!(num_lt_sps.checked_add(num_lt_pics).is_some_and(|n| n <= 32), "too many long-term pictures");
                     let mut msb_acc = 0u32;
                     for i in 0..num_lt_sps + num_lt_pics {
                         let (lsb, used) = if i < num_lt_sps {
@@ -293,9 +291,9 @@ impl SliceHeader {
             if sh.slice_type != SliceType::I {
                 sh.num_ref_idx = [pps.num_ref_idx_l0_default, if sh.is_b() { pps.num_ref_idx_l1_default } else { 0 }];
                 if r.read_flag()? {
-                    sh.num_ref_idx[0] = r.read_ue()? + 1;
+                    sh.num_ref_idx[0] = plus(r.read_ue()?, 1, "num_ref_idx_l0_active_minus1")?;
                     if sh.is_b() {
-                        sh.num_ref_idx[1] = r.read_ue()? + 1;
+                        sh.num_ref_idx[1] = plus(r.read_ue()?, 1, "num_ref_idx_l1_active_minus1")?;
                     }
                 }
                 ensure!(sh.num_ref_idx[0] <= 15 && sh.num_ref_idx[1] <= 15, "num_ref_idx_active out of range");
@@ -339,9 +337,8 @@ impl SliceHeader {
                 sh.max_num_merge_cand = 5 - five_minus;
             }
             sh.qp_delta = r.read_se()?;
-            let qp = pps.init_qp + sh.qp_delta;
             let qp_bd = 6 * (sps.bit_depth_luma as i32 - 8);
-            ensure!((-qp_bd..=51).contains(&qp), "SliceQpY {qp} out of range");
+            ensure!(pps.init_qp.checked_add(sh.qp_delta).is_some_and(|qp| (-qp_bd..=51).contains(&qp)), "SliceQpY out of range");
             if pps.slice_chroma_qp_offsets_present {
                 sh.cb_qp_offset = r.read_se()?;
                 sh.cr_qp_offset = r.read_se()?;
@@ -360,16 +357,15 @@ impl SliceHeader {
                 sh.loop_filter_across_slices = r.read_flag()?;
             }
         }
-        sh.entry_points.clear();
         if pps.tiles_enabled || pps.entropy_coding_sync {
+            // The entry points are validated and skipped, not kept: substreams follow each other
+            // in the slice data, so the decoder finds each one where the previous ended.
             let n = r.read_ue()?;
             ensure!(n <= sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), "num_entry_point_offsets out of range");
             if n > 0 {
-                let len = r.read_ue()? + 1;
+                let len = plus(r.read_ue()?, 1, "offset_len_minus1")?;
                 ensure!(len <= 32, "offset_len_minus1 out of range");
-                for _ in 0..n {
-                    sh.entry_points.push(r.read_bits(len)? + 1);
-                }
+                r.skip(n as usize * len as usize)?;
             }
         }
         if pps.slice_header_extension_present {
@@ -391,9 +387,12 @@ fn parse_pwt(r: &mut BitReader, sh: &SliceHeader, sps: &Sps) -> Result<PredWeigh
     ensure!(t.luma_log2_denom <= 7, "luma_log2_weight_denom out of range");
     let chroma = sps.chroma_array_type() != 0;
     if chroma {
-        let d = t.luma_log2_denom as i32 + r.read_se()?;
-        ensure!((0..=7).contains(&d), "ChromaLog2WeightDenom out of range");
-        t.chroma_log2_denom = d as u32;
+        let d = r.read_se()?;
+        ensure!(
+            i32::try_from(t.luma_log2_denom).ok().and_then(|l| l.checked_add(d)).is_some_and(|d| (0..=7).contains(&d)),
+            "ChromaLog2WeightDenom out of range"
+        );
+        t.chroma_log2_denom = (t.luma_log2_denom as i32 + d) as u32;
     }
     let lists = if sh.is_b() { 2 } else { 1 };
     for l in 0..lists {

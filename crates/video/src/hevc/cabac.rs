@@ -194,7 +194,6 @@ impl<'a> Cabac<'a> {
     /// compare-subtract steps.
     #[inline(always)]
     pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
-        debug_assert!(n <= 16);
         if self.bits < n {
             self.refill();
         }

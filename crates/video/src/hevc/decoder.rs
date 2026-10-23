@@ -5,7 +5,7 @@
 //! feature) that publishes finished CTB rows into the picture's shared [`Frame`]; jobs of later pictures
 //! block per row on the reference data they read, so several pictures decode concurrently.
 
-use crate::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
+use crate::bitstream::{annexb_nals, unescape_rbsp};
 use crate::hevc::dpb::{Dpb, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
 use crate::hevc::error::{Error, Result, ensure, invalid};
 use crate::hevc::params::{Layout, Pps, Sps, Vps};
@@ -168,8 +168,11 @@ impl Decoder {
                 ensure!(pos + 2 <= hvcc.len(), "hvcC truncated");
                 let len = u16::from_be_bytes([hvcc[pos], hvcc[pos + 1]]) as usize;
                 pos += 2;
-                ensure!(pos + len <= hvcc.len(), "hvcC truncated");
-                self.handle_nal(&hvcc[pos..pos + len], 0)?;
+                let Some(nal) = hvcc.get(pos..pos + len) else { return invalid("hvcC truncated") };
+                // only parameter sets are taken from the record (never a picture)
+                if nal.first().is_some_and(|b| (nal_type::VPS..=nal_type::PPS).contains(&((b >> 1) & 0x3f))) {
+                    self.handle_nal(nal, 0)?;
+                }
                 pos += len;
             }
         }
@@ -187,7 +190,7 @@ impl Decoder {
     /// access unit through reordering.
     pub fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
         let nals = match self.nal_length_size {
-            Some(n) => length_prefixed_nals(data, n)?,
+            Some(n) => split_length_prefixed(data, n)?,
             None => annexb_nals(data),
         };
         let mut result = Ok(());
@@ -263,19 +266,22 @@ impl Decoder {
         }
         match hdr.nal_type {
             nal_type::VPS => {
-                let v = Vps::parse(&unescape_rbsp(&nal[2..]))?;
-                let id = v.id as usize;
-                self.vpss[id] = Some(Arc::new(v));
+                // The VPS is informational for a single-layer decoder: one that does not parse is ignored.
+                if let Ok(v) = Vps::parse(&unescape_rbsp(&nal[2..]))
+                    && let Some(slot) = self.vpss.get_mut(v.id as usize)
+                {
+                    *slot = Some(Arc::new(v));
+                }
             }
             nal_type::SPS => {
                 let s = Sps::parse(&unescape_rbsp(&nal[2..]))?;
-                let id = s.id as usize;
-                self.spss[id] = Some(Arc::new(s));
+                let Some(slot) = self.spss.get_mut(s.id as usize) else { return invalid("SPS id out of range") };
+                *slot = Some(Arc::new(s));
             }
             nal_type::PPS => {
                 let p = Pps::parse(&unescape_rbsp(&nal[2..]))?;
-                let id = p.id as usize;
-                self.ppss[id] = Some(Arc::new(p));
+                let Some(slot) = self.ppss.get_mut(p.id as usize) else { return invalid("PPS id out of range") };
+                *slot = Some(Arc::new(p));
             }
             nal_type::EOS | nal_type::EOB => {
                 self.submit_pending();
@@ -333,8 +339,11 @@ impl Decoder {
             &rbsp,
             hdr,
             |id| {
-                let pps = ppss[id as usize].as_ref().ok_or_else(|| Error::MissingParameterSet(format!("PPS {id}")))?;
-                let sps = spss[pps.sps_id as usize].as_ref().ok_or_else(|| Error::MissingParameterSet(format!("SPS {}", pps.sps_id)))?;
+                let pps = ppss.get(id as usize).and_then(|p| p.as_ref()).ok_or_else(|| Error::MissingParameterSet(format!("PPS {id}")))?;
+                let sps = spss
+                    .get(pps.sps_id as usize)
+                    .and_then(|s| s.as_ref())
+                    .ok_or_else(|| Error::MissingParameterSet(format!("SPS {}", pps.sps_id)))?;
                 Ok((pps.clone(), sps.clone()))
             },
             prev,
@@ -346,6 +355,12 @@ impl Decoder {
         } else {
             let Some(p) = &self.pending else { return invalid("slice segment without the first slice of its picture") };
             ensure!(Arc::ptr_eq(&p.pps, &pps), "PPS changed within a picture");
+            ensure!(Arc::ptr_eq(&p.sps, &sps), "SPS changed within a picture");
+            // every slice segment holds at least one CTB
+            ensure!(
+                (p.slices.len() as u64) < u64::from(sps.pic_width_in_ctbs()) * u64::from(sps.pic_height_in_ctbs()),
+                "more slice segments than CTBs"
+            );
         }
         let Some(pending) = self.pending.as_mut() else {
             return invalid("slice segment without the first slice of its picture");
@@ -393,7 +408,9 @@ impl Decoder {
         self.active_sps = Some(sps.clone());
         self.dpb.max_dec_pic_buffering = sps.max_dec_pic_buffering as usize;
         self.dpb.max_num_reorder = sps.max_num_reorder as usize;
-        self.dpb.max_latency = if sps.max_latency_increase_plus1 != 0 { sps.max_num_reorder + sps.max_latency_increase_plus1 - 1 } else { 0 };
+        // SpsMaxLatencyPictures (7-9); a value that does not fit means "never exceeded"
+        self.dpb.max_latency =
+            if sps.max_latency_increase_plus1 != 0 { sps.max_num_reorder.saturating_add(sps.max_latency_increase_plus1 - 1) } else { 0 };
         let irap_no_rasl = hdr.is_irap() && (hdr.is_idr() || hdr.is_bla() || self.first_picture || self.after_eos);
         if hdr.is_irap() {
             self.skip_rasl = irap_no_rasl;
@@ -411,11 +428,23 @@ impl Decoder {
         let template = Frame::new(0, 0, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma);
         let next_id = &mut self.next_id;
         let mut missing = 0u64;
+        // A missing reference picture is a grey frame of its own (8.3.3). The DPB budget (`Sps::dpb_bytes`)
+        // allows the pictures it holds plus these, so past that room the grey frames share one buffer.
+        let dpb_size = sps.max_dec_pic_buffering as usize;
+        let room = (dpb_size + 1).saturating_sub(self.dpb.entries.len()).max(1) as u64;
+        let mut shared: Option<FrameRef> = None;
         let mut make_missing = |p: i32| -> FrameRef {
             missing += 1;
+            if missing > room
+                && let Some(f) = &shared
+            {
+                return f.clone();
+            }
             let id = *next_id;
-            *next_id += 1;
-            Arc::new(Frame::gray(id, p, &template))
+            *next_id = next_id.wrapping_add(1);
+            let f = Arc::new(Frame::gray(id, p, &template));
+            shared = Some(f.clone());
+            f
         };
         let rps = self.dpb.apply_rps(sh, poc, max_lsb, irap_no_rasl, &mut make_missing)?;
         if missing > 0 {
@@ -431,10 +460,13 @@ impl Decoder {
             self.dpb.bump_before_decode(&mut outs);
         }
         self.out_queue.extend(outs);
+        // A conforming stream never holds more pictures than the DPB size (the budget in `Sps::dpb_bytes`
+        // counts that many plus the current one and one spare).
+        ensure!(self.dpb.entries.len() <= dpb_size + 1, "decoded picture buffer overflow");
         let (layout, scaling) = self.layout_for(pps, sps)?;
         let _ = scaling;
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.wrapping_add(1);
         let frame = Arc::new(Frame::new(id, poc, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma));
         let output = sh.pic_output && !(hdr.is_rasl() && self.skip_rasl);
         // Draft mode: a sub-layer non-reference picture of the highest sub-layer is never used
@@ -509,6 +541,24 @@ impl Decoder {
     }
 }
 
+/// Split a length-prefixed access unit (`length_size` bytes of big-endian length before each NAL unit,
+/// 1 to 4) into NAL units; a length that runs past the data is an error. (Checked arithmetic: on a
+/// 32-bit target `index + length` could wrap.)
+fn split_length_prefixed(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    let mut out = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        let Some((len_bytes, tail)) = rest.split_at_checked(length_size) else { return invalid("truncated NAL unit length") };
+        let len = len_bytes.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+        let Some((nal, tail)) = usize::try_from(len).ok().and_then(|n| tail.split_at_checked(n)) else {
+            return invalid("NAL unit runs past the end of the sample");
+        };
+        out.push(nal);
+        rest = tail;
+    }
+    Ok(out)
+}
+
 /// Decode all slices of one picture and publish its rows, in the picture's sample type.
 #[allow(clippy::too_many_arguments)]
 fn run_job(
@@ -556,7 +606,7 @@ fn run_job_as<S: Sample>(
         Err(_) => {
             // make sure readers never block on this frame
             frame.publish_gray();
-            Some(Error::Invalid("internal error while decoding a picture".into()))
+            Some(Error::Internal("panic while decoding a picture".into()))
         }
     };
     if let Ok(mut s) = shared.stats.lock() {
