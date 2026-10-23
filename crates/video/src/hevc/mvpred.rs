@@ -119,7 +119,8 @@ impl<'a, S: crate::hevc::picture::Sample> SliceDecoder<'a, S> {
         let av_b2 = avail(pb2.0, pb2.1);
         let fl_b2 = av_b2 && {
             let m = self.mv_at(pb2.0, pb2.1);
-            !((av_a1 && same_motion(&m_a1, &m)) || (av_b1 && same_motion(&m_b1, &m))) && (fl_a0 as u32 + av_a1 as u32 + fl_b0 as u32 + fl_b1 as u32) != 4
+            !((av_a1 && same_motion(&m_a1, &m)) || (av_b1 && same_motion(&m_b1, &m)))
+                && (fl_a0 as u32 + av_a1 as u32 + fl_b0 as u32 + fl_b1 as u32) != 4
         };
         if fl_b2 {
             list[n] = self.mv_at(pb2.0, pb2.1);
@@ -276,7 +277,10 @@ impl<'a, S: crate::hevc::picture::Sample> SliceDecoder<'a, S> {
             pick.map(|(mv, r)| if r.poc != tpoc && !r.long_term && !tlt { scale_mv(mv, cur_poc - r.poc, cur_poc - tpoc) } else { mv })
         };
         let pa = [(xp - 1, yp + h), (xp - 1, yp + h - 1)];
-        let av_a = [self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[0].0, pa[0].1), self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[1].0, pa[1].1)];
+        let av_a = [
+            self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[0].0, pa[0].1),
+            self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[1].0, pa[1].1),
+        ];
         let is_scaled = av_a[0] || av_a[1];
         let mut a = None;
         for k in 0..2 {

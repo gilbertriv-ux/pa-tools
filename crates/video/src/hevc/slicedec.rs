@@ -678,8 +678,11 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         if intra {
             self.fill_blk(x0, y0, n, n, |b| b.flags |= F_INTRA);
             self.intra_split = part == PartMode::PNxN;
-            let pcm =
-                part == PartMode::P2Nx2N && self.sps.pcm && log2 >= self.sps.log2_min_pcm && log2 <= self.sps.log2_max_pcm && self.c.decode_terminate() == 1;
+            let pcm = part == PartMode::P2Nx2N
+                && self.sps.pcm
+                && log2 >= self.sps.log2_min_pcm
+                && log2 <= self.sps.log2_max_pcm
+                && self.c.decode_terminate() == 1;
             if pcm {
                 self.pcm_sample(x0, y0, log2)?;
                 if self.sps.pcm_loop_filter_disabled {
@@ -892,13 +895,14 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     }
 
     fn transform_tree(&mut self, x0: i32, y0: i32, xb: i32, yb: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf_c: [bool; 2]) -> Result<()> {
-        let split = if log2 <= self.sps.log2_max_tb && log2 > self.sps.log2_min_tb && depth < self.max_trafo_depth && !(self.intra_split && depth == 0) {
-            self.dd(SPLIT_TRANSFORM + (5 - log2 as usize)) == 1
-        } else {
-            // interSplitFlag (7.4.9.8)
-            let inter_split = self.sps.max_th_depth_inter == 0 && !self.cu_intra && self.cu_part != PartMode::P2Nx2N && depth == 0;
-            log2 > self.sps.log2_max_tb || (self.intra_split && depth == 0) || inter_split
-        };
+        let split =
+            if log2 <= self.sps.log2_max_tb && log2 > self.sps.log2_min_tb && depth < self.max_trafo_depth && !(self.intra_split && depth == 0) {
+                self.dd(SPLIT_TRANSFORM + (5 - log2 as usize)) == 1
+            } else {
+                // interSplitFlag (7.4.9.8)
+                let inter_split = self.sps.max_th_depth_inter == 0 && !self.cu_intra && self.cu_part != PartMode::P2Nx2N && depth == 0;
+                log2 > self.sps.log2_max_tb || (self.intra_split && depth == 0) || inter_split
+            };
         let mut cbf_c = [false, false];
         if log2 > 2 {
             for (c, cbf) in cbf_c.iter_mut().enumerate() {
@@ -921,7 +925,8 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             self.transform_tree(x0 + h, y0 + h, x0, y0, log2 - 1, depth + 1, 3, cbf_c)?;
             return Ok(());
         }
-        let cbf_luma = if self.cu_intra || depth != 0 || cbf_c[0] || cbf_c[1] { self.dd(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
+        let cbf_luma =
+            if self.cu_intra || depth != 0 || cbf_c[0] || cbf_c[1] { self.dd(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
         let n = 1 << log2;
         if depth > 0 {
             self.mark_edges(x0, y0, n, n, E_TU_V, E_TU_H);
@@ -996,8 +1001,9 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let mut al = [false; 129];
         let mut at = [false; 129];
         let addr = self.slice_addr;
-        let avail =
-            |pic: &PicState<S>, xn: i32, yn: i32| -> bool { pic.zavail(xl, yl, xn, yn, addr) && (!constrained || pic.blk_at(xn, yn).flags & F_INTRA != 0) };
+        let avail = |pic: &PicState<S>, xn: i32, yn: i32| -> bool {
+            pic.zavail(xl, yl, xn, yn, addr) && (!constrained || pic.blk_at(xn, yn).flags & F_INTRA != 0)
+        };
         let plane = &self.pic.planes[c];
         let r = &mut self.refs_buf;
         // corner
@@ -1325,7 +1331,19 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     }
 
     /// prediction_unit(): parse, derive motion, store it and predict. Returns merge_flag.
-    fn prediction_unit(&mut self, xc: i32, yc: i32, ncb: i32, xp: i32, yp: i32, w: i32, h: i32, part_idx: usize, part: PartMode, skip: bool) -> Result<bool> {
+    fn prediction_unit(
+        &mut self,
+        xc: i32,
+        yc: i32,
+        ncb: i32,
+        xp: i32,
+        yp: i32,
+        w: i32,
+        h: i32,
+        part_idx: usize,
+        part: PartMode,
+        skip: bool,
+    ) -> Result<bool> {
         let merge = if skip { true } else { self.dd(MERGE_FLAG) == 1 };
         let mvf = if merge {
             let idx = if self.sh.max_num_merge_cand > 1 {

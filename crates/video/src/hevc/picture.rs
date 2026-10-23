@@ -313,7 +313,12 @@ impl Frame {
     /// Crop the frame into planar buffers (waits for completion): 8-bit planes when `eight_bit`,
     /// else 16-bit ones. Rows stored in the output type are copied as they are.
     pub fn cropped_planes(&self, crop: (usize, usize, usize, usize), eight_bit: bool) -> (Plane, Plane, Plane) {
-        fn planes<S: Sample, T>(f: &Frame, crop: (usize, usize, usize, usize), conv: impl Fn(S) -> T, wrap: impl Fn(Vec<T>) -> Plane) -> (Plane, Plane, Plane) {
+        fn planes<S: Sample, T>(
+            f: &Frame,
+            crop: (usize, usize, usize, usize),
+            conv: impl Fn(S) -> T,
+            wrap: impl Fn(Vec<T>) -> Plane,
+        ) -> (Plane, Plane, Plane) {
             let (y, u, v) = f.copy_cropped::<S, T>(crop, conv);
             (wrap(y), wrap(u), wrap(v))
         }
@@ -548,7 +553,8 @@ mod tests {
             let (cx, cy, cw, ch) = crop;
             let want_y: Vec<u16> = (cy..cy + ch).flat_map(|r| y[r * w + cx..r * w + cx + cw].to_vec()).collect();
             let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(2));
-            let want_c = |p: &[u16]| -> Vec<u16> { (cy / 2..cy / 2 + cch).flat_map(|r| p[r * w / 2 + cx / 2..r * w / 2 + cx / 2 + ccw].to_vec()).collect() };
+            let want_c =
+                |p: &[u16]| -> Vec<u16> { (cy / 2..cy / 2 + cch).flat_map(|r| p[r * w / 2 + cx / 2..r * w / 2 + cx / 2 + ccw].to_vec()).collect() };
             let got = |p: &Plane| -> Vec<u16> { (0..p.len()).map(|i| p.get(i)).collect() };
             assert_eq!(got(&py), want_y, "luma bd {bd}");
             assert_eq!(got(&pu), want_c(&cb), "cb bd {bd}");

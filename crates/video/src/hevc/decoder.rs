@@ -5,6 +5,7 @@
 //! feature) that publishes finished CTB rows into the picture's shared [`Frame`]; jobs of later pictures
 //! block per row on the reference data they read, so several pictures decode concurrently.
 
+use crate::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
 use crate::hevc::dpb::{Dpb, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
 use crate::hevc::error::{Error, Result, ensure, invalid};
 use crate::hevc::params::{Layout, Pps, Sps, Vps};
@@ -12,7 +13,6 @@ use crate::hevc::picture::{Frame, FrameRef, Sample, stores_u8};
 use crate::hevc::slice::{NalHeader, SliceHeader, nal_type};
 use crate::hevc::slicedec::{Blk, F_INTRA, F_SKIP, PicState, SliceDecoder, SliceJob};
 use crate::hevc::{ColorInfo, Picture};
-use crate::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -294,7 +294,8 @@ impl Decoder {
         }
         let layout = Arc::new(Layout::new(sps, pps)?);
         let scaling = if sps.scaling_list_enabled {
-            let list = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).cloned().unwrap_or_else(crate::hevc::params::ScalingList::default_lists);
+            let list =
+                pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).cloned().unwrap_or_else(crate::hevc::params::ScalingList::default_lists);
             let mut v = Vec::with_capacity(24);
             for size in 0..4 {
                 for m in 0..6 {
@@ -471,7 +472,8 @@ impl Decoder {
     fn submit_pending(&mut self) {
         let Some(p) = self.pending.take() else { return };
         let PendingPic { frame, sps, pps, layout, first_sh, poc, output, meta, slices, .. } = p;
-        let scaling = self.layout_cache.iter().find(|(pp, ss, _, _)| Arc::ptr_eq(pp, &pps) && Arc::ptr_eq(ss, &sps)).and_then(|(_, _, _, s)| s.clone());
+        let scaling =
+            self.layout_cache.iter().find(|(pp, ss, _, _)| Arc::ptr_eq(pp, &pps) && Arc::ptr_eq(ss, &sps)).and_then(|(_, _, _, s)| s.clone());
         self.dispatch(frame.clone(), sps, pps, layout, scaling, slices, meta.draft);
         self.poc_state.update(&first_sh, poc);
         let mut outs = Vec::new();

@@ -1,8 +1,8 @@
 //! NAL unit header (7.3.1.2) and slice segment header (7.3.6).
 
+use crate::bitstream::BitReader;
 use crate::hevc::error::{Result, ensure, invalid};
 use crate::hevc::params::{Pps, Sps, StRps};
-use crate::bitstream::BitReader;
 
 pub mod nal_type {
     pub const TRAIL_N: u8 = 0;

@@ -85,7 +85,9 @@ impl<F> Default for Dpb<F> {
 
 impl<F: Clone> Dpb<F> {
     fn bump(&mut self, outs: &mut Vec<Output<F>>) -> bool {
-        let Some(i) = (0..self.entries.len()).filter(|&i| self.entries[i].needed_for_output).min_by_key(|&i| self.entries[i].poc) else { return false };
+        let Some(i) = (0..self.entries.len()).filter(|&i| self.entries[i].needed_for_output).min_by_key(|&i| self.entries[i].poc) else {
+            return false;
+        };
         let e = &mut self.entries[i];
         e.needed_for_output = false;
         outs.push(Output { frame: e.frame.clone(), poc: e.poc, meta: e.meta.clone() });
@@ -181,8 +183,10 @@ impl<F: Clone> Dpb<F> {
             if msb_present {
                 p += poc - (cycle as i32).wrapping_mul(max_poc_lsb) - (poc & (max_poc_lsb - 1));
             }
-            let found =
-                self.entries.iter().position(|e| e.marking != Marking::Unused && if msb_present { e.poc == p } else { (e.poc & (max_poc_lsb - 1)) == p });
+            let found = self
+                .entries
+                .iter()
+                .position(|e| e.marking != Marking::Unused && if msb_present { e.poc == p } else { (e.poc & (max_poc_lsb - 1)) == p });
             lt_idx.push((found, p, used, msb_present));
         }
         // Short-term entries.

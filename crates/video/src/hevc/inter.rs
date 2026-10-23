@@ -95,7 +95,14 @@ fn filt16_w<'a, P: Px + 'a, const T: usize, const W: usize>(tap: impl Fn(usize) 
 /// [`filt_w`] for a run of `w` outputs (prediction block widths are fixed sizes); in 16-bit lanes
 /// ([`filt16_w`]) when `narrow` (a first pass over 8-bit samples).
 #[inline(always)]
-fn filt<'a, P: Px + 'a, const T: usize>(tap: impl Fn(usize) -> Option<&'a [P]> + Copy, f: &[i8; T], shift: u32, out: &mut [i16], w: usize, narrow: bool) {
+fn filt<'a, P: Px + 'a, const T: usize>(
+    tap: impl Fn(usize) -> Option<&'a [P]> + Copy,
+    f: &[i8; T],
+    shift: u32,
+    out: &mut [i16],
+    w: usize,
+    narrow: bool,
+) {
     if narrow {
         match w {
             4 => return filt16_w::<P, T, 4>(tap, f, out),

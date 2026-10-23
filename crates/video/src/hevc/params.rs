@@ -1,10 +1,10 @@
 //! Parameter sets: VPS (7.3.2.1), SPS (7.3.2.2), PPS (7.3.2.3), profile/tier/level, scaling lists
 //! (7.3.4), short-term reference picture sets (7.3.7) and VUI (E.2.1).
 
+use crate::bitstream::BitReader;
 use crate::hevc::error::{Result, ensure, unsupported};
 use crate::hevc::spec_tables::{DEFAULT_SCALING_INTER, DEFAULT_SCALING_INTRA};
 use crate::hevc::tables::scan_diag;
-use crate::bitstream::BitReader;
 
 /// General profile / tier / level information.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -144,7 +144,15 @@ pub struct Vui {
 
 impl Default for Vui {
     fn default() -> Self {
-        Vui { sar: (0, 0), full_range: false, colour_primaries: 2, transfer_characteristics: 2, matrix_coefficients: 2, field_seq: false, timing: None }
+        Vui {
+            sar: (0, 0),
+            full_range: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            field_seq: false,
+            timing: None,
+        }
     }
 }
 
@@ -507,7 +515,10 @@ impl Sps {
         ensure!(width % (1 << log2_min_cb) == 0 && height % (1 << log2_min_cb) == 0, "picture size not a multiple of MinCbSizeY");
         let max_th_depth_inter = r.read_ue()?;
         let max_th_depth_intra = r.read_ue()?;
-        ensure!(max_th_depth_inter <= log2_ctb - log2_min_tb && max_th_depth_intra <= log2_ctb - log2_min_tb, "transform hierarchy depth out of range");
+        ensure!(
+            max_th_depth_inter <= log2_ctb - log2_min_tb && max_th_depth_intra <= log2_ctb - log2_min_tb,
+            "transform hierarchy depth out of range"
+        );
         let scaling_list_enabled = r.read_flag()?;
         let mut scaling_list = None;
         if scaling_list_enabled {
@@ -516,7 +527,8 @@ impl Sps {
         let amp = r.read_flag()?;
         let sao = r.read_flag()?;
         let pcm = r.read_flag()?;
-        let (mut pcm_bit_depth_luma, mut pcm_bit_depth_chroma, mut log2_min_pcm, mut log2_max_pcm, mut pcm_loop_filter_disabled) = (8, 8, 0, 0, false);
+        let (mut pcm_bit_depth_luma, mut pcm_bit_depth_chroma, mut log2_min_pcm, mut log2_max_pcm, mut pcm_loop_filter_disabled) =
+            (8, 8, 0, 0, false);
         if pcm {
             pcm_bit_depth_luma = r.read_bits(4)? + 1;
             pcm_bit_depth_chroma = r.read_bits(4)? + 1;
