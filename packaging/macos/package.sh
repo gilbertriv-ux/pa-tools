@@ -19,8 +19,9 @@
 #   PT_FEATURES           cargo features for both binaries, e.g. "whisper,download" (default: none)
 #   PT_MODELS_DIR         a models folder (holding e.g. whisper-base/) copied into
 #                         Contents/Resources/models before signing, where the app looks for it.
-#                         Visible entries only, symbolic links followed (a self-contained bundle);
-#                         an empty folder or one with no <model>/model.safetensors only warns.
+#                         Visible entries only, symbolic links followed (a self-contained bundle;
+#                         a link to nowhere is skipped with a warning); an empty folder or one
+#                         with no <model>/model.safetensors only warns.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
