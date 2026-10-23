@@ -162,9 +162,18 @@ fn ci() -> Result<(), String> {
                 cargo(&["clippy", "-p", "soundcraft-video", "--all-targets", "--features", "hevc-decode,av1-decode", "--", "-D", "warnings"])
             }),
         ),
+        // `threads` (rayon) turns on the parallel paths of the decoders (frame threads, tile threads), which
+        // the single-threaded runs above never take.
+        (
+            "clippy video hevc+av1+threads",
+            Box::new(|| {
+                cargo(&["clippy", "-p", "soundcraft-video", "--all-targets", "--features", "hevc-decode,av1-decode,threads", "--", "-D", "warnings"])
+            }),
+        ),
         ("test", Box::new(|| cargo(&["test", "--workspace"]))),
         ("test video hevc", Box::new(|| cargo(&["test", "-p", "soundcraft-video", "--features", "hevc-decode"]))),
         ("test video hevc+av1", Box::new(|| cargo(&["test", "-p", "soundcraft-video", "--features", "hevc-decode,av1-decode"]))),
+        ("test video hevc+av1+threads", Box::new(|| cargo(&["test", "-p", "soundcraft-video", "--features", "hevc-decode,av1-decode,threads"]))),
         ("assets", Box::new(assets)),
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),
