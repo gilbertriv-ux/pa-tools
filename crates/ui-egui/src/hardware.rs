@@ -26,7 +26,9 @@ pub(crate) fn disconnect(app: &mut SoundApp) {
     if let Some(player) = &app.player {
         player.detach_midi_input();
     }
-    app.hardware.connection = None;
+    if app.hardware.connection.take().is_some() {
+        app.hardware.status = "MIDI Thru disconnected. Reconnect after changing the audio engine or session.".into();
+    }
 }
 
 fn refresh(state: &mut HardwareState) -> Result<Value, String> {
