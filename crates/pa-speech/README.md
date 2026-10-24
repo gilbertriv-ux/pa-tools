@@ -1,6 +1,6 @@
 # soundcraft-pa-speech
 
-Speech-to-text for Pa Tools (Text ▸ Transcript). Standalone, layer-0 crate — no `soundcraft-*`
+Speech-to-text for Pa Tools (Window ▸ Transcript). Standalone, layer-0 crate — no `soundcraft-*`
 dependency. Ported from FilmCraft's [`filmcraft-speech`](https://github.com/storytold/filmcraft)
 (MIT OR Apache-2.0); the donor's `filmcraft-time` and `filmcraft-project` types are inlined here as
 plain `f64` seconds.

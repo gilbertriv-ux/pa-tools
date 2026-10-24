@@ -1,4 +1,4 @@
-//! Per-track speech transcripts (Text ▸ Transcript).
+//! Per-track speech transcripts (Window ▸ Transcript).
 //!
 //! A [`Transcript`] is produced by the speech-to-text engine (`soundcraft-pa-speech`) and stored on
 //! the session.

@@ -22,6 +22,13 @@
 //! Nothing here names the speech model's maker or its id: people read the catalogue's display name
 //! ("Speech model, base (multilingual)"), and the folders searched go to the log, not the status line.
 //!
+//! When the model is not on disk and the build has the `download` feature, the window offers to fetch
+//! it: a "Download …" button spawns a background thread that runs the verified downloader
+//! ([`soundcraft_pa_speech::models::download`]) into the folder a later transcription will look in,
+//! reporting progress on the same bar and honouring Cancel with the same discipline as a
+//! transcription (one long job at a time). Without the feature the window compiles unchanged and shows
+//! no download button.
+//!
 //! Time origin: a transcript's word times are samples from the session start, the same origin as
 //! markers and clip positions, never relative to a clip or to a render range.
 
@@ -35,6 +42,12 @@ use soundcraft_time::{SampleRate, Samples};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+#[cfg(feature = "download")]
+use soundcraft_pa_speech::{
+    SpeechError,
+    models::{self, ModelInfo},
+};
 
 /// The command the Transcribe Track button runs (on a background thread, so the app stays alive).
 const TRANSCRIBE_CMD: &str = "track.transcribe";
@@ -212,6 +225,20 @@ pub struct TranscriptState {
     transcriber: Option<SharedTranscriber>,
     /// A transcription asked for before there was a frame to start it in (see [`invoke`]).
     pending: Option<TrackId>,
+    /// A model download under way (feature `download`).
+    #[cfg(feature = "download")]
+    download: Option<Downloading>,
+    /// The worker thread of a download that was cancelled and has not finished yet. No other job
+    /// (download or transcription) starts while it is alive.
+    #[cfg(feature = "download")]
+    download_stopping: Option<std::thread::JoinHandle<()>>,
+    /// A downloader to use instead of the verified one (tests; see [`TranscriptState::inject_downloader`]).
+    #[cfg(feature = "download")]
+    downloader: Option<Downloader>,
+    /// Set when the last transcription attempt could not find the model, so the window offers to
+    /// download it. Cleared when a transcription starts, a transcript is stored, or a download succeeds.
+    #[cfg(feature = "download")]
+    needs_download: bool,
     view: Option<View>,
     shown: Option<TrackId>,
     editing: Option<SpeakerEdit>,
@@ -234,6 +261,14 @@ impl Default for TranscriptState {
             stopping: None,
             transcriber: None,
             pending: None,
+            #[cfg(feature = "download")]
+            download: None,
+            #[cfg(feature = "download")]
+            download_stopping: None,
+            #[cfg(feature = "download")]
+            downloader: None,
+            #[cfg(feature = "download")]
+            needs_download: false,
             view: None,
             shown: None,
             editing: None,
@@ -267,6 +302,32 @@ impl TranscriptState {
     pub fn has_injected_transcriber(&self) -> bool {
         self.transcriber.is_some()
     }
+
+    /// Whether a model download is running.
+    #[cfg(feature = "download")]
+    pub fn is_downloading(&self) -> bool {
+        self.download.is_some()
+    }
+
+    /// Whether a cancelled download is still winding down on its worker thread.
+    #[cfg(feature = "download")]
+    pub fn is_download_stopping(&self) -> bool {
+        self.download_stopping.as_ref().is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Whether the window is offering to download the model (the last transcription found none).
+    #[cfg(feature = "download")]
+    pub fn is_offering_download(&self) -> bool {
+        self.needs_download
+    }
+
+    /// Use `downloader` instead of the verified one for every download this window starts. This is
+    /// the seam for tests, which drive the download state machine without touching the network; the
+    /// program never calls it, so every real download runs the verified downloader.
+    #[cfg(feature = "download")]
+    pub fn inject_downloader(&mut self, downloader: Downloader) {
+        self.downloader = Some(downloader);
+    }
 }
 
 /// A transcription on its worker thread.
@@ -288,6 +349,33 @@ enum Msg {
     Done(Result<TranscribeOutcome, String>),
 }
 
+/// A model download on its worker thread (feature `download`). Mirrors [`Running`]: the same
+/// progress/cancel/reap shape, so the window never holds two long jobs at once.
+#[cfg(feature = "download")]
+struct Downloading {
+    /// The model's neutral display name, for the status line (never its id or maker).
+    label: String,
+    /// When it started, in egui time.
+    started: f64,
+    fraction: f32,
+    stage: String,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<DownloadMsg>,
+    /// The worker thread, kept so that a cancel can wait for it (see [`TranscriptState::download_stopping`]).
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "download")]
+enum DownloadMsg {
+    Progress(f32, String),
+    Done(Result<(), String>),
+}
+
+/// How a download is carried out: the verified downloader in the program, an injected one in tests
+/// (so nothing touches the network). Same shape as [`soundcraft_pa_speech::models::download`].
+#[cfg(feature = "download")]
+pub type Downloader = Arc<dyn Fn(&std::path::Path, &ModelInfo, &mut dyn FnMut(u64, u64, &str) -> bool) -> Result<(), SpeechError> + Send + Sync>;
+
 /// A speaker's name being typed into its badge.
 struct SpeakerEdit {
     /// The line (index into the segments) whose badge is being edited.
@@ -306,11 +394,23 @@ struct SpeakerEdit {
 #[derive(Debug, Clone, PartialEq)]
 enum Action {
     Locate(Samples),
-    Select { track: TrackId, start: Samples, end: Samples },
-    Rename { track: TrackId, speaker: u8, name: String },
+    Select {
+        track: TrackId,
+        start: Samples,
+        end: Samples,
+    },
+    Rename {
+        track: TrackId,
+        speaker: u8,
+        name: String,
+    },
     Anchor(Option<usize>),
     Transcribe(TrackId),
     Cancel,
+    #[cfg(feature = "download")]
+    Download,
+    #[cfg(feature = "download")]
+    CancelDownload,
 }
 
 /// Read-only facts about this frame.
@@ -425,10 +525,20 @@ fn start(app: &mut SoundApp, ctx: &egui::Context, track: TrackId) {
     if app.transcript.is_stopping() {
         return set_status(app, STOPPING);
     }
+    // A download is a long job too; never run one alongside a transcription.
+    #[cfg(feature = "download")]
+    if app.transcript.is_downloading() || app.transcript.is_download_stopping() {
+        return set_status(app, "A model download is in progress; wait for it to finish");
+    }
     let Some(track_name) = app.engine.session().track(track).map(|t| t.name.clone()) else {
         set_status(app, "That track no longer exists");
         return;
     };
+    // A new attempt withdraws the download offer until this run shows the model is missing again.
+    #[cfg(feature = "download")]
+    {
+        app.transcript.needs_download = false;
+    }
     let params = job_params(track, &app.transcript.models_dir, language_flag(app.engine.session()));
     // The ordinary job looks for the speech model when it runs; only a recogniser injected on the
     // state (tests) replaces that.
@@ -519,6 +629,8 @@ fn reap_stopped(app: &mut SoundApp, ctx: &egui::Context) {
 /// Collects the worker's progress and result. Called every frame from `logic`, so a result lands
 /// even while the window is hidden.
 pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
+    #[cfg(feature = "download")]
+    download_step(app, ctx);
     reap_stopped(app, ctx);
     if let Some(track) = app.transcript.pending.take() {
         // Collect its answer from the next frame on, not in the frame that starts it.
@@ -561,6 +673,13 @@ fn finish(app: &mut SoundApp, job: &Running, result: Result<TranscribeOutcome, S
         Err(e) => return set_status(app, e),
     };
     let Some(transcript) = outcome.transcript else {
+        // Offer a download when the model is simply not on disk (`not_found`); other reasons
+        // (an unsupported build, a damaged folder) a download would not fix.
+        #[cfg(feature = "download")]
+        {
+            let reason = outcome.result.get("reason").and_then(Value::as_str).unwrap_or("");
+            app.transcript.needs_download = reason == "not_found";
+        }
         return set_status(app, nothing_stored(&outcome.result));
     };
     // The session may have changed while the speech model worked.
@@ -625,6 +744,181 @@ fn made_with(source: &str) -> String {
     format!("Made with {}", soundcraft_engine::cmd::source_label(source))
 }
 
+// ---- downloading the speech model ----------------------------------------------------------
+
+/// The stage shown on the download bar (neutral: no model id or maker).
+#[cfg(feature = "download")]
+const DOWNLOAD_STAGE: &str = "Downloading the speech model";
+/// What the window says while a cancelled download is winding down, and once it has.
+#[cfg(feature = "download")]
+const DOWNLOAD_STOPPING: &str = "Stopping the download…";
+#[cfg(feature = "download")]
+const DOWNLOAD_STOPPED: &str = "Download stopped";
+
+/// The verified downloader ([`soundcraft_pa_speech::models::download`]); what the program uses when
+/// no downloader was injected.
+#[cfg(feature = "download")]
+fn default_downloader() -> Downloader {
+    Arc::new(|dir, m, progress| models::download(dir, m, progress))
+}
+
+/// Where a downloaded model goes: the Models folder the user typed, else the app's own data folder
+/// (the same place discovery looks last, under the brand's folder names), so a later transcription
+/// finds it. `None` when there is no home folder to put it in.
+#[cfg(feature = "download")]
+fn download_target(models_dir: &str) -> Option<std::path::PathBuf> {
+    let typed = models_dir.trim();
+    if !typed.is_empty() {
+        return Some(std::path::PathBuf::from(typed));
+    }
+    soundcraft_pa_speech::ModelSearch::from_environment(soundcraft_brand::CONFIG_DIR_NAME, soundcraft_brand::CONFIG_DIR_XDG).app_support
+}
+
+/// Starts downloading the default catalogue model on a worker thread. Refuses while any other long
+/// job (a transcription, or a download that is still running or winding down) is alive.
+#[cfg(feature = "download")]
+fn start_download(app: &mut SoundApp, ctx: &egui::Context) {
+    if app.transcript.is_downloading() {
+        return set_status(app, "A model download is already running");
+    }
+    if app.transcript.is_download_stopping() {
+        return set_status(app, DOWNLOAD_STOPPING);
+    }
+    if app.transcript.job.is_some() || app.transcript.is_stopping() {
+        return set_status(app, "A transcription is running; wait for it to finish");
+    }
+    let Some(model) = models::find(models::DEFAULT_MODEL) else {
+        return set_status(app, "There is no speech model to download");
+    };
+    let Some(dir) = download_target(&app.transcript.models_dir) else {
+        return set_status(app, "There is nowhere to put the speech model. Set a Models folder, then try again.");
+    };
+    let label = models::label(model.id).to_string();
+    let downloader = app.transcript.downloader.clone().unwrap_or_else(default_downloader);
+
+    let (tx, rx) = mpsc::channel::<DownloadMsg>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (stop, repaint) = (Arc::clone(&cancel), ctx.clone());
+    let spawned = std::thread::Builder::new().name("model-download".into()).spawn(move || {
+        let progress_tx = tx.clone();
+        let (progress_stop, progress_repaint) = (Arc::clone(&stop), repaint.clone());
+        let mut progress = move |done: u64, total: u64, _file: &str| -> bool {
+            let fraction = if total == 0 { 0.0 } else { (done as f64 / total as f64) as f32 };
+            let _ = progress_tx.send(DownloadMsg::Progress(fraction, DOWNLOAD_STAGE.to_string()));
+            progress_repaint.request_repaint();
+            !progress_stop.load(Ordering::Relaxed)
+        };
+        let result = downloader(&dir, model, &mut progress).map_err(|e| e.to_string());
+        let _ = tx.send(DownloadMsg::Done(result));
+        repaint.request_repaint();
+    });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(e) => return set_status(app, format!("The model download needs a background thread, and this build cannot start one ({e})")),
+    };
+    let started = ctx.input(|i| i.time);
+    app.transcript.download =
+        Some(Downloading { label: label.clone(), started, fraction: 0.0, stage: String::new(), cancel, rx, thread: Some(thread) });
+    app.transcript.status = format!("Downloading {label}...");
+    ctx.request_repaint();
+}
+
+/// Stops a running download. True when there was one. Like a transcription, the worker is told to
+/// stop at once and winds down a moment later; until it has, no other long job starts
+/// ([`TranscriptState::is_download_stopping`]).
+#[cfg(feature = "download")]
+fn cancel_download(app: &mut SoundApp) -> bool {
+    let Some(mut dl) = app.transcript.download.take() else { return false };
+    dl.cancel.store(true, Ordering::Relaxed);
+    app.transcript.download_stopping = dl.thread.take().filter(|thread| !thread.is_finished());
+    if app.transcript.download_stopping.is_some() {
+        set_status(app, DOWNLOAD_STOPPING);
+    } else {
+        set_status(app, DOWNLOAD_STOPPED);
+    }
+    true
+}
+
+/// Notices that a cancelled download's thread has ended: joins it and says so, once. Mirrors
+/// [`reap_stopped`].
+#[cfg(feature = "download")]
+fn reap_download_stopped(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some(thread) = &app.transcript.download_stopping else { return };
+    if !thread.is_finished() {
+        ctx.request_repaint_after_secs(0.1);
+        return;
+    }
+    if let Some(thread) = app.transcript.download_stopping.take()
+        && thread.join().is_err()
+    {
+        log::warn!("model download: the stopped worker thread panicked");
+    }
+    if app.transcript.status == DOWNLOAD_STOPPING {
+        app.transcript.status = DOWNLOAD_STOPPED.to_string();
+    }
+    if app.ui.status == DOWNLOAD_STOPPING {
+        app.ui.status = DOWNLOAD_STOPPED.to_string();
+    }
+    ctx.request_repaint();
+}
+
+/// Collects the download worker's progress and result each frame (called from [`step`]), so a
+/// finished download lands even while the window is hidden. Mirrors the transcription half of [`step`].
+#[cfg(feature = "download")]
+fn download_step(app: &mut SoundApp, ctx: &egui::Context) {
+    reap_download_stopped(app, ctx);
+    let Some(dl) = &mut app.transcript.download else { return };
+    let mut done = None;
+    loop {
+        match dl.rx.try_recv() {
+            Ok(DownloadMsg::Progress(fraction, stage)) => {
+                dl.fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { dl.fraction };
+                dl.stage = stage;
+            }
+            Ok(DownloadMsg::Done(result)) => {
+                done = Some(result);
+                break;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                done = Some(Err("The download stopped unexpectedly".to_string()));
+                break;
+            }
+        }
+    }
+    let Some(result) = done else {
+        ctx.request_repaint_after_secs(0.25);
+        return;
+    };
+    if let Some(dl) = app.transcript.download.take() {
+        finish_download(app, &dl, result);
+    }
+}
+
+/// Reports a finished download: on success the model is ready and the offer is withdrawn, so
+/// Transcribe can run again; on failure a short line (the detail goes to the log).
+#[cfg(feature = "download")]
+fn finish_download(app: &mut SoundApp, dl: &Downloading, result: Result<(), String>) {
+    match result {
+        Ok(()) => {
+            app.transcript.needs_download = false;
+            set_status(app, format!("{} is ready. Choose Transcribe Track to turn this track's speech into text.", dl.label));
+        }
+        Err(error) => set_status(app, download_failed(&error)),
+    }
+}
+
+/// A download error as one line for people: the full text (which may name a file or a URL) goes to
+/// the log; what is shown names no third-party product and gives the one thing to try.
+#[cfg(feature = "download")]
+fn download_failed(error: &str) -> String {
+    log::warn!("model download: {error}");
+    if error.trim() == SpeechError::Cancelled.to_string().as_str() {
+        return DOWNLOAD_STOPPED.to_string();
+    }
+    "The speech model could not be downloaded. Check your internet connection, then try again.".to_string()
+}
+
 // ---- actions -------------------------------------------------------------------------------
 
 /// Names a speaker in a track's transcript (`track.rename_speaker`); an empty name resets it.
@@ -666,6 +960,12 @@ fn apply(app: &mut SoundApp, ctx: &egui::Context, actions: Vec<Action>) {
             Action::Transcribe(track) => start(app, ctx, track),
             Action::Cancel => {
                 cancel(app);
+            }
+            #[cfg(feature = "download")]
+            Action::Download => start_download(app, ctx),
+            #[cfg(feature = "download")]
+            Action::CancelDownload => {
+                cancel_download(app);
             }
         }
     }
@@ -737,8 +1037,12 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
     let choices = candidates(f.s);
     let shown = resolve(st.track, &choices, f.s);
     let running = st.job.is_some();
-    // A stopped job that is still winding down keeps the button off, too.
-    let busy = running || st.is_stopping();
+    // A stopped job that is still winding down keeps the button off, too; so does a download.
+    let busy_base = running || st.is_stopping();
+    #[cfg(feature = "download")]
+    let busy = busy_base || st.is_downloading() || st.is_download_stopping();
+    #[cfg(not(feature = "download"))]
+    let busy = busy_base;
 
     if let Some(shown) = shown {
         let shown_name = choices.iter().find(|(id, _)| *id == shown).map(|(_, n)| n.clone()).unwrap_or_default();
@@ -784,6 +1088,8 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
     if !st.status.is_empty() {
         ui.label(RichText::new(&st.status).font(regular(11.0)).color(t.text_dim));
     }
+    #[cfg(feature = "download")]
+    download_ui(ui, st, f, busy, out);
     ui.separator();
 
     let Some(shown) = shown else { return };
@@ -801,6 +1107,47 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
         return;
     }
     transcript_view(ui, st, f, tr, shown, out);
+}
+
+/// The download affordance: the progress bar and Cancel while a download runs, else a "Download …"
+/// button when the window is offering one and nothing else is busy. Reuses the transcription progress
+/// bar's look.
+#[cfg(feature = "download")]
+fn download_ui(ui: &mut Ui, st: &TranscriptState, f: &Frame, busy: bool, out: &mut Vec<Action>) {
+    if let Some(dl) = &st.download {
+        let elapsed = elapsed_text(f.now - dl.started);
+        let mut label = format!("{:.0}%", dl.fraction * 100.0);
+        if !dl.stage.is_empty() {
+            label.push_str(&format!("  {}", dl.stage));
+        }
+        label.push_str(&format!("  {elapsed}"));
+        ui.add(egui::ProgressBar::new(dl.fraction).text(RichText::new(label).font(regular(11.0))).desired_width(ui.available_width()));
+        if ui.button("Cancel").clicked() {
+            out.push(Action::CancelDownload);
+        }
+        return;
+    }
+    // Offer a download only after a transcription found the model missing, and only when nothing
+    // else is busy.
+    if !st.needs_download || busy {
+        return;
+    }
+    let Some(model) = models::find(models::DEFAULT_MODEL) else { return };
+    let bytes = match download_target(&st.models_dir) {
+        Some(dir) => models::missing_bytes(&dir, model),
+        None => model.size(),
+    };
+    // All files present at their sizes would mean the model is installed; be robust and fall back.
+    let bytes = if bytes == 0 { model.size() } else { bytes };
+    let mb = bytes.div_ceil(1_000_000);
+    let label = models::label(model.id);
+    if ui
+        .add(egui::Button::new(format!("Download {label} ({mb} MB)")))
+        .on_hover_text("Downloads the speech model so this track can be transcribed. It runs in the background, so you can keep working.")
+        .clicked()
+    {
+        out.push(Action::Download);
+    }
 }
 
 /// The meta line, search and the list of lines for a transcript that has words.
