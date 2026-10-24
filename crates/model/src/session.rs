@@ -317,7 +317,7 @@ pub struct Session {
     pub outputs: Vec<OutputPath>,
     pub markers: Vec<MemoryLocation>,
     pub groups: Vec<Group>,
-    /// Per-track speech transcripts (Text ▸ Transcript), produced by `soundcraft-pa-speech`.
+    /// Per-track speech transcripts (Window ▸ Transcript), produced by `soundcraft-pa-speech`.
     #[serde(default)]
     pub transcripts: Vec<Transcript>,
     pub edit: EditState,
