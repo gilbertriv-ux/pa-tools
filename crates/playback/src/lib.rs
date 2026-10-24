@@ -95,6 +95,7 @@ enum Cmd {
 }
 
 struct Shared {
+    clock: Arc<duplex::MasterClock>,
     /// Invalidates queued/preparing starts when stop, locate, or another play supersedes them.
     transport_generation: AtomicU64,
     /// Zero or the generation whose initial source blocks are being warmed.
@@ -186,6 +187,7 @@ struct AudioState {
     looped: Option<Range>,
     /// Rendered frames waiting to be consumed (planar, main channels) and the fractional read index.
     pending: Vec<Vec<f32>>,
+    output_map: Option<duplex::ChannelMap>,
     /// Stereo fold-down gains per main channel (used when the device has fewer channels).
     fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
@@ -213,6 +215,7 @@ impl AudioState {
             garbage,
             old_sessions: None,
             fold: fold_gains(&session),
+            output_map: None,
             rx,
             shared,
             mix: new_engine(sr),
@@ -235,7 +238,11 @@ impl AudioState {
         while let Ok(c) = self.rx.try_recv() {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
-                Cmd::Recording(r) => self.recording = r,
+                Cmd::Recording(r) => {
+                    // Preserve the stop edge even if a new Record is queued in this same block.
+                    if !r { self.shared.clock.invalidate(); }
+                    self.recording = r;
+                },
                 Cmd::Session(s, instances) => {
                     changed = true;
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
@@ -422,7 +429,12 @@ impl AudioState {
                 let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
                 a + (b - a) * fr
             };
-            if channels < nch {
+            if let Some(map) = &self.output_map {
+                for (destination, out) in frame.iter_mut().enumerate() {
+                    let value = map.source_for(destination).filter(|_| sounding).map_or(0.0, sample);
+                    *out = if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 };
+                }
+            } else if channels < nch {
                 // Fold surround to stereo first; a mono device averages the two sides.
                 let (mut l, mut r) = (0.0f32, 0.0f32);
                 if sounding {
@@ -591,6 +603,11 @@ impl Drop for Player {
 }
 
 impl Player {
+    /// Output callbacks are the sole publisher of the software recording clock.
+    pub fn master_clock(&self) -> Arc<duplex::MasterClock> {
+        Arc::clone(&self.shared.clock)
+    }
+
     /// Open the default output device. Never fails: without a device it runs a silent clock.
     pub fn new(session: Arc<Session>) -> Player {
         Player::with_config(session, &AudioConfig::default())
@@ -625,6 +642,7 @@ impl Player {
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Player {
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -633,7 +651,7 @@ impl Player {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let want = session.sample_rate.hz();
-        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
+        let want_ch = u16::try_from(main_channels(&session).max(cfg.output_channels.len()).min(MAX_CHANNELS)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
@@ -650,7 +668,13 @@ impl Player {
                         let channels = usize::from(config.channels);
                         let (tx, rx) = channel();
                         let (gtx, grx) = channel();
-                        let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                        let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                        if !cfg.output_channels.is_empty() {
+                            state.output_map = Some(
+                                duplex::ChannelMap::new(cfg.output_channels.clone(), main_channels(&session), channels)
+                                    .map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?,
+                            );
+                        }
                         let fault = Arc::new(Fault::default());
                         let stream = match format {
                             cpal::SampleFormat::I32 => build_output::<i32>(&device, config, state, channels, &fault, &shared),
@@ -1133,6 +1157,8 @@ where
     let mut scratch = vec![0.0f32; 8192 * frame];
     let chunk = scratch.len();
     let (failed, guard, gone) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault));
+    let output_rate = config.sample_rate.0;
+    let clock = Arc::clone(&shared.clock);
     device.build_output_stream(
         config,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
@@ -1145,6 +1171,13 @@ where
                 for (o, x) in out.iter_mut().zip(s.iter()) {
                     *o = T::from_sample(*x);
                 }
+            }
+            let playback_ns =
+                timestamp.playback.duration_since(&cpal::StreamInstant::new(0, 0)).and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+            if let Some(ns) = playback_ns {
+                clock.publish(ns, data.len() / frame, output_rate, state.recording && state.playing);
+            } else {
+                clock.invalidate();
             }
         },
         // cpal may call this on the audio thread (on ALSA in a loop while the device stays
@@ -1225,6 +1258,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn control_test_state() -> (Sender<Cmd>, Arc<Shared>, AudioState) {
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(1),
             starting: AtomicU64::new(1),
             position: AtomicI64::new(0),
@@ -1235,6 +1269,20 @@ mod tests {
         let (tx, rx) = channel();
         let state = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, channel().0);
         (tx, shared, state)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn coalesced_record_stop_and_restart_publish_a_fresh_capture_epoch() {
+        let (tx, shared, mut state) = control_test_state();
+        shared.clock.publish(1_000_000_000, 480, 48_000, true);
+        let first = shared.clock.snapshot().unwrap().generation;
+        tx.send(Cmd::Recording(false)).unwrap();
+        tx.send(Cmd::Recording(true)).unwrap();
+        state.drain();
+        assert!(shared.clock.snapshot().is_none());
+        shared.clock.publish(1_010_000_000, 480, 48_000, state.recording);
+        assert_eq!(shared.clock.snapshot().unwrap().generation, first + 1);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1359,6 +1407,7 @@ mod tests {
     #[test]
     fn a_block_that_panics_goes_silent_and_is_reported_once() {
         let shared = Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1402,6 +1451,7 @@ mod tests {
     fn audio_state_plays_and_stops_at_end() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1422,6 +1472,7 @@ mod tests {
     fn short_device_callbacks_render_short_mix_blocks() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1448,6 +1499,7 @@ mod tests {
         let id = s.new_clip_id();
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "output", SourceId(5), 0, 0, frames as i64));
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1525,6 +1577,7 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 48_000));
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1550,6 +1603,13 @@ mod tests {
         let l = (0.1 + h * 0.3 + h * 0.5f32).min(1.0);
         assert!((out[200] - l).abs() < 1e-4, "{} vs {l}", out[200]);
         assert_eq!(shared.meters.lock().unwrap().main.peaks.len(), 6);
+        // Explicit hardware routing overrides automatic surround folding and mutes unused slots.
+        st.output_map = Some(duplex::ChannelMap::new(vec![Some(5), None, Some(0)], 6, 3).unwrap());
+        let mut routed = vec![0.0f32; 3 * 256];
+        st.fill(&mut routed, 3);
+        assert!((routed[300] - 0.6).abs() < 1e-5);
+        assert_eq!(routed[301], 0.0);
+        assert!((routed[302] - 0.1).abs() < 1e-5);
     }
 
     #[test]
@@ -1560,6 +1620,7 @@ mod tests {
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1654,6 +1715,7 @@ mod tests {
     #[test]
     fn replaced_sessions_are_freed_on_the_ui_thread() {
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1685,6 +1747,7 @@ mod tests {
     fn looping_wraps() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1722,6 +1785,7 @@ mod tests {
             }
             tr.mixer.inserts[0] = Some(ins);
             let shared = Arc::new(Shared {
+                clock: duplex::MasterClock::new(),
                 transport_generation: AtomicU64::new(0),
                 starting: AtomicU64::new(0),
                 position: AtomicI64::new(0),
@@ -1754,6 +1818,7 @@ mod tests {
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.record_arm = true;
         let shared = Arc::new(Shared {
+            clock: duplex::MasterClock::new(),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),

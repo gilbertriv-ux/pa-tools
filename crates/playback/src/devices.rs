@@ -32,6 +32,8 @@ pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
+    /// Physical output slot -> session main channel; None mutes a slot. Empty preserves automatic mapping.
+    pub output_channels: Vec<Option<usize>>,
 }
 
 /// One device as the settings window lists it.
@@ -164,6 +166,7 @@ mod tests {
             input: None,
             sample_rate: Some(48_000),
             buffer_size: Some(256),
+            output_channels: vec![Some(1), None, Some(0)],
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);

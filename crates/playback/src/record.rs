@@ -61,10 +61,12 @@ impl CaptureRing {
         CaptureRing { slots: (0..n).map(|_| AtomicU32::new(0)).collect(), mask: n - 1, head: AtomicUsize::new(0), tail: AtomicUsize::new(0) }
     }
 
-    /// Queue up to `n` samples (`sample(i)` is the i-th); returns how many fit.
-    fn push(&self, n: usize, sample: impl Fn(usize) -> f32) -> usize {
+    /// Publish whole interleaved frames only; unused slots never split a channel frame.
+    fn push_aligned(&self, n: usize, channels: usize, sample: impl Fn(usize) -> f32) -> usize {
         let head = self.head.load(Ordering::Relaxed);
-        let n = n.min(self.slots.len().saturating_sub(head.wrapping_sub(self.tail.load(Ordering::Acquire))));
+        let channels = channels.max(1);
+        let room = self.slots.len().saturating_sub(head.wrapping_sub(self.tail.load(Ordering::Acquire)));
+        let n = n.min(room) / channels * channels;
         for i in 0..n {
             if let Some(slot) = self.slots.get(head.wrapping_add(i) & self.mask) {
                 slot.store(sample(i).to_bits(), Ordering::Relaxed);
@@ -89,8 +91,19 @@ fn finite(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
+/// A callback owns this stack guard; unwinding and every ordinary return release it.
+struct CallbackExit<'a>(&'a AtomicBool);
+impl Drop for CallbackExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 struct Shared {
     armed: AtomicBool,
+    in_callback: AtomicBool,
+    /// The newest arm accepts only a later output recording epoch.
+    minimum_generation: AtomicU64,
     ring: CaptureRing,
     /// Samples lost while the ring was full.
     dropped: AtomicUsize,
@@ -105,23 +118,66 @@ struct Shared {
 impl Shared {
     fn new(ring: CaptureRing) -> Shared {
         let (beats, fault, failed) = (AtomicU64::new(0), AtomicU8::new(0), Mutex::new(None));
-        Shared { armed: AtomicBool::new(false), ring, dropped: AtomicUsize::new(0), beats, fault, failed }
+        Shared {
+            armed: AtomicBool::new(false),
+            in_callback: AtomicBool::new(false),
+            minimum_generation: AtomicU64::new(0),
+            ring,
+            dropped: AtomicUsize::new(0),
+            beats,
+            fault,
+            failed,
+        }
+    }
+
+    fn accepts_master(&self, generation: u64, recording: bool) -> bool {
+        recording && generation >= self.minimum_generation.load(Ordering::Acquire)
     }
 
     /// Run the input callback's `work`. After a panic in it, the input is broken and does
     /// nothing more.
     fn guarded(&self, work: impl FnOnce()) {
+        // Never wait on the realtime thread. Unexpected reentrancy fails closed.
+        if self.in_callback.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            self.fault.store(BROKEN, Ordering::Relaxed);
+            return;
+        }
+        let _exit = CallbackExit(&self.in_callback);
         self.beats.fetch_add(1, Ordering::Relaxed);
         if self.fault.load(Ordering::Relaxed) != BROKEN && std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             self.fault.store(BROKEN, Ordering::Relaxed);
         }
     }
 
+    /// Control-thread only. Close capture before waiting for any previously admitted callback.
+    /// A newly entering callback sees capture closed until arm publishes its new epoch.
+    fn close_capture_and_wait(&self, timeout: Duration) -> Result<(), &'static str> {
+        self.armed.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        while self.in_callback.load(Ordering::SeqCst) {
+            if started.elapsed() >= timeout {
+                return Err("audio input callback did not quiesce before arming; capture remains stopped");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
     /// The input callback's work while armed. Samples that don't fit are owed (`owed`) and queued
     /// as silence before the next block, so the take keeps its timing.
+    #[cfg(test)]
     fn capture(&self, data: &[f32], owed: &mut usize) {
-        *owed -= self.ring.push(*owed, |_| 0.0);
-        let kept = if *owed == 0 { self.ring.push(data.len(), |i| data.get(i).copied().map_or(0.0, finite)) } else { 0 };
+        self.capture_aligned(data, owed, 1);
+    }
+
+    fn capture_aligned(&self, data: &[f32], owed: &mut usize, channels: usize) {
+        let channels = channels.max(1);
+        if data.len() % channels != 0 {
+            self.fault.store(BROKEN, Ordering::Relaxed);
+            return;
+        }
+        *owed -= self.ring.push_aligned(*owed, channels, |_| 0.0);
+        let kept = if *owed == 0 { self.ring.push_aligned(data.len(), channels, |i| data.get(i).copied().map_or(0.0, finite)) } else { 0 };
         *owed = owed.saturating_add(data.len() - kept);
         self.dropped.fetch_add(data.len() - kept, Ordering::Relaxed);
     }
@@ -138,6 +194,8 @@ pub struct Recorder {
     pub channels: usize,
     /// Requested buffer after fallback; not a measured hardware buffer size.
     pub device_buffer: Option<u32>,
+    /// Recording follows the output callback clock; monitoring retains native-rate SRC.
+    master_clock: Option<Arc<crate::duplex::MasterClock>>,
     /// The take writer, and what each track's take holds so far.
     writer: Option<(std::thread::JoinHandle<Takes>, Vec<(TrackId, Arc<Mutex<LiveTake>>)>)>,
     /// The callback count last seen, and since when.
@@ -152,6 +210,8 @@ fn build_input<T>(
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
     monitor: &Arc<InputRing>,
+    master_clock: Option<Arc<crate::duplex::MasterClock>>,
+    output_rate: u32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample,
@@ -161,8 +221,25 @@ where
     use cpal::traits::DeviceTrait;
     let (sh, errors) = (Arc::clone(shared), Arc::clone(shared));
     let mon = Arc::clone(monitor);
-    let mut scratch = vec![0.0f32; 8192 * usize::from(config.channels).max(1)];
+    let channels = usize::from(config.channels);
+    let native_rate = config.sample_rate.0;
+    let channel_limit = if master_clock.is_some() { 64 } else { 256 };
+    if channels == 0 || channels > channel_limit || native_rate == 0 {
+        return Err(cpal::BuildStreamError::BackendSpecific {
+            err: cpal::BackendSpecificError { description: "unsupported bounded input format".into() },
+        });
+    }
+    let mut scratch = vec![0.0f32; 8192 * channels];
     let chunk = scratch.len();
+    let mut sync = if master_clock.is_some() {
+        Some(
+            crate::duplex::TimestampResampler::new(channels, native_rate, output_rate)
+                .map_err(|why| cpal::BuildStreamError::BackendSpecific { err: cpal::BackendSpecificError { description: why.into() } })?,
+        )
+    } else {
+        None
+    };
+    let mut sync_scratch = vec![0.0f32; chunk];
     let mut owed = 0;
     device.build_input_stream(
         config,
@@ -171,14 +248,54 @@ where
             let timestamp = info.timestamp();
             mon.timing.observe(timestamp.callback.duration_since(&timestamp.capture));
             sh.guarded(|| {
-                for part in data.chunks(chunk) {
+                let capture_ns =
+                    timestamp.capture.duration_since(&cpal::StreamInstant::new(0, 0)).and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+                if sync.is_some() && capture_ns.is_none() {
+                    sh.fault.store(BROKEN, Ordering::Relaxed);
+                    return;
+                }
+                for (part_index, part) in data.chunks(chunk).enumerate() {
                     let Some(s) = scratch.get_mut(..part.len()) else { return };
                     for (o, x) in s.iter_mut().zip(part) {
                         *o = f32::from_sample(*x);
                     }
+                    // Native-rate monitoring is deliberately distinct from take-clock alignment.
                     mon.push(s);
-                    if sh.armed.load(Ordering::Acquire) {
-                        sh.capture(s, &mut owed);
+                    if sh.armed.load(Ordering::SeqCst) {
+                        if let (Some(sync), Some(master)) = (&mut sync, &master_clock) {
+                            let Some(clock) = master.snapshot() else { continue };
+                            if !sh.accepts_master(clock.generation, clock.recording) {
+                                owed = 0;
+                                continue;
+                            }
+                            let frame_offset = part_index.saturating_mul(chunk / channels);
+                            let offset_ns = (frame_offset as u128).saturating_mul(1_000_000_000) / u128::from(native_rate.max(1));
+                            let Some(start_ns) = capture_ns.and_then(|ns| u64::try_from(offset_ns).ok().and_then(|offset| ns.checked_add(offset)))
+                            else {
+                                sh.fault.store(BROKEN, Ordering::Relaxed);
+                                return;
+                            };
+                            let mut used = 0usize;
+                            let result = sync.process(s, start_ns, clock, |frame| {
+                                if used.saturating_add(frame.len()) > sync_scratch.len() {
+                                    sh.capture_aligned(&sync_scratch[..used], &mut owed, channels);
+                                    used = 0;
+                                }
+                                if let Some(to) = sync_scratch.get_mut(used..used.saturating_add(frame.len())) {
+                                    to.copy_from_slice(frame);
+                                    used += frame.len();
+                                }
+                            });
+                            if used != 0 {
+                                sh.capture_aligned(&sync_scratch[..used], &mut owed, channels);
+                            }
+                            if result.is_err() {
+                                sh.fault.store(BROKEN, Ordering::Relaxed);
+                                return;
+                            }
+                        } else {
+                            sh.capture_aligned(s, &mut owed, channels);
+                        }
                     } else {
                         owed = 0;
                     }
@@ -208,6 +325,27 @@ impl Recorder {
     /// drivers usually are) are converted to f32.
     #[cfg(not(target_os = "freebsd"))]
     pub fn open_with(audio: &crate::AudioConfig) -> Result<Recorder, String> {
+        Self::open_inner(audio, None)
+    }
+
+    /// Align recorded take samples to the output callback's software master clock.
+    /// This does not claim a shared physical oscillator or drift-corrected live monitoring.
+    #[cfg(not(target_os = "freebsd"))]
+    pub fn open_with_master(audio: &crate::AudioConfig, clock: Arc<crate::duplex::MasterClock>, output_rate: u32) -> Result<Recorder, String> {
+        if !(8_000..=768_000).contains(&output_rate) {
+            return Err("invalid output master sample rate".into());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (audio, clock);
+            return Err("output-master timestamp synchronization is currently verified only for the macOS timestamp domain".into());
+        }
+        #[cfg(target_os = "macos")]
+        Self::open_inner(audio, Some((clock, output_rate)))
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    fn open_inner(audio: &crate::AudioConfig, master: Option<(Arc<crate::duplex::MasterClock>, u32)>) -> Result<Recorder, String> {
         use cpal::traits::{DeviceTrait, StreamTrait};
         let host = crate::devices::host(audio);
         let device = crate::devices::device(&host, audio.input.as_deref(), false).ok_or("no audio input device")?;
@@ -237,10 +375,12 @@ impl Recorder {
         let ring = CaptureRing::new((config.sample_rate.0 as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
         let shared = Arc::new(Shared::new(ring));
         let monitor = InputRing::new(usize::from(config.channels), config.sample_rate.0);
+        let output_rate = master.as_ref().map_or(config.sample_rate.0, |(_, rate)| *rate);
+        let master_clock = master.map(|(clock, _)| clock);
         let build = |config: &cpal::StreamConfig| match format {
-            cpal::SampleFormat::I32 => build_input::<i32>(&device, config, &shared, &monitor),
-            cpal::SampleFormat::I16 => build_input::<i16>(&device, config, &shared, &monitor),
-            _ => build_input::<f32>(&device, config, &shared, &monitor),
+            cpal::SampleFormat::I32 => build_input::<i32>(&device, config, &shared, &monitor, master_clock.clone(), output_rate),
+            cpal::SampleFormat::I16 => build_input::<i16>(&device, config, &shared, &monitor, master_clock.clone(), output_rate),
+            _ => build_input::<f32>(&device, config, &shared, &monitor, master_clock.clone(), output_rate),
         };
         // The chosen buffer size first; if the device refuses it, its default.
         let stream = match build(&config) {
@@ -263,9 +403,10 @@ impl Recorder {
             shared,
             _stream: Some(stream),
             device_name: name,
-            sample_rate: config.sample_rate.0,
+            sample_rate: output_rate,
             channels,
             device_buffer,
+            master_clock,
             writer: None,
             seen,
         })
@@ -276,9 +417,18 @@ impl Recorder {
         Err("recording is not supported on this platform yet".into())
     }
 
+    #[cfg(target_os = "freebsd")]
+    pub fn open_with_master(_audio: &crate::AudioConfig, _clock: Arc<crate::duplex::MasterClock>, _output_rate: u32) -> Result<Recorder, String> {
+        Err("recording is not supported on this platform yet".into())
+    }
+
+    pub fn clock_relationship(&self) -> crate::duplex::ClockRelationship {
+        if self.master_clock.is_some() { crate::duplex::ClockRelationship::SoftwareMaster } else { crate::duplex::ClockRelationship::Independent }
+    }
+
     /// Capture-to-callback timestamp latency, or a labelled requested-buffer estimate.
     pub fn input_latency(&self) -> Option<crate::latency::StreamLatency> {
-        self.monitor.timing.snapshot(self.device_buffer, self.sample_rate)
+        self.monitor.timing.snapshot(self.device_buffer, self.monitor.rate)
     }
 
     /// Create each take's file and start recording into them: a track's take records the given
@@ -290,6 +440,8 @@ impl Recorder {
         if takes.iter().any(|(_, inputs, _)| inputs.is_empty() || inputs.len() > self.channels || inputs.iter().any(|i| *i >= self.channels)) {
             return Err("a take must select valid input channels".into());
         }
+        // No take path is created until old input work is outside the capture critical section.
+        self.shared.close_capture_and_wait(Duration::from_millis(250)).map_err(str::to_owned)?;
         let mut takes =
             takes.into_iter().map(|(id, inputs, path)| TakeWriter::create(id, inputs, path, self.sample_rate)).collect::<Result<Vec<_>, _>>()?;
         let total_channels = takes.iter().map(|take| take.inputs.len()).sum::<usize>().max(1);
@@ -302,12 +454,15 @@ impl Recorder {
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
         *self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.shared.armed.store(true, Ordering::Release);
+        // Read the output epoch directly: a contended snapshot must never admit an old take.
+        let minimum_generation = self.master_clock.as_ref().map_or(0, |clock| clock.next_generation());
+        self.shared.minimum_generation.store(minimum_generation, Ordering::Release);
+        self.shared.armed.store(true, Ordering::SeqCst);
         let (shared, channels) = (Arc::clone(&self.shared), self.channels);
         match std::thread::Builder::new().name("take writer".into()).spawn(move || write_takes(&shared, takes, channels)) {
             Ok(w) => self.writer = Some((w, live)),
             Err(e) => {
-                self.shared.armed.store(false, Ordering::Release);
+                self.shared.armed.store(false, Ordering::SeqCst);
                 return Err(e.to_string());
             }
         }
@@ -346,7 +501,7 @@ impl Recorder {
     }
 
     pub fn finish(&mut self) -> Takes {
-        self.shared.armed.store(false, Ordering::Release);
+        self.shared.armed.store(false, Ordering::SeqCst);
         let (takes, problem) = self.writer.take().and_then(|(w, _)| w.join().ok()).unwrap_or_default();
         let lost = self.shared.dropped.swap(0, Ordering::Relaxed) / self.channels.max(1);
         let slow =
@@ -364,7 +519,7 @@ impl Drop for Recorder {
 fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> Takes {
     let (mut block, mut header_written, mut reported) = (Vec::new(), Instant::now(), false);
     loop {
-        let stopping = !shared.armed.load(Ordering::Acquire);
+        let stopping = !shared.armed.load(Ordering::SeqCst) && !shared.in_callback.load(Ordering::SeqCst);
         // The ring holds interleaved samples and a pop can end mid-frame: write whole frames and
         // keep the remainder for the next pop, so channels never shift.
         shared.ring.pop_all(&mut block);
@@ -520,6 +675,94 @@ mod tests {
     }
 
     #[test]
+    fn control_quiescence_waits_for_inflight_callback_before_rearming() {
+        let shared = Arc::new(Shared::new(CaptureRing::new(16)));
+        shared.armed.store(true, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let callback_shared = Arc::clone(&shared);
+        let callback = std::thread::spawn(move || {
+            callback_shared.guarded(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let control_shared = Arc::clone(&shared);
+        let control = std::thread::spawn(move || {
+            done_tx.send(control_shared.close_capture_and_wait(Duration::from_secs(1))).unwrap();
+        });
+        let started = Instant::now();
+        while shared.armed.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        assert!(matches!(done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+        callback.join().unwrap();
+        control.join().unwrap();
+        assert!(!shared.in_callback.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn callback_unwind_releases_quiescence_flag_and_reentrancy_never_waits() {
+        let shared = Shared::new(CaptureRing::new(16));
+        shared.guarded(|| panic!("simulated callback failure"));
+        assert!(!shared.in_callback.load(Ordering::SeqCst));
+        assert_eq!(shared.fault.load(Ordering::Relaxed), BROKEN);
+        assert_eq!(shared.close_capture_and_wait(Duration::ZERO), Ok(()));
+        let reentrant = Shared::new(CaptureRing::new(16));
+        reentrant.guarded(|| reentrant.guarded(|| panic!("reentrant work must not run")));
+        assert!(!reentrant.in_callback.load(Ordering::SeqCst));
+        assert_eq!(reentrant.fault.load(Ordering::Relaxed), BROKEN);
+    }
+
+    #[test]
+    fn control_quiescence_timeout_leaves_capture_closed() {
+        let shared = Shared::new(CaptureRing::new(16));
+        shared.armed.store(true, Ordering::SeqCst);
+        shared.in_callback.store(true, Ordering::SeqCst);
+        assert!(shared.close_capture_and_wait(Duration::ZERO).is_err());
+        assert!(!shared.armed.load(Ordering::SeqCst));
+        shared.in_callback.store(false, Ordering::SeqCst);
+        assert_eq!(shared.close_capture_and_wait(Duration::ZERO), Ok(()));
+    }
+
+    #[test]
+    fn newly_armed_take_rejects_the_previous_active_output_epoch() {
+        let master = crate::duplex::MasterClock::new();
+        master.publish(1_000_000_000, 64, 48_000, true);
+        let previous = master.snapshot().unwrap();
+        let shared = Shared::new(CaptureRing::new(16));
+        shared.minimum_generation.store(master.next_generation(), Ordering::Release);
+        assert!(!shared.accepts_master(previous.generation, previous.recording));
+        master.invalidate();
+        master.publish(1_010_000_000, 64, 48_000, true);
+        let fresh = master.snapshot().unwrap();
+        assert!(shared.accepts_master(fresh.generation, fresh.recording));
+        assert!(!shared.accepts_master(fresh.generation, false));
+    }
+
+    #[test]
+    fn capture_overflow_preserves_three_channel_frame_boundaries() {
+        let shared = Shared::new(CaptureRing::new(8));
+        let mut owed = 0;
+        let mut out = Vec::new();
+        shared.capture_aligned(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &mut owed, 3);
+        shared.capture_aligned(&[7.0, 8.0, 9.0], &mut owed, 3);
+        shared.ring.pop_all(&mut out);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(owed, 3);
+        out.clear();
+        shared.capture_aligned(&[10.0, 11.0, 12.0], &mut owed, 3);
+        shared.ring.pop_all(&mut out);
+        assert_eq!(out, [0.0, 0.0, 0.0, 10.0, 11.0, 12.0]);
+        assert_eq!(owed, 0);
+    }
+
+    #[test]
     fn nan_and_infinite_input_records_as_silence() {
         let shared = Shared::new(CaptureRing::new(8));
         let (mut owed, mut out) = (0, Vec::new());
@@ -538,6 +781,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 1,
             device_buffer: None,
+            master_clock: None,
             writer: None,
             seen: (0, Instant::now()),
         }
@@ -684,88 +928,98 @@ mod tests {
 
 /// Ring state behind the lock: interleaved input frames at the input device's rate, plus the
 /// fractional read position (in input frames) of the next output sample.
-struct RingState {
-    data: std::collections::VecDeque<f32>,
-    phase: f64,
-}
-
-/// A small interleaved FIFO from the input callback to the output callback, for input
-/// monitoring. Both sides only `try_lock`; it holds at most ~0.5 s and drops the oldest frames.
-/// The input device may run at a different rate than the session, so the reader converts
-/// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
+/// Lock-free SPSC monitor FIFO. The input callback owns head, output owns tail/phase.
+/// Full queues drop incoming whole frames; the producer never changes the consumer cursor.
 pub struct InputRing {
     pub(crate) timing: Arc<crate::latency::LatencyTracker>,
-    state: Mutex<RingState>,
-    pub channels: std::sync::atomic::AtomicUsize,
-    /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
+    slots: Box<[AtomicU32]>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    phase: AtomicU64,
+    frame_mask: usize,
+    pub channels: AtomicUsize,
     rate: u32,
-    /// Most samples kept: half a second of input, or 24 000 frames when the rate is unknown.
+    /// Samples physically reserved, always a whole number of channel frames.
     cap: usize,
 }
 
 impl InputRing {
     pub fn new(channels: usize, rate: u32) -> Arc<InputRing> {
-        let ch = channels.max(1);
-        let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
+        let ch = channels.clamp(1, 256);
+        let frames = if rate == 0 { 24_000 } else { (rate as usize / 2).clamp(2, 384_000) };
+        let frames = frames.min((1usize << 20) / ch).max(2);
+        let frame_capacity = 1usize << (usize::BITS - 1 - frames.leading_zeros());
+        let cap = frame_capacity.saturating_mul(ch);
         Arc::new(InputRing {
             timing: Arc::default(),
-            state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
-            channels: std::sync::atomic::AtomicUsize::new(ch),
+            slots: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            phase: AtomicU64::new(0.0f64.to_bits()),
+            frame_mask: frame_capacity - 1,
+            channels: AtomicUsize::new(ch),
             rate,
-            cap: frames * ch,
+            cap,
         })
     }
 
     pub fn push(&self, samples: &[f32]) {
-        if let Ok(mut s) = self.state.try_lock() {
-            // Make room before each append so even an oversized callback cannot grow the FIFO.
-            // Drop complete frames to preserve channel alignment.
-            let channels = self.channels.load(Ordering::Relaxed).max(1);
-            for frame in samples.chunks_exact(channels) {
-                while s.data.len().saturating_add(channels) > self.cap {
-                    if s.data.is_empty() {
-                        break;
-                    }
-                    for _ in 0..channels {
-                        s.data.pop_front();
-                    }
-                }
-                if channels <= self.cap {
-                    s.data.extend(frame.iter().copied().map(finite));
-                }
+        let channels = self.channels.load(Ordering::Relaxed).max(1);
+        if channels > self.cap {
+            return;
+        }
+        let mut head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        let room = (self.frame_mask + 1).saturating_sub(head.wrapping_sub(tail));
+        let count = (samples.len() / channels).min(room);
+        for (i, sample) in samples.iter().take(count.saturating_mul(channels)).enumerate() {
+            let frame = head.wrapping_add(i / channels) & self.frame_mask;
+            if let Some(slot) = self.slots.get(frame.saturating_mul(channels).saturating_add(i % channels)) {
+                slot.store(finite(*sample).to_bits(), Ordering::Relaxed);
             }
         }
+        head = head.wrapping_add(count);
+        self.head.store(head, Ordering::Release);
     }
 
-    /// Fill `out` (planar, at `session_rate`) with up to `frames` frames, converting from the
-    /// input rate. Missing frames are silence.
+    /// Consumer-only linear sample-rate conversion into existing planar output buffers.
     pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize, session_rate: u32) {
-        let ch = self.channels.load(Ordering::Relaxed).max(1);
-        for c in out.iter_mut() {
-            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        for channel in out.iter_mut() {
+            channel.iter_mut().take(frames).for_each(|sample| *sample = 0.0);
         }
-        let Ok(mut s) = self.state.try_lock() else { return };
-        // Input frames consumed per output frame.
+        let ch = self.channels.load(Ordering::Relaxed).max(1);
+        if ch > self.cap {
+            return;
+        }
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let mut phase = f64::from_bits(self.phase.load(Ordering::Relaxed));
         let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
-        for f in 0..frames {
-            // Drop input frames we have moved past; keep the one at `phase` and the next one.
-            while s.phase >= 1.0 && s.data.len() >= 2 * ch {
-                s.data.drain(..ch);
-                s.phase -= 1.0;
+        for frame in 0..frames {
+            while phase >= 1.0 && head.wrapping_sub(tail) >= 2 {
+                tail = tail.wrapping_add(1);
+                phase -= 1.0;
             }
-            if s.phase >= 1.0 || s.data.len() < 2 * ch {
+            if phase >= 1.0 || head.wrapping_sub(tail) < 2 {
                 break;
             }
-            let fr = s.phase as f32;
-            for c in 0..ch {
-                let a = s.data.get(c).copied().unwrap_or(0.0);
-                let b = s.data.get(ch + c).copied().unwrap_or(a);
-                if let Some(x) = out.get_mut(c).and_then(|o| o.get_mut(f)) {
-                    *x = a + (b - a) * fr;
+            let fraction = phase as f32;
+            for channel in 0..ch {
+                let get = |frame: usize| {
+                    self.slots
+                        .get((frame & self.frame_mask).saturating_mul(ch).saturating_add(channel))
+                        .map_or(0.0, |slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                };
+                let a = get(tail);
+                let b = get(tail.wrapping_add(1));
+                if let Some(sample) = out.get_mut(channel).and_then(|values| values.get_mut(frame)) {
+                    *sample = a + (b - a) * fraction;
                 }
             }
-            s.phase += step;
+            phase += step;
         }
+        self.phase.store(phase.to_bits(), Ordering::Relaxed);
+        self.tail.store(tail, Ordering::Release);
     }
 }
 
@@ -776,13 +1030,39 @@ mod ring_tests {
     #[test]
     fn oversized_monitor_callback_keeps_memory_bounded_and_channels_aligned() {
         let ring = InputRing::new(2, 48_000);
-        let capacity = ring.state.lock().unwrap().data.capacity();
+        let capacity = ring.slots.len();
         ring.push(&(0..200_000).map(|n| n as f32).collect::<Vec<_>>());
-        let state = ring.state.lock().unwrap();
-        assert_eq!(state.data.capacity(), capacity);
-        assert_eq!(state.data.len(), ring.cap);
-        assert_eq!(state.data.front(), Some(&152_000.0));
-        assert_eq!(state.data.len() % 2, 0);
+        assert_eq!(ring.slots.len(), capacity);
+        assert_eq!(ring.head.load(std::sync::atomic::Ordering::Acquire), ring.cap / 2);
+        assert_eq!(ring.tail.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(f32::from_bits(ring.slots[0].load(std::sync::atomic::Ordering::Relaxed)), 0.0);
+        assert_eq!(ring.cap % 2, 0);
+    }
+
+    #[test]
+    fn full_monitor_drops_new_whole_frames_without_changing_consumer_cursor() {
+        use std::sync::atomic::Ordering;
+        let ring = InputRing::new(3, 8);
+        ring.push(&(0..18).map(|n| n as f32).collect::<Vec<_>>());
+        assert_eq!(ring.head.load(Ordering::Acquire), 4);
+        assert_eq!(ring.tail.load(Ordering::Relaxed), 0);
+        ring.push(&[90.0, 91.0, 92.0]);
+        assert_eq!(ring.tail.load(Ordering::Relaxed), 0);
+        let mut out = vec![vec![0.0; 3]; 3];
+        ring.pop_into(&mut out, 3, 8);
+        assert_eq!(out, [vec![0.0, 3.0, 6.0], vec![1.0, 4.0, 7.0], vec![2.0, 5.0, 8.0]]);
+    }
+
+    #[test]
+    fn monitor_frame_cursors_wrap_without_mixing_channels() {
+        use std::sync::atomic::Ordering;
+        let ring = InputRing::new(3, 16);
+        ring.head.store(usize::MAX - 1, Ordering::Relaxed);
+        ring.tail.store(usize::MAX - 1, Ordering::Relaxed);
+        ring.push(&[1.0, 11.0, 21.0, 2.0, 12.0, 22.0, 3.0, 13.0, 23.0, 4.0, 14.0, 24.0]);
+        let mut out = vec![vec![0.0; 3]; 3];
+        ring.pop_into(&mut out, 3, 16);
+        assert_eq!(out, [vec![1.0, 2.0, 3.0], vec![11.0, 12.0, 13.0], vec![21.0, 22.0, 23.0]]);
     }
 
     /// A 1 kHz sine recorded at 16 kHz must come out as a 1 kHz sine at 48 kHz, across calls.

@@ -838,7 +838,14 @@ impl SoundApp {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
             return;
         }
-        match soundcraft_playback::record::Recorder::open_with(&self.ui.audio) {
+        #[cfg(target_os = "macos")]
+        let opened = match self.player.as_ref().filter(|player| !player.silent) {
+            Some(player) => soundcraft_playback::record::Recorder::open_with_master(&self.ui.audio, player.master_clock(), player.device_rate),
+            None => soundcraft_playback::record::Recorder::open_with(&self.ui.audio),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let opened = soundcraft_playback::record::Recorder::open_with(&self.ui.audio);
+        match opened {
             Ok(r) => {
                 if let Some(p) = &self.player {
                     p.set_input(std::sync::Arc::clone(&r.monitor));
@@ -856,7 +863,9 @@ impl SoundApp {
     fn watch_output(&mut self) {
         if let Some(player) = &self.player {
             let error = player.source_error();
-            if error.is_none() {self.source_error_shown=None;}
+            if error.is_none() {
+                self.source_error_shown = None;
+            }
             let underruns = player.source_underruns();
             if let Some(error) = error.filter(|error| Some(error) != self.source_error_shown.as_ref()) {
                 if self.engine.transport.playing || self.engine.transport.recording {
