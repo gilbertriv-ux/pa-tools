@@ -22,6 +22,8 @@ pub enum MidiIoError {
     Unsupported,
     Disconnected,
     QueueFull,
+    ConnectionLimit,
+    InvalidChannel,
     Backend(String),
 }
 
@@ -34,6 +36,8 @@ impl fmt::Display for MidiIoError {
             Self::Unsupported => f.write_str("hardware MIDI backend is not enabled"),
             Self::Disconnected => f.write_str("MIDI device disconnected"),
             Self::QueueFull => f.write_str("MIDI input queue is full"),
+            Self::ConnectionLimit => f.write_str("MIDI connection limit reached; reconnect the audio engine to reclaim retired queues"),
+            Self::InvalidChannel => f.write_str("MIDI channel must be in 0..=15"),
             Self::Backend(reason) => write!(f, "MIDI backend: {reason}"),
         }
     }
@@ -125,6 +129,10 @@ pub struct TimedShortMessage {
 
 /// Nonblocking short-message receiver. SysEx requires a separate bounded control-worker path.
 pub trait MidiInputConnection: Send {
+    /// Transfer the bounded queue while the native connection remains owned off the audio thread.
+    fn take_receiver(&mut self) -> Option<MidiInputReceiver> {
+        None
+    }
     fn try_receive(&mut self) -> Result<Option<TimedShortMessage>, MidiIoError>;
     fn overflow_count(&self) -> usize;
 }
@@ -194,7 +202,7 @@ impl MidiInputSender {
         let q = &self.0;
         let head = q.head.load(Ordering::Relaxed);
         if head.wrapping_sub(q.tail.load(Ordering::Acquire)) >= q.slots.len() {
-            let _ = q.overflow.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+            q.overflow.store(q.overflow.load(Ordering::Relaxed).saturating_add(1), Ordering::Relaxed);
             return Err(MidiIoError::QueueFull);
         }
         let slot = q.slots.get(head % q.slots.len()).ok_or(MidiIoError::InvalidCapacity)?;

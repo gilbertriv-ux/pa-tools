@@ -12,6 +12,7 @@ pub mod docking;
 pub mod edit_window;
 pub mod extra_windows;
 pub mod fonts;
+mod hardware;
 pub mod icons;
 pub mod menus;
 pub mod midi_editor;
@@ -278,6 +279,7 @@ pub struct SoundApp {
     pub services: Services,
     /// Set only by a desktop host after installing an OS menu bar.
     pub native_menu_bar: bool,
+    hardware: hardware::HardwareState,
     /// Folder for crash-recovery autosaves (native apps set it).
     pub autosave_dir: Option<std::path::PathBuf>,
     /// Writes the open session's autosaves in the background, once there is something to write.
@@ -375,6 +377,7 @@ impl SoundApp {
             transcription: None,
             services,
             native_menu_bar: false,
+            hardware: hardware::HardwareState::default(),
             autosave_dir: None,
             autosaver: None,
             autosaved_rev: 0,
@@ -428,6 +431,9 @@ impl SoundApp {
 
     /// Run a command; errors go to the status line. Returns the result.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if let Some(result) = hardware::command(self, id, &params) {
+            return result;
+        }
         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
             return Err(self.ui.status.clone());
         }
@@ -439,6 +445,9 @@ impl SoundApp {
             self.capture_plugin_states();
         }
         let replacing = matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
+        if replacing {
+            hardware::disconnect(self);
+        }
         match self.engine.execute(id, &params) {
             Ok(v) => {
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
@@ -804,7 +813,8 @@ impl SoundApp {
 
     /// Whether the meters are live: while playing, and while armed or input-monitored tracks are heard.
     fn meters_live(&self) -> bool {
-        self.engine.transport.playing
+        hardware::is_live(self)
+            || self.engine.transport.playing
             || (self.recorder.is_some() && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm))
     }
 
@@ -816,6 +826,7 @@ impl SoundApp {
         if self.engine.transport.recording {
             return Err("stop recording before changing the audio device".into());
         }
+        hardware::disconnect(self);
         self.ui.audio = cfg;
         let at = self.position();
         if let Some(p) = &self.player {
@@ -941,6 +952,7 @@ impl SoundApp {
 
     /// Reopen the audio devices, keeping a take in progress.
     pub fn reconnect_audio(&mut self) {
+        hardware::disconnect(self);
         if self.is_playing() || self.engine.transport.recording {
             self.stop_play();
         }
@@ -1290,7 +1302,9 @@ impl SoundApp {
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
         }
-        workspace::show(self, ui);
+        if !self.native_menu_bar {
+            workspace::show(self, ui);
+        }
         // With the Mix window in its own native window, the main window keeps Edit.
         match if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window } {
             MainWindow::Edit => edit_window::show(self, ui),
@@ -1301,6 +1315,7 @@ impl SoundApp {
         }
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
+        hardware::show(self, &ctx);
         transcript_window::show(self, &ctx);
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);

@@ -26,10 +26,12 @@ pub mod devices;
 pub mod duplex;
 pub mod latency;
 pub mod midi_devices;
+pub mod midi_hardware;
 pub mod record;
 
 pub use devices::AudioConfig;
 
+use midi_devices::MidiInputConnection;
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
@@ -68,6 +70,9 @@ enum Cmd {
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
     Recording(bool),
+    MidiAttach(midi_devices::MidiInputReceiver, TrackId, Option<u8>),
+    MidiRoute(TrackId, Option<u8>),
+    MidiDetach,
     Play {
         from: Samples,
         end: Option<Samples>,
@@ -96,6 +101,7 @@ enum Cmd {
 
 struct Shared {
     clock: Arc<duplex::MasterClock>,
+    midi_connections: AtomicU32,
     /// Invalidates queued/preparing starts when stop, locate, or another play supersedes them.
     transport_generation: AtomicU64,
     /// Zero or the generation whose initial source blocks are being warmed.
@@ -176,7 +182,18 @@ fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fill: impl FnO
 }
 
 /// State owned by the audio callback.
+struct LiveMidiInput {
+    receiver: midi_devices::MidiInputReceiver,
+    target: TrackId,
+    channel: Option<u8>,
+    overflow: usize,
+    discard: bool,
+}
+
 struct AudioState {
+    midi_input: Option<LiveMidiInput>,
+    midi_retired: [Option<midi_devices::MidiInputReceiver>; 16],
+    midi_flush: bool,
     rx: Receiver<Cmd>,
     shared: Arc<Shared>,
     session: Arc<Session>,
@@ -212,6 +229,9 @@ impl AudioState {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
         AudioState {
+            midi_input: None,
+            midi_retired: std::array::from_fn(|_| None),
+            midi_flush: false,
             garbage,
             old_sessions: None,
             fold: fold_gains(&session),
@@ -233,16 +253,113 @@ impl AudioState {
         }
     }
 
+    fn retire_midi(&mut self, receiver: midi_devices::MidiInputReceiver) {
+        for slot in &mut self.midi_retired {
+            if slot.is_none() {
+                *slot = Some(receiver);
+                return;
+            }
+        }
+        // Control admission permits at most sixteen lifetime attachments. Never free a queue
+        // on the realtime thread even if an internal caller violates that invariant.
+        std::mem::forget(receiver);
+    }
+
+    fn disconnect_midi(&mut self) {
+        if let Some(input) = self.midi_input.take() {
+            self.mix.silence_live_midi(Some(input.target));
+            self.retire_midi(input.receiver);
+            self.midi_flush = true;
+            if !self.playing {
+                self.pending_len = 0;
+                self.read = 0.0;
+            }
+        }
+    }
+
+    fn drain_live_midi(&mut self) {
+        let Some(mut input) = self.midi_input.take() else {
+            return;
+        };
+        let overflow = input.receiver.overflow_count();
+        if overflow != input.overflow {
+            input.overflow = overflow;
+            input.discard = true;
+            self.mix.silence_live_midi(Some(input.target));
+            self.midi_flush = true;
+        }
+        for _ in 0..soundcraft_mix::MAX_LIVE_MIDI_EVENTS {
+            match input.receiver.try_receive() {
+                Ok(Some(event)) if !input.discard => {
+                    let bytes = event.message.as_bytes();
+                    let status = bytes.first().copied().unwrap_or(0);
+                    if (0x80..0xf0).contains(&status) && input.channel.is_none_or(|c| c == status & 15) {
+                        let mut message = [0; 3];
+                        for (dst, src) in message.iter_mut().zip(bytes) {
+                            *dst = *src;
+                        }
+                        if !self.mix.queue_live_midi(input.target, 0, message) {
+                            self.mix.silence_live_midi(Some(input.target));
+                            input.discard = true;
+                        }
+                        if !self.playing {
+                            self.pending_len = 0;
+                            self.read = 0.0;
+                        }
+                    } else if status == 0xff {
+                        self.mix.silence_live_midi(Some(input.target));
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    input.discard = false;
+                    break;
+                }
+                Err(_) => {
+                    self.mix.silence_live_midi(Some(input.target));
+                    self.retire_midi(input.receiver);
+                    self.midi_flush = true;
+                    if !self.playing {
+                        self.pending_len = 0;
+                        self.read = 0.0;
+                    }
+                    return;
+                }
+            }
+        }
+        self.midi_input = Some(input);
+    }
+
     fn drain(&mut self) {
         let mut changed = false;
         while let Ok(c) = self.rx.try_recv() {
             match c {
+                Cmd::MidiAttach(receiver, target, channel) => {
+                    self.disconnect_midi();
+                    self.midi_input = Some(LiveMidiInput { receiver, target, channel, overflow: 0, discard: false });
+                }
+                Cmd::MidiRoute(target, channel) => {
+                    if let Some(input) = &mut self.midi_input {
+                        self.mix.silence_live_midi(Some(input.target));
+                        input.target = target;
+                        input.channel = channel;
+                        input.discard = true;
+                        self.midi_flush = true;
+                        if !self.playing {
+                            self.pending_len = 0;
+                            self.read = 0.0;
+                        }
+                    }
+                }
+                Cmd::MidiDetach => self.disconnect_midi(),
                 Cmd::Input(r) => self.input = Some(r),
                 Cmd::Recording(r) => {
                     // Preserve the stop edge even if a new Record is queued in this same block.
-                    if !r { self.shared.clock.invalidate(); }
+                    if !r {
+                        self.shared.clock.invalidate();
+                    }
                     self.recording = r;
-                },
+                }
                 Cmd::Session(s, instances) => {
                     changed = true;
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
@@ -372,6 +489,7 @@ impl AudioState {
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.midi_flush = false;
         self.send_garbage();
         self.pending_len = n;
         if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -394,8 +512,11 @@ impl AudioState {
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
+        self.drain_live_midi();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let monitoring = self.midi_input.is_some()
+            || self.midi_flush
+            || (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm));
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -603,6 +724,35 @@ impl Drop for Player {
 }
 
 impl Player {
+    /// Attach a native MIDI queue; its hardware connection stays on the control thread.
+    /// Admission is lifetime-bounded so replaced queues are never freed in an audio callback.
+    pub fn attach_midi_input(
+        &self,
+        receiver: midi_devices::MidiInputReceiver,
+        target: TrackId,
+        channel: Option<u8>,
+    ) -> Result<(), midi_devices::MidiIoError> {
+        if channel.is_some_and(|c| c > 15) {
+            return Err(midi_devices::MidiIoError::InvalidChannel);
+        }
+        self.shared
+            .midi_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 16).then_some(n + 1))
+            .map_err(|_| midi_devices::MidiIoError::ConnectionLimit)?;
+        self.tx.send(Cmd::MidiAttach(receiver, target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)
+    }
+
+    pub fn set_midi_thru_target(&self, target: TrackId, channel: Option<u8>) -> Result<(), midi_devices::MidiIoError> {
+        if channel.is_some_and(|c| c > 15) {
+            return Err(midi_devices::MidiIoError::InvalidChannel);
+        }
+        self.tx.send(Cmd::MidiRoute(target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)
+    }
+
+    pub fn detach_midi_input(&self) {
+        let _ = self.tx.send(Cmd::MidiDetach);
+    }
+
     /// Output callbacks are the sole publisher of the software recording clock.
     pub fn master_clock(&self) -> Arc<duplex::MasterClock> {
         Arc::clone(&self.shared.clock)
@@ -643,6 +793,7 @@ impl Player {
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Player {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1259,6 +1410,7 @@ mod tests {
     fn control_test_state() -> (Sender<Cmd>, Arc<Shared>, AudioState) {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(1),
             starting: AtomicU64::new(1),
             position: AtomicI64::new(0),
@@ -1269,6 +1421,59 @@ mod tests {
         let (tx, rx) = channel();
         let state = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, channel().0);
         (tx, shared, state)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn midi_does_not_discard_partially_consumed_playback() {
+        let (tx, _, mut state) = control_test_state();
+        state.playing = true;
+        state.pos = 512;
+        state.pending_len = 512;
+        state.read = 100.0;
+        for channel in &mut state.pending {
+            channel.fill(0.25);
+        }
+        let (mut sender, receiver) = midi_devices::input_queue(16).unwrap();
+        tx.send(Cmd::MidiAttach(receiver, TrackId(99), None)).unwrap();
+        sender
+            .try_send(midi_devices::TimedShortMessage { timestamp_us: 0, message: midi_devices::ShortMessage::new(&[0x90, 60, 100]).unwrap() })
+            .unwrap();
+        let mut output = [0.0; 4];
+        state.fill(&mut output, 2);
+        assert_eq!(state.pos, 512);
+        assert_eq!(state.read, 102.0);
+        assert!(output.iter().all(|x| (*x - 0.25).abs() < 1e-6));
+        tx.send(Cmd::MidiDetach).unwrap();
+        state.fill(&mut output, 2);
+        assert_eq!(state.pos, 512);
+        assert_eq!(state.read, 104.0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn midi_queue_drives_stopped_synth_and_retires_disconnected_input() {
+        let (tx, shared, mut state) = control_test_state();
+        let mut session = Session::default();
+        let target = session.add_track(soundcraft_model::TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, None);
+        session.track_mut(target).unwrap().instrument = Some(soundcraft_model::Insert::new("subtractive_synth"));
+        tx.send(Cmd::Session(Arc::new(session), Vec::new())).unwrap();
+        let (mut sender, receiver) = midi_devices::input_queue(16).unwrap();
+        tx.send(Cmd::MidiAttach(receiver, target, Some(2))).unwrap();
+        let event =
+            |status| midi_devices::TimedShortMessage { timestamp_us: 0, message: midi_devices::ShortMessage::new(&[status, 60, 100]).unwrap() };
+        sender.try_send(event(0x91)).unwrap();
+        let mut output = [0.0; 1024];
+        state.fill(&mut output, 2);
+        assert!(output.iter().all(|x| x.abs() < 1e-8));
+        sender.try_send(event(0x92)).unwrap();
+        state.fill(&mut output, 2);
+        assert!(output.iter().any(|x| x.abs() > 1e-5));
+        assert_eq!(shared.position.load(Ordering::Relaxed), 0);
+        drop(sender);
+        state.fill(&mut output, 2);
+        assert!(state.midi_input.is_none());
+        assert_eq!(state.midi_retired.iter().flatten().count(), 1);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1408,6 +1613,7 @@ mod tests {
     fn a_block_that_panics_goes_silent_and_is_reported_once() {
         let shared = Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1452,6 +1658,7 @@ mod tests {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1473,6 +1680,7 @@ mod tests {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1500,6 +1708,7 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "output", SourceId(5), 0, 0, frames as i64));
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1578,6 +1787,7 @@ mod tests {
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1621,6 +1831,7 @@ mod tests {
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1716,6 +1927,7 @@ mod tests {
     fn replaced_sessions_are_freed_on_the_ui_thread() {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1748,6 +1960,7 @@ mod tests {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1786,6 +1999,7 @@ mod tests {
             tr.mixer.inserts[0] = Some(ins);
             let shared = Arc::new(Shared {
                 clock: duplex::MasterClock::new(),
+                midi_connections: AtomicU32::new(0),
                 transport_generation: AtomicU64::new(0),
                 starting: AtomicU64::new(0),
                 position: AtomicI64::new(0),
@@ -1819,6 +2033,7 @@ mod tests {
         s.track_mut(t).unwrap().mixer.record_arm = true;
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
+            midi_connections: AtomicU32::new(0),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
