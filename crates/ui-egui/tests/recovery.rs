@@ -52,6 +52,9 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     let path = dir.join("Song.scraft");
     let mut first = launch(&root);
     first.run("session.save_as", json!({"path": path})).unwrap();
+    // An autosave is a leftover only when it is newer than the file it came from; file times have
+    // a coarse tick, so give the clock one (a fast build otherwise writes both in the same tick).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     first.run("track.new", json!({"name": "Vocal"})).unwrap();
     first.close_autosave();
     drop(first);
@@ -172,5 +175,114 @@ fn a_panic_in_a_frame_autosaves_and_the_app_carries_on() {
     let mut next = launch(&root);
     next.recover(&left[0]);
     assert!(next.engine.session().track_by_name("Vocal").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recovering_stops_a_running_transcription() {
+    let _one = one_at_a_time();
+    let dir = folder("recovery-transcribe");
+    let root = dir.join("Autosave");
+    let mut first = launch(&root);
+    first.run("track.new", json!({"name": "Vocal"})).unwrap();
+    first.close_autosave();
+    let left = leftovers(&root);
+
+    // Another session is open, with a transcription running in it (a folder with no model, so the
+    // worker ends at once; the job stays until a frame collects its answer).
+    let mut next = launch(&root);
+    next.run("track.new", json!({"name": "Drums"})).unwrap();
+    next.transcript.models_dir = dir.join("no-models").to_string_lossy().into_owned();
+    let ctx = egui::Context::default();
+    soundcraft_ui_egui::menus::invoke_menu(&mut next, "track.transcribe", "Track > Transcribe Track");
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(next.transcript.is_running(), "a transcription is running in the session about to be replaced");
+
+    next.recover(&left[0]);
+    assert!(next.engine.session().track_by_name("Vocal").is_some(), "the recovered session is open");
+    assert!(!next.transcript.is_running(), "its transcription was stopped with the session it belonged to");
+
+    // And its answer, whenever it arrives, is not stored in the recovered session.
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(next.engine.session().transcripts.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A recogniser that is slow: it tells the test it has started, then waits to be released, and only
+/// then looks at the stop flag, like a model that takes a while to notice a Cancel.
+struct Slow {
+    started: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl soundcraft_pa_speech::Transcriber for Slow {
+    fn id(&self) -> String {
+        "slow".into()
+    }
+    fn transcribe(
+        &self,
+        _: &[f32],
+        _: &soundcraft_pa_speech::Options,
+        progress: soundcraft_pa_speech::ProgressFn,
+    ) -> Result<soundcraft_pa_speech::Transcript, soundcraft_pa_speech::SpeechError> {
+        let _ = self.started.lock().map(|s| s.send(()));
+        let _ = self.release.lock().map(|r| r.recv());
+        if progress(0.5, "Working") {
+            return Ok(soundcraft_pa_speech::Transcript {
+                words: vec![soundcraft_pa_speech::Word::new("late", 0.0, 0.1)],
+                language: "en".into(),
+                source: "slow".into(),
+            });
+        }
+        Err(soundcraft_pa_speech::SpeechError::Cancelled)
+    }
+}
+
+/// The report: Recover cancels a transcription, whose thread then ends minutes later, mid-run, and
+/// used to wipe the "Recovered ..." message off the main status line. With a recogniser that is
+/// really busy when the cancel comes, the thread outlives Recover, ends later, and the message stays.
+#[test]
+fn recovering_while_the_recogniser_is_mid_run_keeps_the_recovered_message() {
+    let _one = one_at_a_time();
+    let dir = folder("recovery-transcribe-slow");
+    let root = dir.join("Autosave");
+    let mut first = launch(&root);
+    first.run("track.new", json!({"name": "Vocal"})).unwrap();
+    first.close_autosave();
+    // (A lock released a moment ago can look held for a moment more, see `one_at_a_time`.)
+    assert!(eventually(|| !leftovers(&root).is_empty()), "the first session left its autosave");
+    let left = leftovers(&root);
+
+    let mut next = launch(&root);
+    next.run("track.new", json!({"name": "Drums"})).unwrap();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    next.transcript.inject_transcriber(std::sync::Arc::new(Slow { started: Mutex::new(started_tx), release: Mutex::new(gate) }));
+    let ctx = egui::Context::default();
+    soundcraft_ui_egui::menus::invoke_menu(&mut next, "track.transcribe", "Track > Transcribe Track");
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(next.transcript.is_running());
+    // Wait until the recogniser is inside its run: the cancel must come mid-run, not before it.
+    started.recv_timeout(std::time::Duration::from_secs(10)).expect("the recogniser started");
+
+    next.recover(&left[0]);
+    assert!(next.engine.session().track_by_name("Vocal").is_some(), "the recovered session is open");
+    assert!(!next.transcript.is_running(), "the job was cancelled with the session it belonged to");
+    assert!(next.transcript.is_stopping(), "but its thread is still inside the recogniser");
+    assert!(next.ui.status.starts_with("Recovered "), "{}", next.ui.status);
+    let recovered = next.ui.status.clone();
+
+    // The recogniser finally notices; the window reaps the thread and says so in its own status.
+    drop(release);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while next.transcript.is_stopping() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    }
+    soundcraft_ui_egui::transcript_window::step(&mut next, &ctx);
+    assert!(!next.transcript.is_stopping(), "the thread ended");
+    assert_eq!(next.transcript.status, "Transcription stopped", "the window's own status");
+    assert_eq!(next.ui.status, recovered, "the main status line still says what Recover said");
+    assert!(next.engine.session().transcripts.is_empty(), "and the stopped job's answer was not stored in the recovered session");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -29,6 +29,7 @@ pub mod shortcuts;
 pub mod spot;
 pub mod theme;
 pub mod toolbar;
+pub mod transcript_window;
 pub mod video_track;
 pub mod video_window;
 pub mod waveform;
@@ -309,6 +310,8 @@ pub struct SoundApp {
     pub midi: midi_editor::MidiEditorState,
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
+    /// Window ▸ Transcript.
+    pub transcript: transcript_window::TranscriptState,
     pub palette: palette::PaletteState,
     /// Bring the separate Mix window to the front on the next frame.
     pub(crate) focus_mix: bool,
@@ -399,6 +402,7 @@ impl SoundApp {
             midi: midi_editor::MidiEditorState::default(),
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
+            transcript: transcript_window::TranscriptState::default(),
             palette: palette::PaletteState::default(),
             focus_mix: false,
             synthetic: Vec::new(),
@@ -451,6 +455,10 @@ impl SoundApp {
             Ok(v) => {
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
+                }
+                if replacing {
+                    // A transcription belongs to the session it started in.
+                    transcript_window::cancel(self);
                 }
                 if id == "app.quit" {
                     self.quit_requested = true;
@@ -804,6 +812,8 @@ impl SoundApp {
         self.close_autosave();
         match soundcraft_engine::autosave::recover(&mut self.engine, left) {
             Ok(missing) => {
+                // The session was replaced: a transcription belongs to the session it started in.
+                transcript_window::cancel(self);
                 if self.write_autosave() {
                     soundcraft_engine::autosave::discard(left);
                 }
@@ -1230,6 +1240,7 @@ impl SoundApp {
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
+        transcript_window::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
@@ -1332,6 +1343,7 @@ impl SoundApp {
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);
+        transcript_window::show(self, &ctx);
         recovery::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);

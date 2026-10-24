@@ -74,7 +74,7 @@ Parity is measured, not guessed: `crates/engine/catalog/menus.txt` lists the inc
 - Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates and files you own; write manifests atomically; when you are done, remove the build output you created (disk), and nothing else.
 
 ## Quality gates (before every commit)
-`cargo xtask ci` = fmt check, `clippy --workspace --all-targets -D warnings`, tests, assets, layers, wasm check. Commit after each arc of work that builds; one topic per commit.
+`cargo xtask ci` = fmt check, `clippy --workspace --all-targets -D warnings`, tests, the same clippy and tests again for `soundcraft-pa-speech` with its `whisper,download` features on, assets, layers, wasm check. Commit after each arc of work that builds; one topic per commit.
 
 ## Packaging and release
 Build artifacts locally with the scripts in `packaging/` (`macos/package.sh`, `windows/package.ps1`, `linux/package.sh`, `freebsd/package.sh`, `web/package.sh`); the README lists the commands, including the Intel Mac build. Artifacts are named `patools-<ver>-<platform>-<arch>.<ext>` and `pa-tools-cli-<ver>-macos-<arch>.zip`. The brand lives in `packaging/env.sh` and the table at the top of `rebrand.sh`; change it there, then run `./rebrand.sh`. Version: `cargo xtask version [set X.Y.Z]`. The GitHub workflows still call upstream's reusable workflows; what has to be vendored is in `docs/ci-notes-patools.md`. See also `docs/releasing.md` and `docs/release-playbook.md`. Never commit signing material.

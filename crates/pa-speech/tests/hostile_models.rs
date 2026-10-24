@@ -1,0 +1,490 @@
+//! Hostile model folders: files of exactly the catalogue sizes (which is all `models::installed`
+//! checks) whose *content* is crafted to crash a careless loader. `load` must refuse each one with
+//! an error, never panic, abort or allocate from a number in the file.
+//!
+//! Every case is written as valid JSON padded with spaces up to the catalogue size, so that the
+//! parse succeeds and it is the validation that has to say no. The weights are a sparse zero file:
+//! validation runs before they are read, so a rejection that comes from the weights (the
+//! `model.safetensors` prefix in the message) would mean the validation let the case through. The
+//! baseline test shows that a well-formed folder does get as far as the weights.
+#![cfg(feature = "whisper")]
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use serde_json::{Value, json};
+use soundcraft_pa_speech::{SpeechError, load, models};
+
+const MODEL: &str = "whisper-tiny";
+const VOCAB: u64 = 51_865;
+const EOT: u64 = 50_257;
+const SOT: u64 = 50_258;
+const TRANSLATE: u64 = 50_358;
+const TRANSCRIBE: u64 = 50_359;
+const NO_SPEECH: u64 = 50_362;
+const NO_TIMESTAMPS: u64 = 50_363;
+const TS_BEGIN: u64 = 50_364;
+
+/// A scratch folder removed when dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!("pa-speech-hostile-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch folder");
+        Scratch(dir)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A well-formed `config.json` (the shape of the smallest model's).
+fn config() -> Value {
+    json!({
+        "num_mel_bins": 80, "d_model": 384,
+        "encoder_layers": 4, "encoder_attention_heads": 6,
+        "decoder_layers": 4, "decoder_attention_heads": 6,
+        "max_source_positions": 1500, "max_target_positions": 448,
+        "vocab_size": VOCAB
+    })
+}
+
+fn generation_config() -> Value {
+    json!({
+        "alignment_heads": [[2, 2], [3, 0], [3, 2]],
+        "suppress_tokens": [1, 2, 7],
+        "begin_suppress_tokens": [220, EOT]
+    })
+}
+
+/// Added tokens as `(content, id)`: the specials of a multilingual model, in their usual places.
+fn added() -> Vec<(String, u64)> {
+    let mut v = vec![
+        ("<|endoftext|>".to_string(), EOT),
+        ("<|startoftranscript|>".to_string(), SOT),
+        ("<|en|>".to_string(), SOT + 1),
+        ("<|de|>".to_string(), SOT + 2),
+        ("<|translate|>".to_string(), TRANSLATE),
+        ("<|transcribe|>".to_string(), TRANSCRIBE),
+        ("<|nospeech|>".to_string(), NO_SPEECH),
+        ("<|notimestamps|>".to_string(), NO_TIMESTAMPS),
+        ("<|0.00|>".to_string(), TS_BEGIN),
+    ];
+    v.push(("<|0.02|>".to_string(), TS_BEGIN + 1));
+    v
+}
+
+fn tokenizer_of(vocab: Value, added: &[(String, u64)]) -> Value {
+    let added: Vec<Value> = added.iter().map(|(c, id)| json!({"id": id, "content": c, "special": true})).collect();
+    json!({"model": {"type": "BPE", "vocab": vocab, "merges": []}, "added_tokens": added})
+}
+
+fn tokenizer() -> Value {
+    tokenizer_of(json!({"!": 0, "a": 1, "b": 2, "\u{120}the": 3}), &added())
+}
+
+/// Write `value` as `name`, padded with spaces to the catalogue size of that file.
+fn write_padded(dir: &Path, name: &str, value: &Value) {
+    let m = models::find(MODEL).expect("model in the catalogue");
+    let size = m.files.iter().find(|f| f.name == name).expect("file in the catalogue").size;
+    let mut bytes = serde_json::to_vec(value).expect("serialise");
+    assert!(bytes.len() as u64 <= size, "{name}: {} bytes do not fit the catalogue size {size}", bytes.len());
+    bytes.resize(usize::try_from(size).expect("size fits"), b' ');
+    std::fs::write(dir.join(name), bytes).expect("write file");
+}
+
+/// Install the model under a scratch `models_dir` with the given JSON files; sparse weights.
+fn install(tag: &str, config: &Value, generation: &Value, tokenizer: &Value) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(tag);
+    let models_dir = scratch.path().to_path_buf();
+    let m = models::find(MODEL).expect("model in the catalogue");
+    let dir = models::model_dir(&models_dir, m);
+    std::fs::create_dir_all(&dir).expect("create model folder");
+    write_padded(&dir, "config.json", config);
+    write_padded(&dir, "generation_config.json", generation);
+    write_padded(&dir, "tokenizer.json", tokenizer);
+    let weights = m.files.iter().find(|f| f.name == "model.safetensors").expect("weights in the catalogue");
+    File::create(dir.join(weights.name)).and_then(|f| f.set_len(weights.size)).expect("sparse weights");
+    assert!(models::installed(&models_dir, m), "the hostile folder must pass `installed`: that is the whole point");
+    (scratch, models_dir)
+}
+
+/// `load` must fail with a model error whose text contains `why` and which did not come from the
+/// weights (validation runs first).
+fn refuses(tag: &str, config: &Value, generation: &Value, tokenizer: &Value, why: &str) {
+    let (_scratch, models_dir) = install(tag, config, generation, tokenizer);
+    let err = load(&models_dir, MODEL).err().unwrap_or_else(|| panic!("{tag}: the hostile model was accepted"));
+    let SpeechError::Model(text) = &err else { panic!("{tag}: expected a model error, got {err:?}") };
+    assert!(text.contains(why), "{tag}: expected {why:?} in {text:?}");
+    assert!(!text.contains("model.safetensors"), "{tag}: the case got as far as the weights: {text:?}");
+}
+
+#[test]
+fn a_well_formed_folder_gets_as_far_as_the_weights() {
+    // Baseline: the synthetic config and tokenizer are accepted; only the (zero) weights are bad.
+    let (_scratch, models_dir) = install("baseline", &config(), &generation_config(), &tokenizer());
+    let err = load(&models_dir, MODEL).err().expect("zero weights cannot load");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(text.contains("model.safetensors"), "{text:?}");
+}
+
+#[test]
+fn a_vocabulary_id_far_beyond_the_vocabulary_is_refused_not_allocated() {
+    // Used to allocate a table of 10^15 entries (about 24 TB) and abort the process.
+    let tok = tokenizer_of(json!({"!": 1_000_000_000_000_000u64, "a": 1}), &added());
+    refuses("hugeid", &config(), &generation_config(), &tok, "vocab id");
+}
+
+#[test]
+fn a_vocabulary_larger_than_vocab_size_is_refused() {
+    let mut cfg = config();
+    cfg["vocab_size"] = json!(3);
+    let tok = tokenizer_of(json!({"a": 0, "b": 1, "c": 2, "d": 3}), &[]);
+    refuses("bigvocab", &cfg, &generation_config(), &tok, "vocab");
+}
+
+#[test]
+fn an_added_token_id_that_wraps_a_u32_is_refused() {
+    let mut a = added();
+    a.push(("<|zz|>".to_string(), (1u64 << 32) + 5));
+    refuses("wrapid", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "outside");
+}
+
+#[test]
+fn a_short_added_token_between_the_specials_is_refused_not_sliced() {
+    // `<|>` starts with `<|` and ends with `|>` but has no body: slicing it panicked.
+    let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == "<|en|>" { ("<|>".to_string(), id) } else { (c, id) }).collect();
+    refuses("angle", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "language token");
+}
+
+#[test]
+fn a_timestamp_token_beyond_vocab_size_is_refused() {
+    // `<|0.00|>` at 60000 with 51865 logits: indexed the logits out of range.
+    let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == "<|0.00|>" { (c, 60_000) } else { (c, id) }).collect();
+    refuses("tsbegin", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "outside");
+}
+
+#[test]
+fn timestamps_moved_to_id_zero_are_refused_at_load() {
+    // `<|0.00|>` at id 0 made "id >= timestamp_begin" true of every token: each window then
+    // advanced the audio by 10 ms, and a long recording took hours. Refused when the model loads,
+    // before the weights are read.
+    let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == "<|0.00|>" { (c, 0) } else { (c, id) }).collect();
+    refuses("tsid0", &config(), &generation_config(), &tokenizer_of(json!({"!": 5, "a": 1}), &a), "timestamp");
+    // The same for any move below the other special tokens, and for a run that leaves the vocabulary.
+    for id in [1u64, NO_TIMESTAMPS, VOCAB - 1500] {
+        let a: Vec<(String, u64)> = added()
+            .into_iter()
+            .map(|(c, i)| {
+                if c == "<|0.00|>" {
+                    (c, id)
+                } else if c == "<|0.02|>" {
+                    (c, id + 1)
+                } else {
+                    (c, i)
+                }
+            })
+            .collect();
+        refuses(&format!("tsmoved-{id}"), &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+    }
+}
+
+#[test]
+fn another_special_token_inside_the_timestamp_run_is_refused() {
+    let mut a = added();
+    a.push(("<|startoflm|>".to_string(), TS_BEGIN + 40));
+    refuses("tsrun", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+    // A timestamp that is not where its time puts it.
+    let mut a = added();
+    a.push(("<|0.04|>".to_string(), TS_BEGIN + 9));
+    refuses("tsoff", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "timestamp");
+}
+
+#[test]
+fn every_special_token_must_be_inside_the_vocabulary() {
+    for target in ["<|endoftext|>", "<|startoftranscript|>", "<|transcribe|>", "<|notimestamps|>", "<|nospeech|>", "<|translate|>"] {
+        let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == target { (c, VOCAB + 7) } else { (c, id) }).collect();
+        refuses(&format!("special-{}", &target[2..5]), &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), "outside");
+    }
+}
+
+#[test]
+fn zero_attention_heads_are_refused_not_divided_by() {
+    for key in ["decoder_attention_heads", "encoder_attention_heads"] {
+        let mut cfg = config();
+        cfg[key] = json!(0);
+        refuses(&format!("heads0-{key}"), &cfg, &generation_config(), &tokenizer(), "attention_heads");
+    }
+}
+
+#[test]
+fn heads_must_divide_the_model_width() {
+    let mut cfg = config();
+    cfg["decoder_attention_heads"] = json!(7); // 384 % 7 != 0
+    refuses("heads7", &cfg, &generation_config(), &tokenizer(), "attention_heads");
+}
+
+#[test]
+fn absurd_dimensions_are_refused() {
+    for (key, value) in [
+        ("d_model", json!(1u64 << 40)),
+        ("num_mel_bins", json!(0)),
+        ("num_mel_bins", json!(100_000)),
+        ("encoder_layers", json!(0)),
+        ("decoder_layers", json!(1_000_000_000u64)),
+        ("max_source_positions", json!(10)),
+        ("max_source_positions", json!(1u64 << 40)),
+        ("max_target_positions", json!(2)),
+        ("max_target_positions", json!(1u64 << 40)),
+        ("vocab_size", json!(0)),
+        ("vocab_size", json!(1u64 << 40)),
+        ("vocab_size", json!(-5)),
+    ] {
+        let mut cfg = config();
+        cfg[key] = value.clone();
+        let (_scratch, models_dir) = install("dims", &cfg, &generation_config(), &tokenizer());
+        let err = load(&models_dir, MODEL).err().unwrap_or_else(|| panic!("{key}={value} was accepted"));
+        let SpeechError::Model(text) = &err else { panic!("{key}={value}: expected a model error, got {err:?}") };
+        assert!(!text.contains("model.safetensors"), "{key}={value}: got as far as the weights: {text:?}");
+    }
+}
+
+#[test]
+fn alignment_heads_must_exist() {
+    for bad in [json!([[99, 0]]), json!([[0, 99]]), json!([[u64::MAX, 0]])] {
+        let mut generation = generation_config();
+        generation["alignment_heads"] = bad.clone();
+        refuses("alignhead", &config(), &generation, &tokenizer(), "alignment head");
+    }
+}
+
+#[test]
+fn many_duplicate_alignment_heads_load_as_a_few() {
+    // Hundreds of copies of one head (the SPV's file had ~630) are one head; the folder gets as far as the weights.
+    let mut generation = generation_config();
+    generation["alignment_heads"] = json!(vec![[3, 2]; 500]);
+    let (_scratch, models_dir) = install("dupheads", &config(), &generation, &tokenizer());
+    let err = load(&models_dir, MODEL).err().expect("zero weights cannot load");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(text.contains("model.safetensors"), "validation accepted the duplicates: {text:?}");
+}
+
+/// A weights file of exactly the catalogue size: one F32 tensor `name` covering all of it, zero
+/// except for `first` at its start.
+fn write_weights(models_dir: &Path, name: &str, first: f32) {
+    let m = models::find(MODEL).expect("model in the catalogue");
+    let weights = m.files.iter().find(|f| f.name == "model.safetensors").expect("weights in the catalogue");
+    let total = usize::try_from(weights.size).expect("size fits");
+    // The header is padded with spaces until the data that follows it is a whole number of floats.
+    let mut header_len = 80usize;
+    let (header, floats) = loop {
+        let floats = (total - 8 - header_len) / 4;
+        let text = format!(r#"{{"{name}":{{"dtype":"F32","shape":[{floats}],"data_offsets":[0,{}]}}"#, floats * 4);
+        let text = format!("{text}}}");
+        if text.len() <= header_len && (total - 8 - header_len).is_multiple_of(4) {
+            break (format!("{text:<header_len$}"), floats);
+        }
+        header_len += 1;
+    };
+    let path = models::model_dir(models_dir, m).join("model.safetensors");
+    let mut file = File::create(&path).expect("create weights");
+    std::io::Write::write_all(&mut file, &(header_len as u64).to_le_bytes()).expect("write");
+    std::io::Write::write_all(&mut file, header.as_bytes()).expect("write");
+    std::io::Write::write_all(&mut file, &first.to_le_bytes()).expect("write");
+    file.set_len(weights.size).expect("sparse tail");
+    assert_eq!(std::fs::metadata(&path).expect("stat").len(), weights.size);
+    assert!(floats > 1);
+}
+
+#[test]
+fn weights_of_nan_or_infinity_are_refused_naming_the_tensor() {
+    // Valid config, tokenizer and safetensors structure; the weights are what is wrong. Without the
+    // check this loaded and transcribed speech as "!!!!!!!!!!".
+    for (first, label) in [(f32::NAN, "NaN"), (f32::INFINITY, "inf"), (f32::NEG_INFINITY, "-inf")] {
+        let (_scratch, models_dir) = install(&format!("nanweights-{label}"), &config(), &generation_config(), &tokenizer());
+        write_weights(&models_dir, "model.decoder.layers.0.fc1.weight", first);
+        let err = load(&models_dir, MODEL).err().unwrap_or_else(|| panic!("{label}: weights with {label} were accepted"));
+        let SpeechError::Model(text) = &err else { panic!("{label}: expected a model error, got {err:?}") };
+        assert!(
+            text.starts_with("model.safetensors:") && text.contains("`model.decoder.layers.0.fc1.weight`") && text.contains("NaN or infinity"),
+            "{label}: {text:?}"
+        );
+    }
+    // The same file with a finite first value gets past the check (and fails on the missing tensors).
+    let (_scratch, models_dir) = install("finiteweights", &config(), &generation_config(), &tokenizer());
+    write_weights(&models_dir, "model.decoder.layers.0.fc1.weight", 0.25);
+    let err = load(&models_dir, MODEL).err().expect("one tensor is not a network");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(!text.contains("NaN or infinity"), "{text:?}");
+}
+
+#[test]
+fn missing_or_unreadable_files_are_errors() {
+    let (_scratch, models_dir) = install("garbage", &config(), &generation_config(), &tokenizer());
+    let m = models::find(MODEL).expect("model in the catalogue");
+    let dir = models::model_dir(&models_dir, m);
+    // Same size, not JSON at all.
+    let size = m.files.iter().find(|f| f.name == "config.json").expect("config in the catalogue").size;
+    std::fs::write(dir.join("config.json"), vec![0xFFu8; usize::try_from(size).expect("size fits")]).expect("overwrite");
+    assert!(matches!(load(&models_dir, MODEL).err(), Some(SpeechError::Model(_))));
+}
+
+#[test]
+fn special_tokens_that_share_an_id_are_refused_at_load() {
+    // The reviewer's case: <|startoftranscript|> given the id of <|endoftext|>. It loaded, and the
+    // decoder then started where it should have stopped.
+    let a: Vec<(String, u64)> = added().into_iter().map(|(c, id)| if c == "<|startoftranscript|>" { (c, EOT) } else { (c, id) }).collect();
+    refuses("sot-eot", &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a), &format!("share the id {EOT}"));
+    // Every other pair is refused the same way, naming both tokens.
+    let names: Vec<String> = added().into_iter().map(|(c, _)| c).collect();
+    for (i, moved) in names.iter().enumerate() {
+        let other = &names[(i + 1) % names.len()];
+        let id = added().into_iter().find(|(c, _)| c == other).map(|(_, id)| id).expect("listed");
+        let a: Vec<(String, u64)> = added().into_iter().map(|(c, old)| if &c == moved { (c, id) } else { (c, old) }).collect();
+        let (_scratch, models_dir) = install(&format!("clash{i}"), &config(), &generation_config(), &tokenizer_of(json!({"a": 0}), &a));
+        let err = load(&models_dir, MODEL).err().unwrap_or_else(|| panic!("{moved} given the id of {other} was accepted"));
+        let text = err.to_string();
+        assert!(text.contains(moved.as_str()) && text.contains(other.as_str()) && text.contains("share the id"), "{moved} on {other}: {text}");
+    }
+}
+
+// ---- a whole (tiny) network, to run rather than just load ------------------------------------
+
+/// Width of the tiny network below.
+const D: usize = 8;
+
+/// A reproducible stream of small numbers (a linear congruential generator, not for anything else).
+struct Small(u64);
+
+impl Small {
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+    }
+}
+
+/// The tensors of a one-layer, width-8 network under the names and shapes the loader reads, as
+/// `(name, shape, values)`. `conv1` replaces the first layer's weights when given.
+fn tiny_tensors(conv1: Option<f32>) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+    let mut rng = Small(7);
+    let mut out: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    let mut add = |name: &str, shape: &[usize], fill: Option<f32>| {
+        let n: usize = shape.iter().product();
+        let values = (0..n).map(|_| fill.unwrap_or_else(|| rng.next())).collect();
+        out.push((name.to_string(), shape.to_vec(), values));
+    };
+    let norm = |add: &mut dyn FnMut(&str, &[usize], Option<f32>), prefix: &str| {
+        add(&format!("{prefix}.weight"), &[D], Some(1.0));
+        add(&format!("{prefix}.bias"), &[D], Some(0.0));
+    };
+    let attention = |add: &mut dyn FnMut(&str, &[usize], Option<f32>), prefix: &str| {
+        for (part, bias) in [("q_proj", true), ("k_proj", false), ("v_proj", true), ("out_proj", true)] {
+            add(&format!("{prefix}.{part}.weight"), &[D, D], None);
+            if bias {
+                add(&format!("{prefix}.{part}.bias"), &[D], None);
+            }
+        }
+    };
+    let layer = |add: &mut dyn FnMut(&str, &[usize], Option<f32>), prefix: &str, cross: bool| {
+        attention(add, &format!("{prefix}.self_attn"));
+        norm(add, &format!("{prefix}.self_attn_layer_norm"));
+        if cross {
+            attention(add, &format!("{prefix}.encoder_attn"));
+            norm(add, &format!("{prefix}.encoder_attn_layer_norm"));
+        }
+        add(&format!("{prefix}.fc1.weight"), &[4 * D, D], None);
+        add(&format!("{prefix}.fc1.bias"), &[4 * D], None);
+        add(&format!("{prefix}.fc2.weight"), &[D, 4 * D], None);
+        add(&format!("{prefix}.fc2.bias"), &[D], None);
+        norm(add, &format!("{prefix}.final_layer_norm"));
+    };
+    add("model.encoder.conv1.weight", &[D, 80, 3], conv1);
+    add("model.encoder.conv1.bias", &[D], None);
+    add("model.encoder.conv2.weight", &[D, D, 3], None);
+    add("model.encoder.conv2.bias", &[D], None);
+    add("model.encoder.embed_positions.weight", &[1500, D], None);
+    layer(&mut add, "model.encoder.layers.0", false);
+    norm(&mut add, "model.encoder.layer_norm");
+    add("model.decoder.embed_tokens.weight", &[usize::try_from(VOCAB).expect("fits"), D], None);
+    add("model.decoder.embed_positions.weight", &[448, D], None);
+    layer(&mut add, "model.decoder.layers.0", true);
+    norm(&mut add, "model.decoder.layer_norm");
+    out
+}
+
+/// A safetensors file holding `tensors`.
+fn safetensors_of(tensors: &[(String, Vec<usize>, Vec<f32>)]) -> Vec<u8> {
+    let mut header = serde_json::Map::new();
+    let mut body: Vec<u8> = Vec::new();
+    for (name, shape, values) in tensors {
+        let start = body.len();
+        body.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        header.insert(name.clone(), json!({"dtype": "F32", "shape": shape, "data_offsets": [start, body.len()]}));
+    }
+    let header = serde_json::to_vec(&header).expect("serialise");
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&body);
+    file
+}
+
+/// A model folder for the tiny network (any file sizes: it is loaded with `Whisper::load`, not
+/// through the catalogue).
+fn tiny_model(tag: &str, conv1: Option<f32>) -> Scratch {
+    let scratch = Scratch::new(tag);
+    let mut cfg = config();
+    cfg["d_model"] = json!(D);
+    cfg["encoder_layers"] = json!(1);
+    cfg["decoder_layers"] = json!(1);
+    cfg["encoder_attention_heads"] = json!(2);
+    cfg["decoder_attention_heads"] = json!(2);
+    let mut generation = generation_config();
+    generation["alignment_heads"] = json!([[0, 0], [0, 1]]);
+    for (name, value) in [("config.json", cfg), ("generation_config.json", generation), ("tokenizer.json", tokenizer())] {
+        std::fs::write(scratch.path().join(name), serde_json::to_vec(&value).expect("serialise")).expect("write file");
+    }
+    std::fs::write(scratch.path().join("model.safetensors"), safetensors_of(&tiny_tensors(conv1))).expect("write weights");
+    scratch
+}
+
+/// Two seconds of a quiet tone with some noise, 16 kHz mono.
+fn tone() -> Vec<f32> {
+    let mut rng = Small(99);
+    (0..32_000).map(|i| 0.2 * (i as f32 * 0.05).sin() + rng.next()).collect()
+}
+
+fn run_tiny(dir: &Path) -> Result<soundcraft_pa_speech::Transcript, SpeechError> {
+    use soundcraft_pa_speech::Transcriber;
+    let model = soundcraft_pa_speech::whisper::Whisper::load(dir, "tiny-test")?;
+    model.transcribe(&tone(), &soundcraft_pa_speech::Options::default(), &mut |_, _| true)
+}
+
+/// The reviewer's case, in a network small enough to build here: every weight is finite (the load
+/// check passes), but the first layer's weights are 3e38, so its sums overflow while the model
+/// runs. That used to come back as `ok` with a one-word transcript of `!!!!!!!!!!`.
+#[test]
+fn weights_that_overflow_while_running_are_an_error_not_an_ok() {
+    let fine = tiny_model("tiny-fine", None);
+    match run_tiny(fine.path()) {
+        Ok(t) => assert!(t.words.iter().all(|w| w.start_sec.is_finite() && w.end_sec.is_finite()), "{t:?}"),
+        // Whatever else a random network trips over, it is not the overflow check.
+        Err(SpeechError::Model(why)) => assert!(!why.contains("invalid numbers"), "the check misfired on a finite network: {why}"),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+
+    let overflowing = tiny_model("tiny-overflow", Some(3e38));
+    let err = run_tiny(overflowing.path()).expect_err("an overflowing network must not return a transcript");
+    let SpeechError::Model(text) = &err else { panic!("expected a model error, got {err:?}") };
+    assert!(text.starts_with("the speech model produced invalid numbers"), "{text}");
+    assert!(!text.to_lowercase().contains("whisper"), "{text}");
+}

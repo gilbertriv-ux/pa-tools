@@ -2958,6 +2958,69 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
     out
 }
 
+/// Seconds of audio in front of a render range that [`render_clips_settled`] renders and throws
+/// away when a clip on the track has an effect, at the least: it covers the longest lookahead
+/// (10 ms), the ring of the lowest and narrowest EQ band, and the default compressor release.
+pub const CLIP_FX_MIN_PREROLL_SECS: f64 = 3.0;
+
+/// The most [`clip_fx_preroll_secs`] asks for: nine times the longest compressor release (3 s).
+pub const CLIP_FX_MAX_PREROLL_SECS: f64 = 30.0;
+
+/// How many seconds before a range [`render_clips_settled`] renders, and discards, so that the
+/// clip effects (EQ, compressor with its lookahead) of `track` are where a render from the start
+/// of the track would have left them: 0 when no clip of the track has an effect, else at least
+/// [`CLIP_FX_MIN_PREROLL_SECS`], and nine times the longest compressor release set on a clip when
+/// that is more (the gain reduction has then decayed to 1e-4 of what it was), up to
+/// [`CLIP_FX_MAX_PREROLL_SECS`].
+pub fn clip_fx_preroll_secs(s: &Session, track: TrackId) -> f64 {
+    let Some(t) = s.track(track) else { return 0.0 };
+    let mut any = false;
+    let mut release_ms = 0.0f64;
+    for c in t.clips().iter().filter(|c| !c.muted) {
+        let Some(params) = clip_fx_params(s, c.id.0) else { continue };
+        any = true;
+        for (key, value) in params {
+            if key == "comp.release" && value.is_finite() {
+                release_ms = release_ms.max(f64::from(value));
+            }
+        }
+    }
+    if !any {
+        return 0.0;
+    }
+    (release_ms * 9.0 / 1000.0).clamp(CLIP_FX_MIN_PREROLL_SECS, CLIP_FX_MAX_PREROLL_SECS)
+}
+
+/// [`clip_fx_preroll_secs`] in samples at the session's rate (rounded up). A caller that sizes its
+/// ranges to [`MAX_RENDER_SAMPLES`] leaves this much room for it.
+pub fn clip_fx_preroll_samples(s: &Session, track: TrackId) -> usize {
+    let samples = (clip_fx_preroll_secs(s, track) * s.sample_rate.as_f64()).ceil();
+    if samples.is_finite() && samples > 0.0 { samples as usize } else { 0 }
+}
+
+/// [`render_clips`] for a range that is one of several rendered in turn: a clip effect keeps state
+/// (filter history, the compressor's gain reduction and its lookahead delay), and a render of its
+/// own starts every effect from nothing. Rendered that way, the first samples of a range lose up to
+/// 10 ms of the audio ahead of them and the gain steps at the seam. So the range is rendered with
+/// [`clip_fx_preroll_secs`] of audio in front of it, which settles the effects, and that audio is
+/// dropped. The result is the range's samples only, as [`render_clips`] returns them. Nothing is
+/// rendered ahead when the track has no clip effect, or when the range starts at the start of the
+/// session (a render from there starts the effects from nothing too). `range` plus the pre-roll
+/// must fit [`MAX_RENDER_SAMPLES`] across the track's channels, or the result is cut short.
+pub fn render_clips_settled(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
+    let wanted = i64::try_from(clip_fx_preroll_samples(s, track)).unwrap_or(i64::MAX);
+    let pre = wanted.min(range.start.max(0));
+    if pre == 0 {
+        return render_clips(s, track, range);
+    }
+    let mut out = render_clips(s, track, Range::new(range.start - pre, range.end));
+    let drop = usize::try_from(pre).unwrap_or(usize::MAX);
+    for ch in &mut out {
+        ch.drain(..drop.min(ch.len()));
+    }
+    out
+}
+
 /// Render one track through its inserts (pre-fader) — Commit / Freeze.
 pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
     let mut solo = s.clone();
@@ -4412,5 +4475,153 @@ mod tests {
         let mut out = vec![vec![0.0f32; 512]; 2];
         eng.render(s, pos, 512, &mut out);
         out[0][500].abs()
+    }
+    // ---- clip effects across ranges rendered in turn ---------------------------------------
+
+    /// `seconds` of a track at 48 kHz with a quiet tone all through it (so every seam has audio on
+    /// both sides) and short loud bursts at `bursts` (seconds) that drive the compressor.
+    fn burst_track(seconds: usize, bursts: &[f64]) -> (Session, TrackId) {
+        let n = seconds * 48_000;
+        let mut state = 12_345u32;
+        let mut noise = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                let loud = bursts.iter().any(|b| (*b..*b + 0.4).contains(&t));
+                let tone = (t * 2.0 * std::f64::consts::PI * 330.0).sin() as f32;
+                if loud { 0.8 * tone + 0.2 * noise() } else { 0.05 * tone + 0.01 * noise() }
+            })
+            .collect();
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.pool.insert(SourceId(901), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "bursts", SourceId(901), 0, 0, n as i64));
+        (s, t)
+    }
+
+    fn set_clip_fx(s: &mut Session, t: TrackId, values: &[(&str, f64)]) {
+        let cid = s.track(t).unwrap().clips()[0].id.0;
+        for (k, v) in values {
+            s.edit.values.insert(format!("clip_fx.{cid}.{k}"), *v);
+        }
+    }
+
+    /// `render` over `0..n` in ranges of `chunk` samples, one after another.
+    fn in_ranges(n: i64, chunk: i64, render: impl Fn(Range) -> Vec<Vec<f32>>) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < n {
+            let end = (at + chunk).min(n);
+            let part = render(Range::new(at, end));
+            assert_eq!(part[0].len() as i64, end - at, "a range comes back whole");
+            out.extend_from_slice(&part[0]);
+            at = end;
+        }
+        out
+    }
+
+    fn worst_difference(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    /// The report: a track with clip EQ, a compressor and lookahead, rendered in ranges, differed
+    /// from one render at every seam (up to 10 ms of the audio gone, and a step in the gain).
+    #[test]
+    fn clip_effects_render_the_same_in_ranges_as_in_one_go() {
+        let (mut s, t) = burst_track(20, &[0.5, 4.3, 8.9, 13.2]);
+        set_clip_fx(
+            &mut s,
+            t,
+            &[
+                ("eq.hpf_on", 1.0),
+                ("eq.hpf_freq", 120.0),
+                ("eq.low_mid_gain", -4.0),
+                ("eq.mid_gain", 5.0),
+                ("eq.high_shelf_gain", 3.0),
+                ("comp.threshold", -24.0),
+                ("comp.ratio", 6.0),
+                ("comp.attack", 4.0),
+                ("comp.release", 150.0),
+                ("comp.lookahead", 5.0),
+            ],
+        );
+        let n = 20 * 48_000;
+        let whole = render_clips(&s, t, Range::new(0, n));
+        // Ranges of 4.5 s, which is not a multiple of the effects' 4096-sample blocks: seams at
+        // 4.5, 9, 13.5 and 18 s, each one in the quiet after a burst.
+        let chunk = 216_000;
+        let naive = in_ranges(n, chunk, |r| render_clips(&s, t, r));
+        let settled = in_ranges(n, chunk, |r| render_clips_settled(&s, t, r));
+        let (bad, good) = (worst_difference(&naive, &whole[0]), worst_difference(&settled, &whole[0]));
+        assert!(bad > 0.01, "the effects must matter at a seam for this to prove anything (rendering each range afresh differs by {bad})");
+        assert!(good <= 1e-5, "ranges with a pre-roll differ from one render by {good} (without: {bad})");
+    }
+
+    /// A long release needs a longer run-in: 1.5 s means the gain reduction after a burst is still
+    /// falling a second later, so a run-in of 3 s (the least) would leave a step at the seam.
+    #[test]
+    fn a_long_compressor_release_gets_a_longer_run_in() {
+        let (mut s, t) = burst_track(40, &[0.5, 10.0]);
+        set_clip_fx(&mut s, t, &[("comp.threshold", -20.0), ("comp.ratio", 8.0), ("comp.attack", 2.0), ("comp.release", 1500.0)]);
+        assert_eq!(clip_fx_preroll_secs(&s, t), 13.5);
+        let n = 40 * 48_000;
+        let whole = render_clips(&s, t, Range::new(0, n));
+        // Seams at 10.4 + 5 s: the burst's reduction has had 5 s (3.3 releases) to fall.
+        let chunk = 15 * 48_000 + 12_345;
+        let settled = in_ranges(n, chunk, |r| render_clips_settled(&s, t, r));
+        let good = worst_difference(&settled, &whole[0]);
+        assert!(good <= 1e-4, "with the run-in of {} s: {good}", clip_fx_preroll_secs(&s, t));
+        // The least run-in is not enough for this release, which is why it scales.
+        let short = in_ranges(n, chunk, |r| {
+            let pre = (3 * 48_000).min(r.start);
+            let mut out = render_clips(&s, t, Range::new(r.start - pre, r.end));
+            out.iter_mut().for_each(|c| drop(c.drain(..pre as usize)));
+            out
+        });
+        let bad = worst_difference(&short, &whole[0]);
+        assert!(bad > 1e-3 && bad > 10.0 * good, "3 s: {bad}, scaled: {good}");
+    }
+
+    #[test]
+    fn the_run_in_is_zero_without_clip_effects_and_bounded_with_them() {
+        let (mut s, t) = burst_track(2, &[]);
+        assert_eq!(clip_fx_preroll_secs(&s, t), 0.0, "no effect, nothing rendered ahead");
+        let plain = render_clips_settled(&s, t, Range::new(48_000, 96_000));
+        assert_eq!(plain, render_clips(&s, t, Range::new(48_000, 96_000)));
+        assert_eq!(clip_fx_preroll_secs(&s, TrackId(987_654)), 0.0);
+
+        set_clip_fx(&mut s, t, &[("eq.mid_gain", 3.0)]);
+        assert_eq!(clip_fx_preroll_secs(&s, t), CLIP_FX_MIN_PREROLL_SECS, "an EQ alone: the least");
+        for (release, expect) in
+            [(100.0, 3.0), (300.0, 3.0), (1000.0, 9.0), (3000.0, 27.0), (1e12, CLIP_FX_MAX_PREROLL_SECS), (-5.0, 3.0), (f64::NAN, 3.0)]
+        {
+            set_clip_fx(&mut s, t, &[("comp.release", release)]);
+            let secs = clip_fx_preroll_secs(&s, t);
+            assert!((secs - expect).abs() < 1e-9, "release {release} ms: {secs} s, expected {expect}");
+        }
+        // A bypassed clip has no effect to settle.
+        let cid = s.track(t).unwrap().clips()[0].id.0;
+        s.edit.set_flag(&format!("clip_fx.bypass.{cid}"), true);
+        assert_eq!(clip_fx_preroll_secs(&s, t), 0.0);
+    }
+
+    /// The start of the session needs no run-in (nothing is before it), and a range inside the
+    /// first seconds takes what there is.
+    #[test]
+    fn a_range_near_the_start_takes_the_run_in_there_is() {
+        let (mut s, t) = burst_track(6, &[0.1]);
+        set_clip_fx(&mut s, t, &[("comp.threshold", -24.0), ("comp.ratio", 6.0), ("comp.lookahead", 5.0), ("eq.hpf_on", 1.0)]);
+        let n = 6 * 48_000;
+        let whole = render_clips(&s, t, Range::new(0, n));
+        assert_eq!(render_clips_settled(&s, t, Range::new(0, 4_000)), render_clips(&s, t, Range::new(0, 4_000)));
+        let settled = in_ranges(n, 20_000, |r| render_clips_settled(&s, t, r));
+        // Ranges that start later begin their run-in elsewhere, so the filters' rounding differs in
+        // the last bits (a few millionths here); the audio does not.
+        assert!(worst_difference(&settled, &whole[0]) <= 3e-5);
     }
 }
