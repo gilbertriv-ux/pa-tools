@@ -25,6 +25,7 @@
 pub mod devices;
 pub mod latency;
 pub mod midi_io;
+pub mod midi_record;
 pub mod record;
 
 pub use devices::AudioConfig;
