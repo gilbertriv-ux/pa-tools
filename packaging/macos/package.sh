@@ -130,6 +130,19 @@ if [ -n "${PT_MODELS_DIR:-}" ]; then
   bundle_speech_models "$PT_MODELS_DIR" "$APP/Contents/Resources"
 fi
 
+# Licence files for distribution: the .app itself must carry them, not only the CLI zip.
+copy_docs "$APP/Contents/Resources"
+# Whisper model weights licence, beside the bundled weights (openai/whisper-* is MIT).
+if [ -d "$APP/Contents/Resources/models" ]; then
+  cat > "$APP/Contents/Resources/models/WHISPER-LICENSE.txt" <<'WL'
+Whisper model weights (openai/whisper-*)
+Copyright (c) 2022 OpenAI
+Licensed under the MIT License: https://github.com/openai/whisper/blob/main/LICENSE
+The Hugging Face safetensors conversion is distributed under Apache-2.0.
+See ATTRIBUTION.md in this bundle for full attribution.
+WL
+fi
+
 # Drop extended attributes picked up during the build (quarantine, FinderInfo) before signing:
 # `codesign --verify --strict` rejects them, and nothing after signing may touch the bundle.
 xattr -cr "$APP"
