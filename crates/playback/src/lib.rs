@@ -23,6 +23,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod devices;
+pub mod duplex;
+pub mod latency;
+pub mod midi_devices;
 pub mod record;
 
 pub use devices::AudioConfig;
@@ -32,7 +35,7 @@ use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -70,11 +73,32 @@ enum Cmd {
         end: Option<Samples>,
         looped: Option<Range>,
     },
+    /// Control-worker starts are checked again when dequeued: stop/seek may have overtaken them.
+    #[cfg(not(target_arch = "wasm32"))]
+    AwaitPlay {
+        from: Samples,
+        generation: u64,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    PreparedPlay {
+        from: Samples,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        generation: u64,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    PrepareFailed {
+        generation: u64,
+    },
     Stop,
     Locate(Samples),
 }
 
 struct Shared {
+    /// Invalidates queued/preparing starts when stop, locate, or another play supersedes them.
+    transport_generation: AtomicU64,
+    /// Zero or the generation whose initial source blocks are being warmed.
+    starting: AtomicU64,
     position: AtomicI64,
     playing: AtomicBool,
     /// Speed × 1000.
@@ -96,6 +120,7 @@ pub enum OutputTrouble {
 /// How the audio output is doing, for the UI.
 #[derive(Default)]
 struct Fault {
+    latency: latency::LatencyTracker,
     /// A block panicked: output stays silent from then on.
     failed: AtomicBool,
     gone: AtomicBool,
@@ -232,14 +257,35 @@ impl AudioState {
                     }
                 }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
-                Cmd::Play { from, end, looped } => {
+                Cmd::Play { from, end, looped } => self.begin_play(from, end, looped),
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::AwaitPlay { from, generation } => {
+                    if self.shared.transport_generation.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
                     self.pos = from;
-                    self.end = end;
-                    self.looped = looped.filter(|r| r.len() > 64);
-                    self.playing = true;
+                    self.playing = false;
+                    self.end = None;
+                    self.looped = None;
                     self.pending_len = 0;
                     self.read = 0.0;
                     self.mix.reset();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::PreparedPlay { from, end, looped, generation } => {
+                    if self.shared.transport_generation.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    let _ = self.shared.starting.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
+                    self.begin_play(from, end, looped);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::PrepareFailed { generation } => {
+                    if self.shared.transport_generation.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    self.playing = false;
+                    let _ = self.shared.starting.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 }
                 Cmd::Stop => {
                     self.playing = false;
@@ -261,7 +307,17 @@ impl AudioState {
             self.mix.ensure_synced(&self.session);
         }
         self.send_garbage();
-        self.shared.playing.store(self.playing, Ordering::Relaxed);
+        self.shared.playing.store(self.playing || self.shared.starting.load(Ordering::Acquire) != 0, Ordering::Relaxed);
+    }
+
+    fn begin_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        self.pos = from;
+        self.end = end;
+        self.looped = looped.filter(|range| range.len() > 64);
+        self.playing = true;
+        self.pending_len = 0;
+        self.read = 0.0;
+        self.mix.reset();
     }
 
     fn send_garbage(&mut self) {
@@ -305,6 +361,7 @@ impl AudioState {
             }
             ring.pop_into(&mut self.mix.input, n, self.session.sample_rate.hz());
         }
+        soundcraft_mix::source_stream::prefetch(&self.session, self.pos, self.looped);
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
@@ -461,6 +518,10 @@ pub struct Player {
     watch: Mutex<Option<(u64, std::time::Instant)>>,
     tx: Sender<Cmd>,
     side: Mutex<Side>,
+    input_timing: Mutex<Option<Arc<latency::LatencyTracker>>>,
+    /// Only control/UI threads use these mutexes, never the audio callback.
+    source_session: Mutex<Arc<Session>>,
+    source_failure: Arc<Mutex<Option<(u64, String)>>>,
     #[cfg(not(target_arch = "wasm32"))]
     _stream: Option<cpal::Stream>,
     #[cfg(target_arch = "wasm32")]
@@ -473,6 +534,60 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct StartJob {
+    session: Arc<Session>,
+    shared: Arc<Shared>,
+    tx: Sender<Cmd>,
+    failure: Arc<Mutex<Option<(u64, String)>>>,
+    generation: u64,
+    from: Samples,
+    end: Option<Samples>,
+    looped: Option<Range>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn start_worker() -> Option<&'static SyncSender<StartJob>> {
+    static WORKER: std::sync::OnceLock<Option<SyncSender<StartJob>>> = std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = sync_channel::<StartJob>(16);
+            std::thread::Builder::new()
+                .name("audio-readiness".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        let current = || job.shared.transport_generation.load(Ordering::Acquire) == job.generation;
+                        let result = soundcraft_mix::source_stream::prepare(&job.session, job.from, job.looped, current);
+                        if !current() {
+                            continue;
+                        }
+                        match result {
+                            Ok(true) => {
+                                let _ =
+                                    job.tx.send(Cmd::PreparedPlay { from: job.from, end: job.end, looped: job.looped, generation: job.generation });
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                *job.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some((job.generation, error));
+                                // The callback rechecks the generation; a stale failure cannot
+                                // clear the pending intent of a newer Play request.
+                                let _ = job.tx.send(Cmd::PrepareFailed { generation: job.generation });
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.shared.transport_generation.fetch_add(1, Ordering::AcqRel);
+        self.shared.starting.store(0, Ordering::Release);
+    }
 }
 
 impl Player {
@@ -510,6 +625,8 @@ impl Player {
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Player {
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -563,6 +680,9 @@ impl Player {
                             watch: Mutex::new(None),
                             tx,
                             side: new_side(grx),
+                            input_timing: Mutex::new(None),
+                            source_session: Mutex::new(Arc::clone(&session)),
+                            source_failure: Arc::new(Mutex::new(None)),
                             _stream: Some(stream),
                             device_name: name,
                             device_rate: rate,
@@ -610,6 +730,7 @@ impl Player {
         gtx: Sender<Vec<Box<dyn Plugin>>>,
     ) -> Player {
         let rate = session.sample_rate.hz();
+        let control_session = Arc::clone(&session);
         let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
         let fault = Arc::new(Fault::default());
         let failed = Arc::clone(&fault);
@@ -640,6 +761,9 @@ impl Player {
             watch: Mutex::new(None),
             tx,
             side,
+            input_timing: Mutex::new(None),
+            source_session: Mutex::new(control_session),
+            source_failure: Arc::new(Mutex::new(None)),
             _stream: None,
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
@@ -663,6 +787,9 @@ impl Player {
             fault: Arc::default(),
             tx,
             side,
+            input_timing: Mutex::new(None),
+            source_session: Mutex::new(Arc::clone(&session)),
+            source_failure: Arc::new(Mutex::new(None)),
             _stream: None,
             device_name: "No audio device".into(),
             device_rate: session.sample_rate.hz(),
@@ -675,6 +802,7 @@ impl Player {
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
     pub fn update_session(&self, s: Arc<Session>) {
+        *self.source_session.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&s);
         let instances = self.side().prepare(&s);
         let _ = self.tx.send(Cmd::Session(s, instances));
     }
@@ -745,14 +873,60 @@ impl Player {
 
     /// Start playback at `from`, stopping at `end`, or looping `looped`.
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        let generation = self.shared.transport_generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let session = Arc::clone(&self.source_session.lock().unwrap_or_else(PoisonError::into_inner));
+        *self.source_failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        soundcraft_mix::source_stream::prefetch(&session, from, looped);
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        if session.pool.ids().any(|id| session.pool.get(id).is_some_and(|source| source.is_file_backed())) {
+            self.shared.starting.store(generation, Ordering::Release);
+            let _ = self.tx.send(Cmd::AwaitPlay { from, generation });
+            let job = StartJob {
+                session,
+                shared: Arc::clone(&self.shared),
+                tx: self.tx.clone(),
+                failure: Arc::clone(&self.source_failure),
+                generation,
+                from,
+                end,
+                looped,
+            };
+            if start_worker().is_some_and(|worker| worker.try_send(job).is_ok()) {
+                return;
+            }
+            if self.shared.transport_generation.load(Ordering::Acquire) == generation {
+                self.shared.starting.store(0, Ordering::Release);
+                self.shared.playing.store(false, Ordering::Relaxed);
+                *self.source_failure.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((generation, "audio readiness worker is unavailable or busy".into()));
+            }
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = generation;
+        self.shared.starting.store(0, Ordering::Release);
         let _ = self.tx.send(Cmd::Play { from, end, looped });
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
+        *self.input_timing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&ring.timing));
         let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    /// Timestamp latency when available; otherwise a labelled requested-buffer estimate.
+    pub fn output_latency(&self) -> Option<latency::StreamLatency> {
+        if self.silent {
+            return None;
+        }
+        self.fault.latency.snapshot(self.device_buffer, self.device_rate)
+    }
+
+    /// Input timestamp latency after an attached input callback has run. Unknown stays unknown.
+    pub fn input_latency(&self) -> Option<latency::StreamLatency> {
+        self.input_timing.lock().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(|t| t.snapshot(None, 0))
     }
 
     pub fn set_recording(&self, on: bool) {
@@ -760,13 +934,37 @@ impl Player {
     }
 
     pub fn stop(&self) {
+        self.shared.transport_generation.fetch_add(1, Ordering::AcqRel);
+        self.shared.starting.store(0, Ordering::Release);
         self.shared.playing.store(false, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Stop);
     }
 
     pub fn locate(&self, at: Samples) {
+        self.shared.transport_generation.fetch_add(1, Ordering::AcqRel);
+        if self.shared.starting.swap(0, Ordering::AcqRel) != 0 {
+            self.shared.playing.store(false, Ordering::Relaxed);
+        }
+        let session = self.source_session.lock().unwrap_or_else(PoisonError::into_inner);
+        soundcraft_mix::source_stream::prefetch(&session, at, None);
         self.shared.position.store(at, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Locate(at));
+    }
+
+    /// Source failures for the UI/control thread. This may lock and format error strings.
+    pub fn source_error(&self) -> Option<String> {
+        self.source_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(generation, _)| self.shared.transport_generation.load(Ordering::Acquire) == *generation)
+            .map(|(_, error)| error.clone())
+            .or_else(|| soundcraft_mix::source_stream::first_error(&self.source_session.lock().unwrap_or_else(PoisonError::into_inner)))
+    }
+
+    /// Cumulative source-cache misses for status reporting. Call on the UI/control thread.
+    pub fn source_underruns(&self) -> u64 {
+        soundcraft_mix::source_stream::underruns(&self.source_session.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     pub fn set_speed(&self, speed: f32) {
@@ -937,8 +1135,10 @@ where
     let (failed, guard, gone) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault));
     device.build_output_stream(
         config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             mark_audio_thread();
+            let timestamp = info.timestamp();
+            failed.latency.observe(timestamp.playback.duration_since(&timestamp.callback));
             for out in data.chunks_mut(chunk) {
                 let Some(s) = scratch.get_mut(..out.len()) else { return };
                 guarded_block(&failed, &guard, s, |d| state.fill(d, channels));
@@ -1022,6 +1222,67 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
 mod tests {
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn control_test_state() -> (Sender<Cmd>, Arc<Shared>, AudioState) {
+        let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(1),
+            starting: AtomicU64::new(1),
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(true),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let state = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, channel().0);
+        (tx, shared, state)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stale_prepared_play_cannot_restart_after_stop() {
+        let (tx, shared, mut state) = control_test_state();
+        tx.send(Cmd::AwaitPlay { from: 128, generation: 1 }).unwrap();
+        shared.transport_generation.store(2, Ordering::Release);
+        shared.starting.store(0, Ordering::Release);
+        tx.send(Cmd::Stop).unwrap();
+        tx.send(Cmd::PreparedPlay { from: 128, end: None, looped: None, generation: 1 }).unwrap();
+        state.drain();
+        assert!(!state.playing);
+        assert!(!shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stale_prepared_play_and_failure_do_not_override_seek_or_new_start() {
+        let (tx, shared, mut state) = control_test_state();
+        shared.transport_generation.store(3, Ordering::Release);
+        shared.starting.store(3, Ordering::Release);
+        tx.send(Cmd::Locate(900)).unwrap();
+        tx.send(Cmd::PreparedPlay { from: 128, end: None, looped: None, generation: 1 }).unwrap();
+        tx.send(Cmd::PrepareFailed { generation: 1 }).unwrap();
+        state.drain();
+        assert_eq!(state.pos, 900);
+        assert!(!state.playing);
+        assert_eq!(shared.starting.load(Ordering::Acquire), 3);
+        assert!(shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pending_play_holds_position_then_starts_when_matching_pages_are_ready() {
+        let (tx, shared, mut state) = control_test_state();
+        tx.send(Cmd::AwaitPlay { from: 128, generation: 1 }).unwrap();
+        state.drain();
+        assert_eq!(state.pos, 128);
+        assert!(!state.playing);
+        assert!(shared.playing.load(Ordering::Relaxed));
+        tx.send(Cmd::PreparedPlay { from: 128, end: Some(1000), looped: None, generation: 1 }).unwrap();
+        state.drain();
+        assert!(state.playing);
+        assert_eq!(shared.starting.load(Ordering::Acquire), 0);
+        assert_eq!(state.end, Some(1000));
+    }
+
     /// A stream that builds; `starts` says whether the device lets it play (it can refuse after a
     /// reconnect).
     struct Fake {
@@ -1098,6 +1359,8 @@ mod tests {
     #[test]
     fn a_block_that_panics_goes_silent_and_is_reported_once() {
         let shared = Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
@@ -1139,6 +1402,8 @@ mod tests {
     fn audio_state_plays_and_stops_at_end() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1157,6 +1422,8 @@ mod tests {
     fn short_device_callbacks_render_short_mix_blocks() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1181,6 +1448,8 @@ mod tests {
         let id = s.new_clip_id();
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "output", SourceId(5), 0, 0, frames as i64));
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1256,6 +1525,8 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 48_000));
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1289,6 +1560,8 @@ mod tests {
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
         let s = Arc::new(s);
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1381,6 +1654,8 @@ mod tests {
     #[test]
     fn replaced_sessions_are_freed_on_the_ui_thread() {
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1410,6 +1685,8 @@ mod tests {
     fn looping_wraps() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
@@ -1445,6 +1722,8 @@ mod tests {
             }
             tr.mixer.inserts[0] = Some(ins);
             let shared = Arc::new(Shared {
+                transport_generation: AtomicU64::new(0),
+                starting: AtomicU64::new(0),
                 position: AtomicI64::new(0),
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
@@ -1475,6 +1754,8 @@ mod tests {
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.record_arm = true;
         let shared = Arc::new(Shared {
+            transport_generation: AtomicU64::new(0),
+            starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),

@@ -8,7 +8,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{Insert, TrackKind};
+use soundcraft_model::{Insert, SourceId, TrackKind};
 use std::path::Path;
 
 const SAMPLER: &str = "sampler";
@@ -55,9 +55,13 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
             values.push((k.clone(), pi.clamp(x as f32)));
         }
     }
-    let bytes = crate::io::read_file(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("Sample").to_string();
-    attach(e, t, &name, &bytes, Some(&path), values)
+    let audio = crate::io::disk_source(Path::new(&path), e.session().sample_rate.hz())?;
+    if audio.frames() == 0 {
+        return Err(bad(id, "sample contains no audio"));
+    }
+    let src = crate::io::register_disk_source(e.session_mut(), &name, Path::new(&path), audio);
+    attach_source(e, t, src, values)
 }
 
 /// Decodes `bytes` (a file called `name`, for the format hint) into a new session source and
@@ -68,17 +72,36 @@ pub(crate) fn attach(e: &mut Engine, t: TrackId, name: &str, bytes: &[u8], path:
     if e.session().track(t).map(|tr| tr.kind) != Some(TrackKind::Instrument) {
         return Err(bad(id, "only instrument tracks have a sampler"));
     }
-    let info = soundcraft_dsp::plugin_info(SAMPLER).ok_or_else(|| bad(id, "the sampler is not available"))?;
+    let _ = soundcraft_dsp::plugin_info(SAMPLER).ok_or_else(|| bad(id, "the sampler is not available"))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(bad(id, "byte sample exceeds the bounded transfer budget; load a file source"));
+    }
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
+    let probe = soundcraft_audio_io::probe(bytes, ext.as_deref()).map_err(|e| bad(id, e.to_string()))?;
+    if probe.channels == 0
+        || probe.channels > 64
+        || probe.frames.saturating_mul(u64::from(probe.channels)) > soundcraft_mix::MAX_RENDER_SAMPLES as u64
+    {
+        return Err(bad(id, "decoded sample exceeds the resident budget"));
+    }
     let (format, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
     if buf.frames() == 0 || buf.num_channels() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
-    let buf = crate::io::at_rate(buf, e.session().sample_rate.hz(), MAX_SAMPLE_VALUES)
+    let buf = crate::io::at_rate(buf, e.session().sample_rate.hz(), MAX_SAMPLE_VALUES.min(soundcraft_mix::MAX_RENDER_SAMPLES))
         .ok_or_else(|| EngineError::Io(format!("{name}: too long for a sample (ten minutes of 192 kHz stereo at most)")))?;
-    let channels = buf.num_channels();
+    if buf.frames().saturating_mul(buf.num_channels()) > soundcraft_mix::MAX_RENDER_SAMPLES {
+        return Err(bad(id, "decoded sample exceeds the resident budget"));
+    }
+    let src = crate::io::add_source(e.session_mut(), name, buf, path, format.format);
+    attach_source(e, t, src, values)
+}
+
+fn attach_source(e: &mut Engine, t: TrackId, src: SourceId, values: Vec<(String, f32)>) -> Result<Value> {
+    let id = "mix.sampler_load";
+    let info = soundcraft_dsp::plugin_info(SAMPLER).ok_or_else(|| bad(id, "the sampler is not available"))?;
     let s = e.session_mut();
-    let src = crate::io::add_source(s, name, buf, path, format.format);
+    let channels = s.pool.get(src).map_or(0, |audio| audio.num_channels());
     let (frames, rate, stem) = s.source(src).map_or((0, 0, String::new()), |x| (x.frames, x.sample_rate, x.name.clone()));
     let tr = s.track_mut(t).ok_or_else(|| bad(id, "no track"))?;
     let keep = tr.instrument.as_ref().is_some_and(|i| i.plugin == SAMPLER);

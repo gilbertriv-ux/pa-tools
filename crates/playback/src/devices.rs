@@ -49,6 +49,14 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
+    /// A buffer-duration estimate only; converter and hardware latency are unknown.
+    pub fn buffer_latency(&self, frames: u32, rate: u32) -> Option<crate::latency::StreamLatency> {
+        if !self.sample_rates.contains(&rate) || !self.buffer_sizes().contains(&frames) {
+            return None;
+        }
+        crate::latency::buffer_latency(frames, rate)
+    }
+
     /// Standard buffer sizes inside the device's range (all of them when the range is unknown).
     pub fn buffer_sizes(&self) -> Vec<u32> {
         STANDARD_BUFFERS.iter().copied().filter(|b| self.buffer_min.is_none_or(|m| *b >= m) && self.buffer_max.is_none_or(|m| *b <= m)).collect()

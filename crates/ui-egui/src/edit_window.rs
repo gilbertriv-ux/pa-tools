@@ -1562,8 +1562,8 @@ fn clip_preview_fades(clip: &Clip, gesture: Option<&Gesture>) -> (soundcraft_mod
 fn draw_live_take(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect) {
     let Some(rec) = &app.recorder else { return };
     let Some(take) = rec.live_take(track.id) else { return };
-    let block_len = soundcraft_playback::record::LIVE_BLOCK as f64 * s.sample_rate.as_f64() / f64::from(rec.sample_rate.max(1));
-    let len = soundcraft_time::to_samples(take.first().map_or(0, Vec::len) as f64 * block_len);
+    let block_len = take.block_frames as f64 * s.sample_rate.as_f64() / f64::from(rec.sample_rate.max(1));
+    let len = soundcraft_time::to_samples(take.channels.first().map_or(0, Vec::len) as f64 * block_len);
     let sel = s.edit.selection;
     let (start, pass) = if s.edit.loop_record && !sel.is_empty() { (sel.start, Some(sel.len())) } else { (app.record_start, None) };
     let Some((origin, span)) = soundcraft_engine::io::live_span(start, pass, app.punch, len) else { return };
@@ -1572,7 +1572,7 @@ fn draw_live_take(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &
     let (body, _, wave) = clip_colors([t.rec.r(), t.rec.g(), t.rec.b()], false);
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     if track.view != "blocks" {
-        crate::waveform::draw_live(&painter.with_clip_rect(r.intersect(lane)), s, tl, origin as f64, block_len, &take, r, wave);
+        crate::waveform::draw_live(&painter.with_clip_rect(r.intersect(lane)), s, tl, origin as f64, block_len, &take.channels, r, wave);
     }
 }
 
@@ -1635,7 +1635,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                         &preview
                     };
                     crate::waveform::draw(&painter.with_clip_rect(vis), s, tl, shown, audio, track.channels(), body_r, wave);
-                    let n = track.channels().min(audio.peaks.len()).max(1);
+                    let n = track.channels().min(audio.num_channels()).max(1);
                     for k in 1..n {
                         let y = body_r.min.y + body_r.height() / n as f32 * k as f32;
                         painter.line_segment([pos2(vis.min.x, y), pos2(vis.max.x, y)], Stroke::new(1.0, body.gamma_multiply(0.7)));
@@ -3199,10 +3199,10 @@ mod tests {
                         let source = clip.source().unwrap();
                         if channels == 2 {
                             let audio = h.state().engine.session().pool.get(source).unwrap().clone();
-                            let left = audio.buffer.channels[0].clone();
+                            let left = audio.materialize(4 * 1024 * 1024).unwrap().channels[0].clone();
                             let right = left.iter().map(|sample| sample * 0.5).collect();
                             let audio = soundcraft_model::SourceAudio::new(soundcraft_audio_io::AudioBuffer {
-                                sample_rate: audio.buffer.sample_rate,
+                                sample_rate: audio.sample_rate(),
                                 channels: vec![left, right],
                             });
                             let s = h.state_mut().engine.session_mut();

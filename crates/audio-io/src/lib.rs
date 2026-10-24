@@ -20,12 +20,15 @@ mod caf;
 mod flac;
 mod mp4;
 mod pcm;
+pub mod peak_stream;
 pub mod peaks;
+pub mod reader;
 mod symph;
 mod wav;
 
 pub use buffer::AudioBuffer;
 use std::io::{Seek, Write};
+pub use symph::decode_file_blocks;
 
 /// Errors from probing, decoding and encoding.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +42,9 @@ pub enum AudioError {
     /// The input (or requested output) exceeds a size limit.
     #[error("audio too large: {0}")]
     TooLarge(String),
+    /// Shared worker memory is temporarily reserved by another job; retry without poisoning media.
+    #[error("audio working memory is temporarily busy; retry the operation")]
+    ScratchBusy,
     /// Encoding failed (e.g. an empty buffer).
     #[error("audio encode failed: {0}")]
     Encode(String),

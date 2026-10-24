@@ -20,11 +20,16 @@ pub type Takes = (Vec<(TrackId, PathBuf)>, Option<String>);
 /// Frames each block of a [`LiveTake`] sums up.
 pub const LIVE_BLOCK: usize = 128;
 /// Blocks a live take keeps per channel at most (three hours at 48 kHz); its file records on.
-const LIVE_BLOCKS: usize = 1 << 22;
+const LIVE_BLOCKS: usize = 8192;
 
 /// A take while it records, summed up for drawing: per channel, the (min, max) of each
 /// [`LIVE_BLOCK`] frames so far.
-pub type LiveTake = Vec<Vec<(f32, f32)>>;
+#[derive(Debug, Clone)]
+pub struct LiveTake {
+    pub channels: Vec<Vec<(f32, f32)>>,
+    pub block_frames: usize,
+    max_blocks: usize,
+}
 
 const RING_SECONDS: usize = 4;
 /// How long a recording input may go without a callback before it counts as gone.
@@ -131,6 +136,8 @@ pub struct Recorder {
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
+    /// Requested buffer after fallback; not a measured hardware buffer size.
+    pub device_buffer: Option<u32>,
     /// The take writer, and what each track's take holds so far.
     writer: Option<(std::thread::JoinHandle<Takes>, Vec<(TrackId, Arc<Mutex<LiveTake>>)>)>,
     /// The callback count last seen, and since when.
@@ -159,8 +166,10 @@ where
     let mut owed = 0;
     device.build_input_stream(
         config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
+        move |data: &[T], info: &cpal::InputCallbackInfo| {
             crate::mark_audio_thread();
+            let timestamp = info.timestamp();
+            mon.timing.observe(timestamp.callback.duration_since(&timestamp.capture));
             sh.guarded(|| {
                 for part in data.chunks(chunk) {
                     let Some(s) = scratch.get_mut(..part.len()) else { return };
@@ -245,12 +254,31 @@ impl Recorder {
         };
         stream.play().map_err(|e| e.to_string())?;
         let seen = (0, Instant::now());
-        Ok(Recorder { monitor, shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels, writer: None, seen })
+        let device_buffer = match config.buffer_size {
+            cpal::BufferSize::Fixed(n) => Some(n),
+            cpal::BufferSize::Default => None,
+        };
+        Ok(Recorder {
+            monitor,
+            shared,
+            _stream: Some(stream),
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels,
+            device_buffer,
+            writer: None,
+            seen,
+        })
     }
 
     #[cfg(target_os = "freebsd")]
     pub fn open_with(_audio: &crate::AudioConfig) -> Result<Recorder, String> {
         Err("recording is not supported on this platform yet".into())
+    }
+
+    /// Capture-to-callback timestamp latency, or a labelled requested-buffer estimate.
+    pub fn input_latency(&self) -> Option<crate::latency::StreamLatency> {
+        self.monitor.timing.snapshot(self.device_buffer, self.sample_rate)
     }
 
     /// Create each take's file and start recording into them: a track's take records the given
@@ -259,8 +287,17 @@ impl Recorder {
         if self.writer.is_some() {
             return Err("already recording".into());
         }
-        let takes =
+        if takes.iter().any(|(_, inputs, _)| inputs.is_empty() || inputs.len() > self.channels || inputs.iter().any(|i| *i >= self.channels)) {
+            return Err("a take must select valid input channels".into());
+        }
+        let mut takes =
             takes.into_iter().map(|(id, inputs, path)| TakeWriter::create(id, inputs, path, self.sample_rate)).collect::<Result<Vec<_>, _>>()?;
+        let total_channels = takes.iter().map(|take| take.inputs.len()).sum::<usize>().max(1);
+        let bound = (8 * 1024 * 1024 / 8 / total_channels).clamp(2, LIVE_BLOCKS);
+        let bound = 1usize << (usize::BITS - 1 - bound.leading_zeros());
+        for take in &mut takes {
+            take.live.lock().unwrap_or_else(PoisonError::into_inner).max_blocks = bound;
+        }
         let live = takes.iter().map(|t| (t.id, Arc::clone(&t.live))).collect();
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
@@ -350,9 +387,8 @@ fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> 
     let (mut done, mut problem) = (Vec::new(), None);
     for mut t in takes {
         t.write_header();
-        if t.frames == 0 {
-            let _ = std::fs::remove_file(&t.path);
-        } else {
+        // Preserve even empty/failed take files; a recording never authorizes deletion.
+        if t.frames != 0 {
             done.push((t.id, t.path));
         }
         problem = problem.or(t.error);
@@ -366,6 +402,7 @@ struct TakeWriter {
     inputs: Vec<usize>,
     path: PathBuf,
     file: File,
+    bytes: Vec<u8>,
     rate: u32,
     frames: u64,
     error: Option<String>,
@@ -374,10 +411,13 @@ struct TakeWriter {
 
 impl TakeWriter {
     fn create(id: TrackId, inputs: Vec<usize>, path: PathBuf, rate: u32) -> Result<TakeWriter, String> {
+        if inputs.is_empty() || inputs.len() > usize::from(u16::MAX) || rate == 0 {
+            return Err("invalid take channel count or sample rate".into());
+        }
         let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| File::create_new(&path));
         let file = file.map_err(|e| format!("{}: {e}", path.display()))?;
-        let live = Arc::new(Mutex::new(vec![Vec::new(); inputs.len()]));
-        let mut take = TakeWriter { id, inputs, path, file, rate, frames: 0, error: None, live };
+        let live = Arc::new(Mutex::new(LiveTake { channels: vec![Vec::new(); inputs.len()], block_frames: LIVE_BLOCK, max_blocks: LIVE_BLOCKS }));
+        let mut take = TakeWriter { id, inputs, path, file, bytes: Vec::with_capacity(64 * 1024), rate, frames: 0, error: None, live };
         take.write_header();
         take.error.take().map_or(Ok(take), Err)
     }
@@ -388,16 +428,26 @@ impl TakeWriter {
         if self.error.is_some() {
             return;
         }
-        let bytes: Vec<u8> = block
-            .chunks_exact(channels)
-            .flat_map(|f| self.inputs.iter().flat_map(move |&i| f.get(i).copied().unwrap_or(0.0).to_le_bytes()))
-            .collect();
-        match self.file.write_all(&bytes) {
-            Ok(()) => {
-                self.summarize(block, channels);
-                self.frames += (block.len() / channels) as u64;
+        // Bounded conversion scratch, reused across writes; never allocate a take-sized buffer.
+        let frames_per_chunk = (64 * 1024 / self.inputs.len().max(1) / 4).max(1);
+        let samples_per_chunk = frames_per_chunk.saturating_mul(channels);
+        for part in block.chunks(samples_per_chunk) {
+            self.bytes.clear();
+            for frame in part.chunks_exact(channels) {
+                for &input in &self.inputs {
+                    self.bytes.extend_from_slice(&frame.get(input).copied().unwrap_or(0.0).to_le_bytes());
+                }
             }
-            Err(e) => self.fail(e),
+            match self.file.write_all(&self.bytes) {
+                Ok(()) => {
+                    self.summarize(part, channels);
+                    self.frames = self.frames.saturating_add((part.len() / channels) as u64);
+                }
+                Err(e) => {
+                    self.fail(e);
+                    break;
+                }
+            }
         }
     }
 
@@ -405,12 +455,27 @@ impl TakeWriter {
     fn summarize(&self, block: &[f32], channels: usize) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         for (f, n) in block.chunks_exact(channels).zip(self.frames..) {
-            let at = (n / LIVE_BLOCK as u64) as usize;
-            for (blocks, &i) in live.iter_mut().zip(&self.inputs) {
+            while n / (live.block_frames as u64) >= live.max_blocks as u64 {
+                for blocks in &mut live.channels {
+                    let pairs = blocks.len().div_ceil(2);
+                    for index in 0..pairs {
+                        let first = blocks.get(index * 2).copied().unwrap_or((0.0, 0.0));
+                        let second = blocks.get(index * 2 + 1).copied().unwrap_or(first);
+                        if let Some(to) = blocks.get_mut(index) {
+                            *to = (first.0.min(second.0), first.1.max(second.1));
+                        }
+                    }
+                    blocks.truncate(pairs); // In-memory vector only; no file operation.
+                }
+                live.block_frames = live.block_frames.saturating_mul(2);
+            }
+            let at = (n / live.block_frames as u64) as usize;
+            let max_blocks = live.max_blocks;
+            for (blocks, &i) in live.channels.iter_mut().zip(&self.inputs) {
                 let v = f.get(i).copied().unwrap_or(0.0);
                 match blocks.get_mut(at) {
                     Some(b) => *b = (b.0.min(v), b.1.max(v)),
-                    None if at < LIVE_BLOCKS => blocks.push((v, v)),
+                    None if at < max_blocks => blocks.push((v, v)),
                     None => {}
                 }
             }
@@ -472,6 +537,7 @@ mod tests {
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,
+            device_buffer: None,
             writer: None,
             seen: (0, Instant::now()),
         }
@@ -500,10 +566,66 @@ mod tests {
         assert_eq!(recorder(&gone).trouble(), Some(Trouble::Device("“Mic In” was disconnected".into())));
     }
 
+    // Preserve every test artifact. Atomic create_dir reserves a fresh path without cleanup.
+    fn test_dir(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..1000 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("pa-m1-{label}-{}-{now}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("cannot reserve test directory: {e}"),
+            }
+        }
+        panic!("cannot reserve a unique test directory")
+    }
+
+    #[test]
+    fn empty_take_is_retained_and_invalid_input_is_rejected_before_creation() {
+        let dir = test_dir("empty-preserved");
+        let path = dir.join("empty.wav");
+        let take = TakeWriter::create(TrackId(1), vec![0], path.clone(), 48_000).unwrap();
+        let shared = Shared::new(CaptureRing::new(64));
+        let (takes, problem) = write_takes(&shared, vec![take], 1);
+        assert!(takes.is_empty());
+        assert!(problem.is_none());
+        assert!(path.is_file());
+        assert!(decode(&path).iter().all(Vec::is_empty));
+        let invalid = dir.join("invalid.wav");
+        assert!(TakeWriter::create(TrackId(2), vec![], invalid.clone(), 48_000).is_err());
+        assert!(!invalid.exists());
+    }
+
+    #[test]
+    fn live_waveform_coarsens_instead_of_growing_with_take_duration() {
+        let dir = test_dir("bounded-live");
+        let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("take.wav"), 48_000).unwrap();
+        take.live.lock().unwrap().max_blocks = 2;
+        take.write(&vec![0.25; LIVE_BLOCK * 16], 1);
+        let live = take.live.lock().unwrap();
+        assert!(live.channels[0].len() <= 2);
+        assert!(live.block_frames >= LIVE_BLOCK * 8);
+        assert!(live.channels[0].iter().all(|range| *range == (0.25, 0.25)));
+    }
+
+    #[test]
+    fn disk_conversion_scratch_is_reused_for_large_blocks() {
+        let dir = test_dir("bounded-writer");
+        let path = dir.join("long.wav");
+        let mut take = TakeWriter::create(TrackId(1), vec![0, 1], path.clone(), 48_000).unwrap();
+        let capacity = take.bytes.capacity();
+        take.write(&vec![0.25; 200_000], 2);
+        assert_eq!(take.bytes.capacity(), capacity);
+        assert_eq!(take.frames, 100_000);
+        take.write_header();
+        assert_eq!(decode(&path)[0].len(), 100_000);
+    }
+
     #[test]
     fn a_failed_write_is_trouble_while_still_recording() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-failed-take-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("failed-take");
         let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox_01.wav"), 48_000).unwrap();
         take.file = File::open(&take.path).unwrap();
         let shared = Arc::new(Shared::new(CaptureRing::new(1 << 12)));
@@ -520,13 +642,11 @@ mod tests {
         assert_eq!(r.trouble(), None, "reported once");
         shared.armed.store(false, Ordering::Release);
         assert!(writer.join().unwrap().1.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn takes_stream_into_their_files() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-takes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("takes");
         let gtr = TakeWriter::create(TrackId(1), vec![1, 2], dir.join("Gtr_01.wav"), 48_000).unwrap();
         let mut vox = TakeWriter::create(TrackId(2), vec![0], dir.join("Vox_01.wav"), 48_000).unwrap();
         assert!(TakeWriter::create(TrackId(3), vec![0], dir.join("Vox_01.wav"), 48_000).is_err(), "never overwrites a file");
@@ -548,20 +668,17 @@ mod tests {
         assert_eq!((done.len(), problem), (2, None));
         assert_eq!(decode(&done[0].1), vec![channel(1), channel(2)]);
         assert_eq!(decode(&done[1].1), vec![[vec![0.5; 100], vec![0.25; 50], channel(0)].concat()]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_take_sums_itself_up_for_drawing_while_it_records() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-live-take-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("live-take");
         let mut take = TakeWriter::create(TrackId(4), vec![2, 0], dir.join("Gtr_01.wav"), 48_000).unwrap();
         let input: Vec<f32> = (0..300).flat_map(|f| [f as f32, -1.0, -(f as f32)]).collect();
         take.write(&input[..3 * 100], 3);
         take.write(&input[3 * 100..], 3);
-        let live = take.live.lock().unwrap().clone();
+        let live = take.live.lock().unwrap().channels.clone();
         assert_eq!(live, [[(-127.0, 0.0), (-255.0, -128.0), (-299.0, -256.0)], [(0.0, 127.0), (128.0, 255.0), (256.0, 299.0)]]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -577,6 +694,7 @@ struct RingState {
 /// The input device may run at a different rate than the session, so the reader converts
 /// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
 pub struct InputRing {
+    pub(crate) timing: Arc<crate::latency::LatencyTracker>,
     state: Mutex<RingState>,
     pub channels: std::sync::atomic::AtomicUsize,
     /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
@@ -590,6 +708,7 @@ impl InputRing {
         let ch = channels.max(1);
         let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
         Arc::new(InputRing {
+            timing: Arc::default(),
             state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
             rate,
@@ -599,9 +718,21 @@ impl InputRing {
 
     pub fn push(&self, samples: &[f32]) {
         if let Ok(mut s) = self.state.try_lock() {
-            s.data.extend(samples.iter().copied().map(finite));
-            while s.data.len() > self.cap {
-                s.data.pop_front();
+            // Make room before each append so even an oversized callback cannot grow the FIFO.
+            // Drop complete frames to preserve channel alignment.
+            let channels = self.channels.load(Ordering::Relaxed).max(1);
+            for frame in samples.chunks_exact(channels) {
+                while s.data.len().saturating_add(channels) > self.cap {
+                    if s.data.is_empty() {
+                        break;
+                    }
+                    for _ in 0..channels {
+                        s.data.pop_front();
+                    }
+                }
+                if channels <= self.cap {
+                    s.data.extend(frame.iter().copied().map(finite));
+                }
             }
         }
     }
@@ -641,6 +772,18 @@ impl InputRing {
 #[cfg(test)]
 mod ring_tests {
     use super::InputRing;
+
+    #[test]
+    fn oversized_monitor_callback_keeps_memory_bounded_and_channels_aligned() {
+        let ring = InputRing::new(2, 48_000);
+        let capacity = ring.state.lock().unwrap().data.capacity();
+        ring.push(&(0..200_000).map(|n| n as f32).collect::<Vec<_>>());
+        let state = ring.state.lock().unwrap();
+        assert_eq!(state.data.capacity(), capacity);
+        assert_eq!(state.data.len(), ring.cap);
+        assert_eq!(state.data.front(), Some(&152_000.0));
+        assert_eq!(state.data.len() % 2, 0);
+    }
 
     /// A 1 kHz sine recorded at 16 kHz must come out as a 1 kHz sine at 48 kHz, across calls.
     #[test]

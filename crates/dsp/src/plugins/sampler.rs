@@ -133,20 +133,18 @@ fn ordered(a: u8, b: u8) -> (u8, u8) {
     (a.min(b), a.max(b))
 }
 
-/// 4-point cubic (Catmull-Rom) interpolation of `x` at fractional frame `pos` (>= 0). Reads
-/// outside the slice are silence.
+/// 4-point cubic (Catmull-Rom) interpolation at fractional frame `pos` (>= 0).
+/// Out-of-range frames are silence; a missing in-range cache sample silences this output.
 #[inline]
-fn hermite(x: &[f32], pos: f64) -> f32 {
+fn hermite(sample: &dyn SampleSource, channel: usize, pos: f64) -> f32 {
     let i = pos as usize;
     let t = (pos - i as f64) as f32;
-    let at = |k: usize| x.get(k).copied().unwrap_or(0.0);
-    let x0 = at(i);
+    let at = |k: usize| if k >= sample.frames() { Some(0.0) } else { sample.sample(channel, k) };
+    let Some(x0) = at(i) else { return 0.0 };
     if t == 0.0 {
         return if x0.is_finite() { x0 } else { 0.0 };
     }
-    let xm1 = at(i.saturating_sub(1));
-    let x1 = at(i.saturating_add(1));
-    let x2 = at(i.saturating_add(2));
+    let (Some(xm1), Some(x1), Some(x2)) = (at(i.saturating_sub(1)), at(i.saturating_add(1)), at(i.saturating_add(2))) else { return 0.0 };
     let c1 = 0.5 * (x1 - xm1);
     let c2 = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
     let c3 = 0.5 * (x2 - xm1) + 1.5 * (x0 - x1);
@@ -275,6 +273,13 @@ impl Sampler {
             .unwrap_or(0);
         let start = d.start * self.len.saturating_sub(1) as f64;
         let looping = self.loop_frames().is_some_and(|(_, end)| start < end);
+        if let Some(sample) = self.sample.as_deref() {
+            sample.prefetch(start as usize);
+            if let Some((a, b)) = self.loop_frames() {
+                sample.prefetch(a as usize);
+                sample.prefetch(b as usize);
+            }
+        }
         let gain = (1.0 - d.sens) + d.sens * f32::from(vel) / 127.0;
         if let Some(v) = self.voices.get_mut(idx) {
             *v = Voice { note, held: !d.one_shot, gain, pos: start, step: step.min(MAX_STEP), forward: true, looping, env: Adsr::new() };
@@ -315,11 +320,14 @@ impl Sampler {
             if !v.active() {
                 continue;
             }
+            sample.prefetch(v.pos as usize);
+            let ahead = if v.forward { v.pos + v.step * 128.0 } else { (v.pos - v.step * 128.0).max(0.0) };
+            sample.prefetch(ahead as usize);
             let a = v.env.next(&self.rates) * v.gain * level;
             for (c, b) in io.iter_mut().take(ch).enumerate() {
                 let src = if nch == 1 { 0 } else { c };
-                if let (Some(x), Some(data)) = (b.get_mut(n), sample.channel(src)) {
-                    *x += hermite(data, v.pos) * a;
+                if let Some(x) = b.get_mut(n) {
+                    *x += hermite(sample, src, v.pos) * a;
                 }
             }
             let r = if v.looping { region } else { None };
@@ -450,6 +458,9 @@ impl Plugin for Sampler {
         let rate = sample.as_deref().map_or(self.sr, |s| s.sample_rate());
         // An unusable rate plays at the host rate rather than not at all.
         self.sample_sr = if rate.is_finite() && rate > 0.0 { rate.min(1_536_000.0) } else { self.sr };
+        if let Some(source) = sample.as_deref() {
+            source.prefetch(0);
+        }
         self.sample = sample;
         true
     }
@@ -457,6 +468,57 @@ impl Plugin for Sampler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hermite_reads_a_paged_source_without_whole_channel_access() {
+        struct Paged;
+        impl crate::SampleSource for Paged {
+            fn sample_rate(&self) -> f32 {
+                48_000.0
+            }
+            fn num_channels(&self) -> usize {
+                1
+            }
+            fn channel(&self, _: usize) -> Option<&[f32]> {
+                None
+            }
+            fn frames(&self) -> usize {
+                4
+            }
+            fn sample(&self, ch: usize, frame: usize) -> Option<f32> {
+                if ch == 0 { [0.0, 1.0, -0.5, 0.25].get(frame).copied() } else { None }
+            }
+        }
+        let resident = crate::SampleBuffer { sample_rate: 48_000.0, channels: vec![vec![0.0, 1.0, -0.5, 0.25]] };
+        for step in 0..40 {
+            let at = f64::from(step) / 10.0;
+            assert_eq!(super::hermite(&Paged, 0, at), super::hermite(&resident, 0, at));
+        }
+    }
+
+    #[test]
+    fn missing_paged_interpolation_neighbor_silences_the_frame() {
+        struct Missing;
+        impl crate::SampleSource for Missing {
+            fn sample_rate(&self) -> f32 {
+                48_000.0
+            }
+            fn num_channels(&self) -> usize {
+                1
+            }
+            fn channel(&self, _: usize) -> Option<&[f32]> {
+                None
+            }
+            fn frames(&self) -> usize {
+                100
+            }
+            fn sample(&self, _: usize, frame: usize) -> Option<f32> {
+                (frame == 10).then_some(0.5)
+            }
+        }
+        assert_eq!(super::hermite(&Missing, 0, 10.0), 0.5);
+        assert_eq!(super::hermite(&Missing, 0, 10.5), 0.0);
+    }
+
     use super::*;
     use crate::SampleBuffer;
     use std::f32::consts::TAU;

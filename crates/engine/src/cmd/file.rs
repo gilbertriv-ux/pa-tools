@@ -19,13 +19,13 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = str_param(p, "path").map(str::to_string).or_else(|| e.path.clone()).ok_or_else(|| bad("session.save", "no path yet: pass `path` (Save As)"))?;
             refuse_replacing(e, "session.save", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session(e, &path)?;
-            Ok(json!({"path": path, "audio_files_written": written}))
+            Ok(json!({"path": e.path.as_deref().unwrap_or(&path), "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_as", "Save Session As...", ["File"], Some("Cmd+Shift+S"), "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_as", "`path` required"))?.to_string();
             refuse_replacing(e, "session.save_as", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session(e, &path)?;
-            Ok(json!({"path": path, "audio_files_written": written}))
+            Ok(json!({"path": e.path.as_deref().unwrap_or(&path), "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
@@ -237,9 +237,7 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
     let target = import_audio_target(e, p)?;
     let mut out = Vec::new();
     for path in &paths {
-        let bytes = crate::io::read_file(path)?;
-        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
-        let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?;
+        let r = crate::io::import_audio_file(e, path, target, at)?;
         out.push(r);
     }
     Ok(json!({"imported": out}))
@@ -619,8 +617,8 @@ mod tests {
         assert_eq!(e.session().tracks[0].format, ChannelFormat::Surround51);
         let src = e.session().sources[0].id;
         let audio = e.session().pool.get(src).unwrap();
-        assert_eq!(audio.buffer.channels.len(), 6);
-        assert!((audio.buffer.channels[5][0] - 0.6).abs() < 1e-3);
+        assert_eq!(audio.num_channels(), 6);
+        assert!((audio.sample(5, 0, false).unwrap() - 0.6).abs() < 1e-3);
 
         let mut e = Engine::default();
         e.execute("track.new", &json!({"name": "Bed", "format": "5.1"})).unwrap();

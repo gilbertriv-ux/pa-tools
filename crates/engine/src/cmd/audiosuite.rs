@@ -64,7 +64,15 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
             continue;
         }
         let channels = e.session().track(track).map_or(1, |t| t.channels());
-        crate::io::refuse_longer(e.session(), "audiosuite.process", &clip.name, "process", clip.length, most.min(crate::io::render_limit(channels)))?;
+        let growth = match name.as_str() {
+            "time_stretch" => ratio,
+            "pitch_shift" => 2f64.powf(f64::from(semitones.abs()) / 12.0),
+            "varispeed" => f64::from(to) / sr.as_f64(),
+            _ => 1.0,
+        }
+        .max(1.0);
+        let budget = (crate::io::render_limit(channels) as f64 / growth).floor() as usize;
+        crate::io::refuse_longer(e.session(), "audiosuite.process", &clip.name, "process", clip.length, most.min(budget))?;
         let mut audio = soundcraft_mix::render_clips(e.session(), track, clip.range());
         // Render without the clip's own fades: re-render a copy without fades so they stay editable.
         let mut tmp = e.session().clone();
@@ -206,7 +214,7 @@ mod tests {
         let c = e.session().tracks[0].clips()[0].clone();
         assert!((c.gain_db + 6.0).abs() < 1e-6, "{}", c.gain_db);
         assert_eq!(c.gain_env, vec![(0, 0.0), (32, -12.0)]);
-        let sample = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0][0];
+        let sample = e.session().pool.get(c.source().unwrap()).unwrap().materialize(4 * 1024 * 1024).unwrap().channels[0][0];
         assert!((sample + 0.5).abs() < 1e-3, "invert flips the file and leaves the gain on the clip, got {sample}");
 
         let (mut e, id) = gained_clip();
@@ -214,7 +222,7 @@ mod tests {
         let c = e.session().tracks[0].clips()[0].clone();
         assert!((c.gain_db + 6.0).abs() < 1e-6, "{}", c.gain_db);
         assert_eq!(c.gain_env, vec![(0, 0.0), (32, -12.0)]);
-        let sample = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0][0];
+        let sample = e.session().pool.get(c.source().unwrap()).unwrap().materialize(4 * 1024 * 1024).unwrap().channels[0][0];
         assert!((sample - 0.5).abs() < 1e-3, "duplicate keeps the file level and the clip gain, got {sample}");
     }
 
@@ -226,7 +234,7 @@ mod tests {
                 e.session_mut().find_clip_mut(id).unwrap().stretch = stretch;
                 e.execute("audiosuite.process", &json!({"process": process, "clips": [id.0]})).unwrap();
                 let c = e.session().tracks[0].clips()[0].clone();
-                let frames = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0].len();
+                let frames = e.session().pool.get(c.source().unwrap()).unwrap().materialize(4 * 1024 * 1024).unwrap().channels[0].len();
                 assert_eq!(c.stretch, 1.0, "{process} at {stretch}");
                 assert_eq!(c.length, i64::try_from(frames).unwrap(), "{process} at {stretch}");
             }
@@ -245,7 +253,7 @@ mod tests {
         assert_eq!(e.execute("audiosuite.process", &generator).unwrap()["processed"], 1);
         let c = e.session().tracks[1].clips()[0].clone();
         assert_eq!((c.start, c.length), (48_000, 48_000));
-        let buf = &e.session().pool.get(c.source().unwrap()).unwrap().buffer;
+        let buf = e.session().pool.get(c.source().unwrap()).unwrap().materialize(4 * 1024 * 1024).unwrap();
         assert_eq!(buf.channels.len(), 2);
         let peak = buf.channels[1].iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!((peak - 0.5).abs() < 0.01, "-6 dB sine peaks near 0.5, got {peak}");

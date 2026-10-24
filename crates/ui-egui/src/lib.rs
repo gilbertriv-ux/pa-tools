@@ -268,6 +268,8 @@ pub struct SoundApp {
     recorder_failed: bool,
     /// Input this take lost to a slow disk, as last reported (ms).
     lost_shown: u64,
+    source_error_shown: Option<String>,
+    source_underruns_shown: u64,
     /// Where the takes being recorded go, autosaved with the session so a crash can't lose them.
     take_plan: Option<soundcraft_engine::io::Recording>,
     pub ui: UiState,
@@ -365,6 +367,8 @@ impl SoundApp {
             punch: None,
             recorder_failed: false,
             lost_shown: 0,
+            source_error_shown: None,
+            source_underruns_shown: 0,
             take_plan: None,
             ui: UiState::default(),
             audio_health_report: None,
@@ -850,6 +854,23 @@ impl SoundApp {
 
     /// Stop the transport, keeping a take in progress, when the audio output fails.
     fn watch_output(&mut self) {
+        if let Some(player) = &self.player {
+            let error = player.source_error();
+            if error.is_none() {self.source_error_shown=None;}
+            let underruns = player.source_underruns();
+            if let Some(error) = error.filter(|error| Some(error) != self.source_error_shown.as_ref()) {
+                if self.engine.transport.playing || self.engine.transport.recording {
+                    self.stop_play();
+                }
+                self.ui.status = format!("Audio source read failed: {error}. Existing takes are retained.");
+                self.source_error_shown = Some(error);
+                return;
+            }
+            if underruns > self.source_underruns_shown {
+                self.ui.status = "Audio reading could not keep up; a playback dropout occurred.".into();
+            }
+            self.source_underruns_shown = underruns;
+        }
         let Some(p) = &self.player else { return };
         let Some(trouble) = p.trouble() else { return };
         let name = p.device_name.clone();

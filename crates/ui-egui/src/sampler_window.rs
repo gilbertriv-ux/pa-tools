@@ -175,9 +175,9 @@ pub fn sample_strip(app: &mut SoundApp, ui: &mut Ui, tid: TrackId, ins: &Insert)
     });
     let info = match (&source, &audio) {
         (Some(src), Some(a)) => {
-            let rate = a.buffer.sample_rate.max(1);
+            let rate = a.sample_rate().max(1);
             let secs = a.frames() as f64 / f64::from(rate);
-            let width = match a.buffer.num_channels() {
+            let width = match a.num_channels() {
                 1 => "mono".to_string(),
                 2 => "stereo".to_string(),
                 n => format!("{n} ch"),
@@ -208,18 +208,19 @@ pub fn sample_strip(app: &mut SoundApp, ui: &mut Ui, tid: TrackId, ins: &Insert)
         p.rect_filled(Rect::from_x_y_ranges(x_of(ls)..=x_of(le), r.y_range()), 0.0, t.accent.gamma_multiply(0.18));
     }
     // One min/max column per point, a lane per channel (two at most).
-    let lanes = audio.peaks.len().clamp(1, 2);
+    let lanes = audio.num_channels().clamp(1, 2);
     let lane_h = r.height() / lanes as f32;
     let cols = r.width().max(1.0) as usize;
     let wave = t.text.gamma_multiply(0.8);
-    for (c, peaks) in audio.peaks.iter().take(lanes).enumerate() {
+    for c in 0..lanes {
         let mid = r.min.y + lane_h * (c as f32 + 0.5);
         let half = lane_h * 0.45;
-        let samples = audio.channel(c).unwrap_or_default();
-        for i in 0..cols {
-            let a = frames.saturating_mul(i) / cols;
-            let b = (frames.saturating_mul(i + 1) / cols).max(a + 1);
-            let (lo, hi) = peaks.minmax(samples, a, b);
+        let Some(spans) = audio.waveform_spans(c, 0.0, frames as f64 / cols.max(1) as f64, 0.0, cols, false) else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            continue;
+        };
+        for (i, span) in spans.into_iter().enumerate() {
+            let Some((lo, hi)) = span else { continue };
             let x = r.min.x + i as f32 + 0.5;
             p.line_segment([pos2(x, mid - hi.clamp(-1.0, 1.0) * half), pos2(x, mid - lo.clamp(-1.0, 1.0) * half)], Stroke::new(1.0, wave));
         }

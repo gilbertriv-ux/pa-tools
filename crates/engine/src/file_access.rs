@@ -441,9 +441,9 @@ mod tests {
     /// Every file a command reads or writes by path goes through `io` (`read_file`, `write_file`
     /// and the other checked helpers there), which check the roots. Engine code that reaches for
     /// the file system itself would bypass them, so none may: every file under `src/` except
-    /// `io.rs`, this module and the test files. Audio is decoded into the session when it enters
-    /// it (import, open, sampler load), so playback and bounce read nothing from disk and need no
-    /// check of their own. Plug-in scans live in the host crates. The one engine module that reads
+    /// `io.rs`, this module and the test files. Audio sources receive already-checked open-file
+    /// capabilities through io.rs; background readers never resolve or open a session-provided
+    /// path themselves. Plug-in scans live in the host crates. The one engine module that reads
     /// and writes a fixed folder is `autosave.rs`: crash-recovery copies in the app's own data
     /// folder, which no command names, so it is skipped too.
     #[test]

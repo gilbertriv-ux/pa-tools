@@ -6,7 +6,7 @@ use soundcraft_time::Samples;
 
 /// Draw a clip's audio across `body`, one band per channel, `channels` of them at most.
 pub fn draw(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, channels: usize, body: Rect, wave: Color32) {
-    for (ch, band) in bands(body, channels.min(audio.peaks.len()).max(1)).enumerate() {
+    for (ch, band) in bands(body, channels.min(audio.num_channels()).max(1)).enumerate() {
         channel(painter, s, tl, clip, audio, ch, band, wave);
     }
 }
@@ -17,12 +17,12 @@ fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
 }
 
 fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, ch: usize, band: Rect, wave: Color32) {
-    let (Some(samples), Some(peaks)) = (audio.channel(ch), audio.peaks.get(ch)) else { return };
+    let samples = audio.channel(ch).unwrap_or_default();
     let Some(g) = Grid::new(painter, s, tl, band) else { return };
     let (rectified, power, outlines) = (s.edit.flag("waveform.rectified"), s.edit.flag("waveform.power"), s.edit.flag("waveform.outlines"));
     let origin = clip.start.saturating_sub(clip.source_offset()) as f64;
     let gain = |pos: f64| clip.gain_at((pos as Samples).saturating_sub(clip.start).min(clip.length).max(0)) * s.edit.zoom.waveform_zoom;
-    if g.step <= 1.0 {
+    if g.step <= 1.0 && !audio.is_file_backed() {
         let first = (g.pos_at(g.vis.min.x) - origin).floor().max(0.0) as usize;
         let last = (g.pos_at(g.vis.max.x) - origin).ceil() as usize;
         let from = first.saturating_sub(1);
@@ -34,10 +34,9 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
         return;
     }
     let (start, overlap) = (g.start() - origin, g.overlap());
-    let spans = if power {
-        peaks.rms_spans(samples, start, g.step, overlap, g.cols).into_iter().map(|r| r.map(|r| (-r, r))).collect()
-    } else {
-        peaks.spans(samples, start, g.step, overlap, g.cols)
+    let Some(spans) = audio.waveform_spans(ch, start, g.step, overlap, g.cols, power) else {
+        painter.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        return;
     };
     let base = g.cy + g.half;
     let ys: Vec<Option<(f32, f32)>> = spans

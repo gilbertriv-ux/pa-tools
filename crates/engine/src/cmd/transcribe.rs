@@ -47,6 +47,9 @@ fn transcribe(e: &mut Engine, p: &Value) -> Result<Value> {
     // Render the track's clips and downmix to mono at the session rate, then resample to 16 kHz.
     let sr = e.session().sample_rate;
     let end = e.session().content_end();
+    let width = e.session().track(track).map_or(1, |track| track.channels()).max(1);
+    let converted = (soundcraft_mix::MAX_RENDER_SAMPLES as f64 * sr.as_f64() / f64::from(soundcraft_pa_speech::SAMPLE_RATE)).floor() as usize;
+    crate::io::refuse_longer(e.session(), cmd, "track", "transcribe in one operation", end, crate::io::render_limit(width).min(converted))?;
     let channels = soundcraft_mix::render_clips(e.session(), track, Range::new(0, end));
     let mono = soundcraft_pa_speech::downmix(&channels);
     // High-quality (Kaiser-windowed sinc, anti-aliased) rate conversion to the recogniser's 16 kHz.

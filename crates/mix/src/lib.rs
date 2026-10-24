@@ -50,6 +50,8 @@
 //! [`Insert::sample`]: soundcraft_model::Insert::sample
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod source_stream;
+
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
@@ -614,6 +616,7 @@ impl MixEngine {
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
+        source_stream::prefetch(s, pos, None);
         let frames = frames.min(self.max_block);
         if pos != self.last_end {
             // Seek: silence held notes and ringing plugins.
@@ -1423,7 +1426,8 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
     let Some(audio) = s.pool.get(source) else { return };
-    let nsrc = audio.buffer.channels.len();
+    let nsrc = audio.num_channels();
+    let realtime = on_audio_thread();
     if nsrc == 0 {
         return;
     }
@@ -1433,7 +1437,7 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     // Gain is evaluated every 32 samples and interpolated (fades and envelopes stay smooth).
     const STEP: usize = 32;
     for (ch, dst) in buf.iter_mut().enumerate() {
-        let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let source_channel = ch % nsrc;
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
@@ -1447,13 +1451,14 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| audio.sample(source_channel, x, realtime)).unwrap_or(0.0)
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                    let a = if x0 >= 0.0 { audio.sample(source_channel, x0 as usize, realtime).unwrap_or(0.0) } else { 0.0 };
+                    let b =
+                        if x0 + 1.0 >= 0.0 { audio.sample(source_channel, (x0 as usize).saturating_add(1), realtime).unwrap_or(0.0) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -1615,13 +1620,22 @@ struct PoolSample(Arc<SourceAudio>);
 
 impl SampleSource for PoolSample {
     fn sample_rate(&self) -> f32 {
-        self.0.buffer.sample_rate as f32
+        self.0.sample_rate() as f32
     }
     fn num_channels(&self) -> usize {
-        self.0.buffer.num_channels()
+        self.0.num_channels()
     }
     fn channel(&self, ch: usize) -> Option<&[f32]> {
-        self.0.channel(ch)
+        self.0.resident()?.channels.get(ch).map(Vec::as_slice)
+    }
+    fn frames(&self) -> usize {
+        self.0.frames()
+    }
+    fn sample(&self, ch: usize, frame: usize) -> Option<f32> {
+        self.0.sample(ch, frame, on_audio_thread())
+    }
+    fn prefetch(&self, frame: usize) {
+        self.0.prefetch(frame);
     }
 }
 
@@ -2032,10 +2046,11 @@ fn apply_matrix_span(src: &[Vec<f32>], span: std::ops::Range<usize>, dst: &mut [
     }
 }
 
-/// Ceiling on one in-memory offline render (samples summed over channels): 2^29 f32 = 2 GiB, about
-/// 93 minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory;
-/// [`RangeRender`] streams any length.
-pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
+/// Ceiling on one legacy in-memory offline output (samples summed over channels): 2^22 f32 =
+/// 16 MiB. Callers must refuse over-budget requests before rendering: these legacy APIs truncate
+/// their output at this bound. [`RangeRender`] streams any length without a whole-range buffer.
+/// This is an output-buffer bound, not a total budget for plugin scratch or concurrent jobs.
+pub const MAX_RENDER_SAMPLES: usize = 1 << 22;
 
 /// Offline render of the main mix over `range` (planar, [`main_channels`] channels in SMPTE/WAV
 /// order). The mix's delay-compensation latency is removed, so the result lines up with the
@@ -3300,7 +3315,7 @@ mod tests {
     #[test]
     fn surround_track_passes_through_bit_exact() {
         let (s, _) = multichannel_session(ChannelFormat::Surround51, ChannelFormat::Surround51, 4800);
-        let src = s.pool.get(SourceId(901)).unwrap().buffer.channels.clone();
+        let src = s.pool.get(SourceId(901)).unwrap().materialize(4800 * 6).unwrap().channels;
         let out = render_range(&s, Range::new(0, 4800), 512);
         assert_eq!(out.len(), 6);
         for (o, x) in out.iter().zip(src.iter()) {

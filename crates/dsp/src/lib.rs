@@ -22,6 +22,7 @@ mod params;
 pub mod pitch_detect;
 pub mod plugins;
 pub mod spectrum;
+pub mod stream_resample;
 mod util;
 
 pub use offline::FadeShape;
@@ -305,6 +306,13 @@ pub trait SampleSource: Send + Sync {
     fn num_channels(&self) -> usize;
     /// One channel's frames (`None` past the last channel).
     fn channel(&self, ch: usize) -> Option<&[f32]>;
+    /// One sample. File-backed implementations override this with nonblocking cache access;
+    /// `None` can mean a cache miss, so consumers must never fetch a whole channel as fallback.
+    fn sample(&self, ch: usize, frame: usize) -> Option<f32> {
+        self.channel(ch).and_then(|data| data.get(frame)).copied()
+    }
+    /// Schedule a source position without waiting, allocating, locking, or reading the file.
+    fn prefetch(&self, _frame: usize) {}
     /// Frames per channel (the shortest channel, so every index below it is readable).
     fn frames(&self) -> usize {
         (0..self.num_channels()).filter_map(|c| self.channel(c)).map(<[f32]>::len).min().unwrap_or(0)
