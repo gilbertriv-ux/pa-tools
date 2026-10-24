@@ -230,6 +230,7 @@ struct Strip {
     held: Vec<u8>,
     /// Held live notes: one channel-bit mask per pitch; fixed storage supports channel fan-in.
     live_held: [u16; 128],
+    live_sustain: u16,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     chase: bool,
     muted: bool,
@@ -315,6 +316,7 @@ impl Strip {
             sample: None,
             held: Vec::new(),
             live_held: [0; 128],
+            live_sustain: 0,
             chase: true,
             muted: false,
             gr: 0.0,
@@ -517,10 +519,12 @@ impl MixEngine {
         self.main.len()
     }
 
-    /// Queue one short channel message without growing storage. Offset is relative to the next
-    /// render block. The host drains its bounded input queue directly on the audio thread.
+    /// Queue a short channel message at the next render quantum without growing storage.
+    /// Only offset zero is supported: native connection timestamps have no audio-clock epoch.
+    /// Rejecting nonzero offsets preserves live/timeline ownership ordering within each block.
     pub fn queue_live_midi(&mut self, track: TrackId, offset: usize, message: [u8; 3]) -> bool {
-        if self.live_midi_len == MAX_LIVE_MIDI_EVENTS || !(0x80..0xf0).contains(&message[0]) || message[1] >= 128 || message[2] >= 128 {
+        if offset != 0 || self.live_midi_len == MAX_LIVE_MIDI_EVENTS || !(0x80..0xf0).contains(&message[0]) || message[1] >= 128 || message[2] >= 128
+        {
             return false;
         }
         self.live_midi[self.live_midi_len] = LiveMidiEvent { track, offset, message };
@@ -533,7 +537,7 @@ impl MixEngine {
         for (id, strip) in &mut self.strips {
             if target.is_none_or(|target| target == *id) {
                 if let Some(instrument) = &mut strip.instrument {
-                    instrument.plugin.all_notes_off();
+                    release_live_notes(instrument.plugin.as_mut(), &strip.held, &mut strip.live_held, &mut strip.live_sustain, 0);
                 }
                 strip.live_held.fill(0);
             }
@@ -564,6 +568,7 @@ impl MixEngine {
             }
             s.held.clear();
             s.live_held.fill(0);
+            s.live_sustain = 0;
             s.chase = true;
             s.align.clear();
             s.align_pre.clear();
@@ -677,6 +682,7 @@ impl MixEngine {
                 }
                 st.held.clear();
                 st.live_held.fill(0);
+                st.live_sustain = 0;
                 st.chase = true;
             }
         }
@@ -1060,8 +1066,9 @@ fn process_strip(
                     if std::mem::take(&mut strip.chase) {
                         chase_controllers(s, t, pos, inst);
                     }
-                    schedule_notes(s, t, pos, frames, inst, &mut strip.held, &strip.live_held);
                 }
+                // Native live events belong to the next quantum boundary. Update their
+                // ownership before scheduling later timeline events in this block.
                 for event in live.midi.iter().filter(|event| event.track == t.id) {
                     let offset = event.offset.min(frames.saturating_sub(1));
                     let [status, pitch, velocity] = event.message;
@@ -1069,8 +1076,11 @@ fn process_strip(
                     let bit = 1u16 << channel;
                     match status & 0xf0 {
                         0x90 if velocity > 0 => {
-                            strip.live_held[usize::from(pitch)] |= bit;
-                            inst.plugin.note_on(offset, pitch, velocity);
+                            let held = &mut strip.live_held[usize::from(pitch)];
+                            if *held == 0 && !strip.held.contains(&pitch) {
+                                inst.plugin.note_on(offset, pitch, velocity);
+                            }
+                            *held |= bit;
                         }
                         0x80 | 0x90 => {
                             let held = &mut strip.live_held[usize::from(pitch)];
@@ -1079,13 +1089,26 @@ fn process_strip(
                                 inst.plugin.note_off(offset, pitch);
                             }
                         }
+                        0xb0 if pitch == 64 => {
+                            if velocity >= 64 {
+                                strip.live_sustain |= bit;
+                            } else {
+                                strip.live_sustain &= !bit;
+                            }
+                            inst.plugin.midi(offset, [0xb0, 64, if strip.live_sustain != 0 { 127 } else { 0 }]);
+                        }
+                        0xb0 if pitch == 121 => {
+                            strip.live_sustain = 0;
+                            inst.plugin.midi(offset, [0xb0, 121, velocity]);
+                        }
                         0xb0 if pitch == 120 || pitch == 123 => {
-                            strip.live_held.fill(0);
-                            inst.plugin.all_notes_off();
-                            inst.plugin.midi(offset, [0xb0, pitch, velocity]);
+                            release_live_notes(inst.plugin.as_mut(), &strip.held, &mut strip.live_held, &mut strip.live_sustain, offset);
                         }
                         _ => inst.plugin.midi(offset, [status & 0xf0, pitch, velocity]),
                     }
+                }
+                if !live.monitor_only {
+                    schedule_notes(s, t, pos, frames, inst, &mut strip.held, &strip.live_held);
                 }
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
@@ -1571,6 +1594,23 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
         .map_or(0, |v| v as i64)
 }
 
+/// Live and sequenced notes share an instrument instance. A live panic must not issue
+/// global all-notes-off: sequenced sustained notes would disappear until their next onset.
+/// Sustain is currently one merged controller channel; releasing it can also release a
+/// sequenced pedal-only tail, although physically held sequenced pitches remain protected.
+fn release_live_notes(plugin: &mut dyn Plugin, timeline: &[u8], live: &mut [u16; 128], pedal: &mut u16, offset: usize) {
+    if *pedal != 0 {
+        plugin.midi(offset, [0xb0, 64, 0]);
+    }
+    *pedal = 0;
+    for (pitch, mask) in live.iter_mut().enumerate() {
+        if *mask != 0 && !timeline.contains(&(pitch as u8)) {
+            plugin.note_off(offset, pitch as u8);
+        }
+        *mask = 0;
+    }
+}
+
 /// Send note on/offs and controllers for MIDI clips overlapping the block.
 fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>, live_held: &[u16; 128]) {
     let sr = s.sample_rate;
@@ -1612,7 +1652,9 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 continue;
             }
             if on >= pos && on < end {
-                inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
+                if live_held[usize::from(n.pitch)] == 0 {
+                    inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
+                }
                 if !held.contains(&n.pitch) && held.len() < 128 {
                     held.push(n.pitch);
                 }
@@ -2404,6 +2446,166 @@ mod tests {
         ins.params.insert("level".into(), level_db);
         tr.instrument = Some(ins);
         s
+    }
+
+    #[test]
+    fn live_disconnect_preserves_sustained_timeline_voice() {
+        let mut s = synth_session(-6.0);
+        let target = s.tracks[0].id;
+        s.track_mut(target).unwrap().instrument.as_mut().unwrap().params.insert("amp_release".into(), 1.0);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.queue_live_midi(target, 0, [0x90, 72, 100]);
+        eng.render(&s, 0, 512, &mut out);
+        assert!(eng.strips[&target].held.contains(&60));
+        eng.silence_live_midi(Some(target));
+        for block in 1..=12 {
+            eng.render(&s, block * 512, 512, &mut out);
+        }
+        let energy = out[0].iter().map(|x| x * x).sum::<f32>();
+        assert!(energy > 1e-5, "live disconnect silenced the still-held timeline note: energy={energy}");
+        assert!(eng.strips[&target].held.contains(&60));
+        assert_eq!(eng.strips[&target].live_held[72], 0);
+    }
+
+    #[test]
+    fn quantum_live_on_precedes_future_timeline_on_without_duplicate_voice() {
+        let mut s = synth_session(-6.0);
+        let target = s.tracks[0].id;
+        if let ClipContent::Midi { sequence } = &mut s.track_mut(target).unwrap().playlist_mut().unwrap().clips[0].content {
+            sequence.notes[0].start = 4; // 100 samples into this block, after live onset.
+        }
+        let mut immediate = s.clone();
+        if let ClipContent::Midi { sequence } = &mut immediate.track_mut(target).unwrap().playlist_mut().unwrap().clips[0].content {
+            sequence.notes[0].start = 0;
+        }
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut baseline = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        let mut expected = out.clone();
+        assert!(!eng.queue_live_midi(target, 100, [0x90, 60, 100]));
+        assert!(eng.queue_live_midi(target, 0, [0x90, 60, 100]));
+        eng.render(&s, 0, 512, &mut out);
+        baseline.render(&immediate, 0, 512, &mut expected);
+        assert!(out[0][..90].iter().any(|x| x.abs() > 1e-5), "live onset was delayed to timeline onset");
+        assert_eq!(out, expected, "later timeline onset spawned another voice");
+    }
+
+    #[test]
+    fn quantum_live_off_does_not_preempt_later_timeline_off() {
+        let mut s = synth_session(-6.0);
+        let target = s.tracks[0].id;
+        s.track_mut(target).unwrap().instrument.as_mut().unwrap().params.insert("amp_release".into(), 1.0);
+        if let ClipContent::Midi { sequence } = &mut s.track_mut(target).unwrap().playlist_mut().unwrap().clips[0].content {
+            sequence.notes[0].length = 28; // 700 samples: off is 188 into second block.
+        }
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut baseline = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        let mut expected = out.clone();
+        eng.queue_live_midi(target, 0, [0x90, 60, 100]);
+        eng.render(&s, 0, 512, &mut out);
+        baseline.render(&s, 0, 512, &mut expected);
+        eng.queue_live_midi(target, 0, [0x80, 60, 0]);
+        eng.render(&s, 512, 512, &mut out);
+        baseline.render(&s, 512, 512, &mut expected);
+        assert_eq!(out, expected, "boundary live off cut the still-held timeline voice before its scheduled off");
+        assert!(out[0][..180].iter().any(|x| x.abs() > 1e-5));
+    }
+
+    #[test]
+    fn same_pitch_live_overlap_does_not_spawn_an_extra_voice() {
+        let s = synth_session(-6.0);
+        let target = s.tracks[0].id;
+        let mut baseline = MixEngine::new(48_000.0, 512);
+        let mut live = MixEngine::new(48_000.0, 512);
+        let mut expected = vec![vec![0.0; 512]; 2];
+        let mut actual = expected.clone();
+        live.queue_live_midi(target, 0, [0x90, 60, 100]);
+        for block in 0..12 {
+            if block == 1 {
+                live.silence_live_midi(Some(target));
+            }
+            baseline.render(&s, block * 512, 512, &mut expected);
+            live.render(&s, block * 512, 512, &mut actual);
+            assert_eq!(actual, expected, "same-pitch overlap introduced a second voice in block {block}");
+        }
+    }
+
+    #[test]
+    fn live_panic_preserves_same_pitch_timeline_overlap() {
+        for panic in [None, Some(120), Some(123)] {
+            let mut s = synth_session(-6.0);
+            let target = s.tracks[0].id;
+            s.track_mut(target).unwrap().instrument.as_mut().unwrap().params.insert("amp_release".into(), 1.0);
+            let mut eng = MixEngine::new(48_000.0, 512);
+            let mut out = vec![vec![0.0; 512]; 2];
+            eng.queue_live_midi(target, 0, [0x90, 60, 100]);
+            eng.render(&s, 0, 512, &mut out);
+            if let Some(cc) = panic {
+                eng.queue_live_midi(target, 0, [0xb0, cc, 0]);
+            } else {
+                eng.silence_live_midi(Some(target));
+            }
+            for block in 1..=12 {
+                eng.render(&s, block * 512, 512, &mut out);
+            }
+            assert!(out[0].iter().any(|x| x.abs() > 1e-5), "live panic {panic:?} cut same-pitch timeline note");
+            assert_eq!(eng.strips[&target].live_held[60], 0);
+            // The protected voice must still release at its eventual timeline note-off.
+            for block in 13..=60 {
+                eng.render(&s, block * 512, 512, &mut out);
+            }
+            assert!(out[0].iter().all(|x| x.abs() < 1e-7));
+        }
+    }
+
+    #[test]
+    fn disconnect_without_live_pedal_preserves_timeline_pedal_tail() {
+        let mut s = synth_session(-6.0);
+        let target = s.tracks[0].id;
+        let track = s.track_mut(target).unwrap();
+        track.instrument.as_mut().unwrap().params.insert("amp_release".into(), 1.0);
+        if let ClipContent::Midi { sequence } = &mut track.playlist_mut().unwrap().clips[0].content {
+            sequence.notes[0].length = 20;
+            sequence.ctrls.push(soundcraft_midi::CtrlEvent { tick: 0, channel: 0, kind: CtrlKind::Cc(64), value: 127 });
+        }
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        for block in 0..4 {
+            eng.render(&s, block * 512, 512, &mut out);
+        }
+        assert!(eng.strips[&target].held.is_empty());
+        eng.silence_live_midi(Some(target));
+        for block in 4..16 {
+            eng.render(&s, block * 512, 512, &mut out);
+        }
+        assert!(out[0].iter().any(|x| x.abs() > 1e-5), "disconnect cut a timeline-only pedal tail");
+    }
+
+    #[test]
+    fn live_disconnect_releases_held_and_pedal_latched_live_only_notes() {
+        let mut s = Session::default();
+        let target = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let mut instrument = Insert::new("subtractive_synth");
+        instrument.params.insert("amp_release".into(), 1.0);
+        s.track_mut(target).unwrap().instrument = Some(instrument);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.monitor_only = true;
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.queue_live_midi(target, 0, [0xb0, 64, 127]);
+        eng.queue_live_midi(target, 0, [0x90, 60, 100]);
+        eng.queue_live_midi(target, 0, [0x90, 72, 100]);
+        eng.render(&s, 0, 512, &mut out);
+        eng.queue_live_midi(target, 0, [0x80, 60, 0]);
+        eng.render(&s, 0, 512, &mut out);
+        assert!(out[0].iter().any(|x| x.abs() > 1e-5));
+        eng.silence_live_midi(Some(target));
+        for _ in 0..16 {
+            eng.render(&s, 0, 512, &mut out);
+        }
+        assert!(out[0].iter().all(|x| x.abs() < 1e-7), "live-only held/pedal voices survived disconnect");
+        assert!(eng.strips[&target].live_held.iter().all(|mask| *mask == 0));
     }
 
     #[test]
