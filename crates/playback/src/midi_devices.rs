@@ -24,6 +24,7 @@ pub enum MidiIoError {
     QueueFull,
     ConnectionLimit,
     InvalidChannel,
+    LiveInstrumentUnavailable,
     Backend(String),
 }
 
@@ -37,6 +38,9 @@ impl fmt::Display for MidiIoError {
             Self::Disconnected => f.write_str("MIDI device disconnected"),
             Self::QueueFull => f.write_str("MIDI input queue is full"),
             Self::ConnectionLimit => f.write_str("MIDI connection limit reached; reconnect the audio engine to reclaim retired queues"),
+            Self::LiveInstrumentUnavailable => {
+                f.write_str("live instrument unavailable: choose a prepared built-in instrument within the 32-lane limit")
+            }
             Self::InvalidChannel => f.write_str("MIDI channel must be in 0..=15"),
             Self::Backend(reason) => write!(f, "MIDI backend: {reason}"),
         }

@@ -102,6 +102,7 @@ enum Cmd {
 struct Shared {
     clock: Arc<duplex::MasterClock>,
     midi_connections: AtomicU32,
+    midi_source_failed: AtomicBool,
     /// Invalidates queued/preparing starts when stop, locate, or another play supersedes them.
     transport_generation: AtomicU64,
     /// Zero or the generation whose initial source blocks are being warmed.
@@ -194,6 +195,7 @@ struct AudioState {
     midi_input: Option<LiveMidiInput>,
     midi_retired: [Option<midi_devices::MidiInputReceiver>; 16],
     midi_flush: bool,
+    midi_tail_remaining: usize,
     stop_muted: bool,
     rx: Receiver<Cmd>,
     shared: Arc<Shared>,
@@ -233,6 +235,7 @@ impl AudioState {
             midi_input: None,
             midi_retired: std::array::from_fn(|_| None),
             midi_flush: false,
+            midi_tail_remaining: 0,
             stop_muted: false,
             garbage,
             old_sessions: None,
@@ -271,6 +274,7 @@ impl AudioState {
         if let Some(input) = self.midi_input.take() {
             self.mix.silence_live_midi(Some(input.target));
             self.retire_midi(input.receiver);
+            self.midi_tail_remaining = self.mix.live_tail_samples();
             self.midi_flush = true;
             if !self.playing {
                 self.pending_len = 0;
@@ -320,6 +324,7 @@ impl AudioState {
                 Err(_) => {
                     self.mix.silence_live_midi(Some(input.target));
                     self.retire_midi(input.receiver);
+                    self.midi_tail_remaining = self.mix.live_tail_samples();
                     self.midi_flush = true;
                     if !self.playing {
                         self.pending_len = 0;
@@ -448,6 +453,7 @@ impl AudioState {
             input.discard_pending();
         }
         self.midi_flush = false;
+        self.midi_tail_remaining = 0;
         if let Some(input) = &mut self.midi_input {
             input.discard = true;
         }
@@ -516,6 +522,11 @@ impl AudioState {
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        if self.midi_input.as_ref().is_some_and(|input| self.mix.live_instrument_failed(input.target)) {
+            self.shared.midi_source_failed.store(true, Ordering::Release);
+            self.disconnect_midi();
+        }
+        self.midi_tail_remaining = self.midi_tail_remaining.saturating_sub(n);
         self.midi_flush = false;
         self.send_garbage();
         self.pending_len = n;
@@ -550,6 +561,7 @@ impl AudioState {
         }
         let channels = channels.max(1);
         let monitoring = self.midi_input.is_some()
+            || self.midi_tail_remaining > 0
             || self.midi_flush
             || (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm));
         if !self.playing && !monitoring {
@@ -635,6 +647,8 @@ struct Side {
     shadow: HashMap<(TrackId, usize), (String, usize, bool)>,
     /// Session sample rate the instances were prepared for.
     rate: f32,
+    midi_target: Option<TrackId>,
+    live_keys: HashMap<(TrackId, usize), (String, usize, Option<Vec<u8>>, Option<soundcraft_model::SourceId>, usize)>,
     /// Editor handles of the live instances.
     editors: HashMap<(TrackId, usize), Box<dyn PluginEditor>>,
     /// State readers of the live instances.
@@ -648,7 +662,17 @@ struct Side {
 
 impl Side {
     fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
-        Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
+        Side {
+            shadow: HashMap::new(),
+            live_keys: HashMap::new(),
+            midi_target: None,
+            rate,
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+            refused: HashSet::new(),
+            garbage,
+            old_sessions: None,
+        }
     }
 
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
@@ -671,7 +695,18 @@ impl Side {
         let _ = tx.send(Cmd::OldSessions(otx));
     }
 
+    fn validate_midi_target(&mut self) -> bool {
+        let invalid = self
+            .midi_target
+            .is_some_and(|target| !self.shadow.get(&(target, soundcraft_mix::LIVE_INSTRUMENT_SLOT)).is_some_and(|(_, _, ready)| *ready));
+        if invalid {
+            self.midi_target = None;
+        }
+        invalid
+    }
+
     fn forget(&mut self, key: (TrackId, usize)) {
+        self.live_keys.remove(&key);
         self.shadow.remove(&key);
         self.states.remove(&key);
         self.refused.remove(&key);
@@ -763,6 +798,13 @@ impl Drop for Player {
 }
 
 impl Player {
+    /// Control-side status when a session edit invalidated the monitored instrument lane.
+    pub fn midi_thru_error(&self) -> Option<&'static str> {
+        self.shared
+            .midi_source_failed
+            .load(Ordering::Acquire)
+            .then_some("Live MIDI disconnected: the selected instrument failed, was removed, is unsupported, or exceeds the 32-lane limit")
+    }
     /// Attach a native MIDI queue; its hardware connection stays on the control thread.
     /// Admission is lifetime-bounded so replaced queues are never freed in an audio callback.
     pub fn attach_midi_input(
@@ -774,21 +816,35 @@ impl Player {
         if channel.is_some_and(|c| c > 15) {
             return Err(midi_devices::MidiIoError::InvalidChannel);
         }
+        if !self.side().shadow.get(&(target, soundcraft_mix::LIVE_INSTRUMENT_SLOT)).is_some_and(|(_, _, ready)| *ready) {
+            return Err(midi_devices::MidiIoError::LiveInstrumentUnavailable);
+        }
         self.shared
             .midi_connections
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 16).then_some(n + 1))
             .map_err(|_| midi_devices::MidiIoError::ConnectionLimit)?;
-        self.tx.send(Cmd::MidiAttach(receiver, target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)
+        self.tx.send(Cmd::MidiAttach(receiver, target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)?;
+        self.side().midi_target = Some(target);
+        self.shared.midi_source_failed.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn set_midi_thru_target(&self, target: TrackId, channel: Option<u8>) -> Result<(), midi_devices::MidiIoError> {
         if channel.is_some_and(|c| c > 15) {
             return Err(midi_devices::MidiIoError::InvalidChannel);
         }
-        self.tx.send(Cmd::MidiRoute(target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)
+        if !self.side().shadow.get(&(target, soundcraft_mix::LIVE_INSTRUMENT_SLOT)).is_some_and(|(_, _, ready)| *ready) {
+            return Err(midi_devices::MidiIoError::LiveInstrumentUnavailable);
+        }
+        self.tx.send(Cmd::MidiRoute(target, channel)).map_err(|_| midi_devices::MidiIoError::Disconnected)?;
+        self.side().midi_target = Some(target);
+        self.shared.midi_source_failed.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn detach_midi_input(&self) {
+        self.side().midi_target = None;
+        self.shared.midi_source_failed.store(false, Ordering::Release);
         let _ = self.tx.send(Cmd::MidiDetach);
     }
 
@@ -833,6 +889,7 @@ impl Player {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1017,8 +1074,16 @@ impl Player {
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
     pub fn update_session(&self, s: Arc<Session>) {
         *self.source_session.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&s);
-        let instances = self.side().prepare(&s);
+        let mut side = self.side();
+        let instances = side.prepare(&s);
+        let invalid = side.validate_midi_target();
+        drop(side);
         let _ = self.tx.send(Cmd::Session(s, instances));
+        if invalid {
+            self.shared.midi_source_failed.store(true, Ordering::Release);
+            let _ = self.tx.send(Cmd::MidiDetach);
+            log::warn!("Live MIDI disconnected: selected instrument lane is no longer available");
+        }
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.
@@ -1221,7 +1286,11 @@ fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
 
 impl Side {
     fn capture_states(&mut self) -> PluginStates {
-        self.states.iter_mut().filter(|(k, _)| !self.refused.contains(*k)).filter_map(|(&(t, slot), r)| Some((t, slot, r.save_state()?))).collect()
+        self.states
+            .iter_mut()
+            .filter(|(k, _)| k.1 != soundcraft_mix::LIVE_INSTRUMENT_SLOT && !self.refused.contains(*k))
+            .filter_map(|(&(t, slot), r)| Some((t, slot, r.save_state()?)))
+            .collect()
     }
 
     fn open_editor(&mut self, key: (TrackId, usize)) -> Result<(), String> {
@@ -1241,29 +1310,51 @@ impl Side {
             for k in keys {
                 self.forget(k);
             }
+            self.live_keys.clear();
             self.rate = sr;
         }
         let specs = soundcraft_mix::instance_specs(s);
         let stale: Vec<(TrackId, usize)> = self.shadow.keys().filter(|k| !specs.iter().any(|x| (x.track, x.slot) == **k)).copied().collect();
         for k in stale {
             self.forget(k);
+            if k.1 == soundcraft_mix::LIVE_INSTRUMENT_SLOT {
+                self.live_keys.remove(&k);
+            }
         }
         let mut out = Vec::new();
         for spec in specs {
             let key = (spec.track, spec.slot);
-            if self.shadow.get(&key).is_some_and(|(id, ch, _)| *id == spec.id && *ch == spec.ch) {
+            let is_live = spec.slot == soundcraft_mix::LIVE_INSTRUMENT_SLOT;
+            let sample = s.track(spec.track).and_then(|t| t.instrument.as_ref()).and_then(|i| i.sample);
+            let sample_identity = sample.and_then(|id| s.pool.get(id)).map_or(0, |a| Arc::as_ptr(a) as usize);
+            let live_key = (spec.id.clone(), spec.ch, spec.state.clone(), sample, sample_identity);
+            if self.shadow.get(&key).is_some_and(|(id, ch, _)| *id == spec.id && *ch == spec.ch)
+                && (!matches!(spec.slot, soundcraft_mix::LIVE_INSTRUMENT_SLOT | soundcraft_mix::INSTRUMENT_SLOT)
+                    || self.live_keys.get(&key) == Some(&live_key))
+            {
                 continue;
             }
             self.forget(key);
-            let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch);
+            if matches!(spec.slot, soundcraft_mix::LIVE_INSTRUMENT_SLOT | soundcraft_mix::INSTRUMENT_SLOT) {
+                self.live_keys.insert(key, live_key);
+            }
+            let made = if is_live {
+                let snapshot = self.states.get_mut(&(spec.track, soundcraft_mix::INSTRUMENT_SLOT)).and_then(|r| r.save_state());
+                s.track(spec.track)
+                    .and_then(|t| soundcraft_mix::create_live_instance(s, t, snapshot.as_deref().or(spec.state.as_deref()), sr, BLOCK, spec.ch))
+            } else {
+                soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch)
+            };
             log::debug!("plugin instance for {:?} slot {}: {} ({} ch, created: {})", spec.track, spec.slot, spec.id, spec.ch, made.is_some());
             self.shadow.insert(key, (spec.id.clone(), spec.ch, made.is_some()));
             if let Some(soundcraft_mix::NewInstance { mut plugin, refused_state }) = made {
-                if let Some(e) = plugin.editor() {
-                    self.editors.insert(key, e);
-                }
-                if let Some(r) = plugin.state_reader() {
-                    self.states.insert(key, r);
+                if !is_live {
+                    if let Some(e) = plugin.editor() {
+                        self.editors.insert(key, e);
+                    }
+                    if let Some(r) = plugin.state_reader() {
+                        self.states.insert(key, r);
+                    }
                 }
                 if refused_state {
                     self.refused.insert(key);
@@ -1445,11 +1536,61 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
 mod tests {
     use super::*;
 
+    #[test]
+    fn builtin_lane_handoff_is_control_prepared_bounded_and_retired() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = Session::default();
+        let target = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(target).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+        let mut side = Side::new(48_000.0, channel().1);
+        let prepared = side.prepare(&s);
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared.iter().any(|p| p.slot == soundcraft_mix::LIVE_INSTRUMENT_SLOT));
+        assert!(side.prepare(&s).is_empty());
+        side.midi_target = Some(target);
+        assert!(!side.validate_midi_target());
+        assert!(!side.states.contains_key(&(target, soundcraft_mix::LIVE_INSTRUMENT_SLOT)));
+        assert!(!side.editors.contains_key(&(target, soundcraft_mix::LIVE_INSTRUMENT_SLOT)));
+        s.track_mut(target).unwrap().instrument = None;
+        assert!(side.prepare(&s).is_empty());
+        assert!(side.live_keys.is_empty());
+        assert!(side.shadow.is_empty());
+        assert!(side.validate_midi_target());
+        assert!(side.midi_target.is_none());
+        for _ in 0..=soundcraft_mix::MAX_LIVE_INSTRUMENTS {
+            let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+            s.track_mut(t).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+        }
+        let specs = soundcraft_mix::instance_specs(&s);
+        assert_eq!(specs.iter().filter(|p| p.slot == soundcraft_mix::LIVE_INSTRUMENT_SLOT).count(), soundcraft_mix::MAX_LIVE_INSTRUMENTS);
+        assert!(!soundcraft_mix::live_instrument_supported("clap:test.instrument"));
+    }
+
+    #[test]
+    fn same_id_sample_replacement_reprepares_both_control_owned_lanes() {
+        use soundcraft_model::{ChannelFormat, Insert, SourceAudio, SourceId, TrackKind};
+        let mut s = Session::default();
+        let target = s.add_track(TrackKind::Instrument, ChannelFormat::Mono, None);
+        let source = SourceId(91);
+        let audio = |value| Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![value; 1024]] }));
+        s.pool.insert(source, audio(0.2));
+        let mut ins = Insert::new("sampler");
+        ins.sample = Some(source);
+        s.track_mut(target).unwrap().instrument = Some(ins);
+        let mut side = Side::new(48_000.0, channel().1);
+        assert_eq!(side.prepare(&s).len(), 2);
+        assert!(side.prepare(&s).is_empty());
+        s.pool.insert(source, audio(0.6));
+        assert_eq!(side.prepare(&s).len(), 2, "same source ID with a new shared audio handle must refresh both instances");
+        assert!(side.prepare(&s).is_empty());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn control_test_state() -> (Sender<Cmd>, Arc<Shared>, AudioState) {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(1),
             starting: AtomicU64::new(1),
             position: AtomicI64::new(0),
@@ -1473,7 +1614,8 @@ mod tests {
         session.track_mut(audio).unwrap().mixer.input_monitor = true;
         let synth = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
         session.track_mut(synth).unwrap().instrument = Some(Insert::new("subtractive_synth"));
-        tx.send(Cmd::Session(Arc::new(session), Vec::new())).unwrap();
+        let prepared = Side::new(48_000.0, channel().1).prepare(&session);
+        tx.send(Cmd::Session(Arc::new(session), prepared)).unwrap();
         let ring = record::InputRing::new(1, 48_000);
         tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
         let (mut sender, receiver) = midi_devices::input_queue(16).unwrap();
@@ -1506,7 +1648,9 @@ mod tests {
         state.fill(&mut output, 2);
         assert!(output.iter().any(|x| x.abs() > 0.1), "intentional resume accepts fresh input");
         ring.discard_pending();
-        for _ in 0..4 { state.fill(&mut output, 2); }
+        for _ in 0..4 {
+            state.fill(&mut output, 2);
+        }
         assert!(output.iter().all(|x| *x == 0.0), "fresh MIDI test requires silence after input/pending audio drains");
         sender.try_send(event).unwrap();
         state.fill(&mut output, 2);
@@ -1547,7 +1691,8 @@ mod tests {
         let mut session = Session::default();
         let target = session.add_track(soundcraft_model::TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, None);
         session.track_mut(target).unwrap().instrument = Some(soundcraft_model::Insert::new("subtractive_synth"));
-        tx.send(Cmd::Session(Arc::new(session), Vec::new())).unwrap();
+        let prepared = Side::new(48_000.0, channel().1).prepare(&session);
+        tx.send(Cmd::Session(Arc::new(session), prepared)).unwrap();
         let (mut sender, receiver) = midi_devices::input_queue(16).unwrap();
         tx.send(Cmd::MidiAttach(receiver, target, Some(2))).unwrap();
         let event =
@@ -1704,6 +1849,7 @@ mod tests {
         let shared = Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1749,6 +1895,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1771,6 +1918,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1799,6 +1947,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1878,6 +2027,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -1922,6 +2072,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -2018,6 +2169,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -2051,6 +2203,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),
@@ -2090,6 +2243,7 @@ mod tests {
             let shared = Arc::new(Shared {
                 clock: duplex::MasterClock::new(),
                 midi_connections: AtomicU32::new(0),
+                midi_source_failed: AtomicBool::new(false),
                 transport_generation: AtomicU64::new(0),
                 starting: AtomicU64::new(0),
                 position: AtomicI64::new(0),
@@ -2124,6 +2278,7 @@ mod tests {
         let shared = Arc::new(Shared {
             clock: duplex::MasterClock::new(),
             midi_connections: AtomicU32::new(0),
+            midi_source_failed: AtomicBool::new(false),
             transport_generation: AtomicU64::new(0),
             starting: AtomicU64::new(0),
             position: AtomicI64::new(0),

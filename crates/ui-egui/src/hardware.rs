@@ -114,6 +114,15 @@ pub(crate) fn command(app: &mut SoundApp, id: &str, params: &Value) -> Option<Re
 
 pub(crate) fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.hardware);
+    // Close the hardware connection on this UI thread after the player rejects a
+    // removed or unavailable destination; do not leave a stale "Monitoring" status.
+    if state.connection.is_some()
+        && let Some(reason) = app.player.as_ref().and_then(|player| player.midi_thru_error())
+    {
+        drop(state.connection.take());
+        state.status = format!("MIDI Thru stopped: {reason}");
+        app.ui.status = state.status.clone();
+    }
     let mut midi_open = state.midi_open;
     egui::Window::new("MIDI Thru").open(&mut midi_open).default_width(410.0).show(ctx, |ui| {
         ui.label("Play a MIDI keyboard through an instrument track, with the transport stopped or playing.");

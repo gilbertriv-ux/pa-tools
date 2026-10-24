@@ -202,6 +202,11 @@ pub trait Plugin: Send {
     fn param(&self, id: &str) -> Option<f32>;
     /// In-place processing of `channels` planar buffers each `frames` long.
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
+    /// A wrapper contained a processing failure in its private workspace. Hosts may retire
+    /// only that source without contaminating healthy audio already present in the output.
+    fn processing_failed(&self) -> bool {
+        false
+    }
     /// Processing latency in samples (for delay compensation).
     fn latency(&self) -> usize {
         0
