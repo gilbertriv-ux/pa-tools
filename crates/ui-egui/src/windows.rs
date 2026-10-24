@@ -548,6 +548,13 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         if crate::widgets::checkbox(ui, &mut dc, "Delay compensation").changed() {
             let _ = app.run("options.delay_compensation", json!({"value": dc}));
         }
+        let mut comp = app.ui.compensate_latency;
+        if crate::widgets::checkbox(ui, &mut comp, "Compensate record latency").changed() {
+            let _ = app.run(crate::hardware::COMPENSATION, json!({"value": comp}));
+        }
+        ui.label(
+            egui::RichText::new("Moves each finished take earlier by the measured round-trip latency. Off by default.").small().color(t.text_dim),
+        );
         if ui.button("Reconnect audio device").clicked() {
             app.reconnect_audio();
         }

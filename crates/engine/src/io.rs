@@ -1427,14 +1427,21 @@ pub struct Take {
 
 /// Place recorded take files as `plan` says, as one undo step ("Record").
 pub fn place_recording(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>) -> Vec<soundcraft_model::ClipId> {
-    add_recording_in(e, plan.start, takes, plan.pass, plan.punch)
+    add_recording_in(e, plan.start, takes, plan.pass, plan.punch, 0)
+}
+
+/// [`place_recording`] for latency-compensated takes: `plan.start` is already moved earlier, and
+/// `trim` frames (the part of the shift that would have gone before 0) are cut from the head of
+/// each take so the audio still lines up. A negative `trim` counts as 0.
+pub fn place_recording_trimmed(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>, trim: i64) -> Vec<soundcraft_model::ClipId> {
+    add_recording_in(e, plan.start, takes, plan.pass, plan.punch, trim)
 }
 
 /// Turn recorded take files into clips at `start`, as one undo step ("Record"); each file is the
 /// source of its clips. With `pass` (loop recording), a take becomes one clip per pass (at most
 /// 1000), each pass after the first on a new playlist.
 pub fn add_recording(e: &mut Engine, start: Samples, takes: Vec<(TrackId, PathBuf)>, pass: Option<Samples>) -> Vec<soundcraft_model::ClipId> {
-    add_recording_in(e, start, takes, pass, None)
+    add_recording_in(e, start, takes, pass, None, 0)
 }
 
 /// [`add_recording`] limited to the `punch` range: each clip is cut to it before it's placed, so
@@ -1445,6 +1452,7 @@ fn add_recording_in(
     takes: Vec<(TrackId, PathBuf)>,
     pass: Option<Samples>,
     punch: Option<Range>,
+    trim: i64,
 ) -> Vec<soundcraft_model::ClipId> {
     let before = e.session_arc();
     let mut out = Vec::new();
@@ -1461,7 +1469,9 @@ fn add_recording_in(
         let src = add_source(s, name, buf, Some(&path.to_string_lossy()), FileFormat::Wav);
         let Some(x) = s.sources.last_mut() else { continue };
         x.unsaved = resampled;
-        let len = i64::try_from(x.frames).unwrap_or(0);
+        // Frames cut from the head of the take (latency compensation); the rest is placed as usual.
+        let head = trim.clamp(0, i64::try_from(x.frames).unwrap_or(0));
+        let len = i64::try_from(x.frames).unwrap_or(0).saturating_sub(head);
         let pass = pass.unwrap_or(len).max(1);
         for offset in (0..len).step_by(usize::try_from(pass).unwrap_or(usize::MAX)).take(1_000) {
             let n = pass.min(len - offset);
@@ -1482,7 +1492,7 @@ fn add_recording_in(
                 t.active_playlist = t.playlists.len() - 1;
             }
             let cid = s.new_clip_id();
-            crate::edit::place_clip(s, tid, Clip::audio(cid, name, src, offset.saturating_add(cut), clip_start, clip_len));
+            crate::edit::place_clip(s, tid, Clip::audio(cid, name, src, head.saturating_add(offset).saturating_add(cut), clip_start, clip_len));
             out.push(cid);
         }
     }
@@ -1561,6 +1571,30 @@ mod record_tests {
         assert_eq!((t.active_playlist, t.playlists[2].name.as_str()), (2, "Vox.03"));
         e.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compensated_take_cuts_the_part_that_would_start_before_zero() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut e = Engine::default();
+        let vox = armed(&mut e, "Vox", "mono", "In 1");
+        let take = dir.join("Audio Files/Take.wav");
+        write_take(&take, 1_000);
+        let plan = Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: vec![Take { track: vox, path: take.clone(), channels: 1 }] };
+        place_recording_trimmed(&mut e, &plan, vec![(vox, take.clone())], 300);
+        let clips: Vec<_> = e.session().track(vox).unwrap().clips().iter().map(|c| (c.start, c.length, c.source_offset())).collect();
+        assert_eq!(clips, vec![(0, 700, 300)]);
+        // Hostile trims: negative counts as 0, more than the take leaves nothing to place.
+        let mut e = Engine::default();
+        let vox = armed(&mut e, "Vox", "mono", "In 1");
+        place_recording_trimmed(&mut e, &plan, vec![(vox, take.clone())], -5);
+        assert_eq!(e.session().track(vox).unwrap().clips()[0].length, 1_000);
+        let mut e = Engine::default();
+        let vox = armed(&mut e, "Vox", "mono", "In 1");
+        place_recording_trimmed(&mut e, &plan, vec![(vox, take)], i64::MAX);
+        assert!(e.session().track(vox).unwrap().clips().iter().all(|c| c.length >= 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

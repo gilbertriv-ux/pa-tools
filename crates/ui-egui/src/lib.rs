@@ -12,6 +12,7 @@ pub mod docking;
 pub mod edit_window;
 pub mod extra_windows;
 pub mod fonts;
+pub mod hardware;
 pub mod icons;
 pub mod menus;
 pub mod midi_editor;
@@ -99,6 +100,9 @@ pub struct UiState {
     pub show_playback_engine: bool,
     /// The audio device choice (Setup › Playback Engine), kept with the preferences: per machine.
     pub audio: soundcraft_playback::AudioConfig,
+    /// Setup › Playback Engine › Compensate record latency: finished takes are moved earlier by the
+    /// measured round-trip latency. Per machine; off by default.
+    pub compensate_latency: bool,
     /// The Mix window lives in its own native window (Window › Mix in Separate Window); the main
     /// window then always shows Edit.
     pub mix_separate: bool,
@@ -165,6 +169,7 @@ impl Default for UiState {
             show_configurations: false,
             show_playback_engine: false,
             audio: soundcraft_playback::AudioConfig::default(),
+            compensate_latency: false,
             mix_separate: false,
             show_io_setup: false,
             show_shortcuts: false,
@@ -933,7 +938,18 @@ impl SoundApp {
         });
         self.punch = None;
         self.autosaved_rev = 0;
-        let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
+        // Latency compensation (preference, off by default): the take moves earlier by the measured
+        // round trip; what would fall before 0 is trimmed from its head so it still lines up.
+        let (plan, trim) = {
+            let enabled = self.ui.compensate_latency;
+            let out = self.player.as_ref().filter(|p| !p.silent).map_or((0, 0), |p| (p.output_latency_frames(), p.device_rate));
+            let offset = self.recorder.as_ref().map_or(0, |r| {
+                hardware::record_offset(r.input_latency_frames(), r.sample_rate, out.0, out.1, self.engine.session().sample_rate.hz())
+            });
+            let (start, trim) = hardware::compensate(enabled, plan.start, offset);
+            (soundcraft_engine::io::Recording { start, ..plan }, trim)
+        };
+        let ids = soundcraft_engine::io::place_recording_trimmed(&mut self.engine, &plan, takes, trim);
         self.ui.status =
             if plan.pass.is_some() { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
         if let Some(p) = problem {

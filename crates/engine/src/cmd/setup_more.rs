@@ -104,7 +104,7 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"enabled": s.edit.flag("midi.beat_clock"), "offset": s.edit.value("midi.beat_clock.offset", 0.0), "destination": text(&s.edit, "midi.beat_clock.destination")}))
         }),
         cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — filtered kinds are not recorded", always, midi_filter),
-        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]}", always, midi_inputs),
+        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]} — returns {enabled, available}: `available` lists the MIDI input ports the system offers", always, midi_inputs),
         cmd!(noundo "setup.transcription_settings", "Transcription Settings...", ["Setup"], None, "{enabled?: bool, language?: 'en'}", always, |e, p| {
             let s = e.session_mut();
             if let Some(v) = p.get("enabled").and_then(Value::as_bool) {
@@ -399,7 +399,8 @@ fn midi_inputs(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     let enabled: Vec<&str> = s.edit.flags.iter().filter_map(|f| f.strip_prefix("midi.input.")).collect();
-    Ok(json!({"enabled": enabled}))
+    // The real input ports (empty without hardware), so a caller can pick names that exist.
+    Ok(json!({"enabled": enabled, "available": super::hardware::input_port_names()}))
 }
 
 fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -579,6 +580,7 @@ mod tests {
         assert_eq!(r["filtered"], json!(["sysex"]));
         let r = e.execute("setup.midi_input_devices", &json!({"enable": ["Keys"]})).unwrap();
         assert_eq!(r["enabled"], json!(["Keys"]));
+        assert!(r["available"].is_array(), "real ports are listed (empty without hardware)");
         let r = e.execute("setup.video_sync_offset", &json!({"frames": 2})).unwrap();
         assert_eq!(r["samples"], 3200.0);
     }

@@ -17,6 +17,7 @@ mod edit_more;
 mod event;
 mod event_more;
 mod file;
+mod hardware;
 mod health;
 mod instrument;
 mod midi;
@@ -136,6 +137,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(sampler::specs());
         v.extend(video::specs());
         v.extend(zoom_toggle::specs());
+        v.extend(hardware::specs());
         v
     })
 }

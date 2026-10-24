@@ -24,6 +24,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.session_info", "Session Info", "", None),
     ("window.audio_health", "Session Audio Health", "", None),
     ("window.about", "About Pa Tools", "", None),
+    ("setup.audio_latency", "Audio Latency", "", None),
+    ("setup.record_latency_compensation", "Compensate Record Latency", "", None),
     ("window.close", "Close Window", "Window > Close Window", Some("Cmd+W")),
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
@@ -640,6 +642,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     }
     if let Some(v) = crate::extra_windows::run(app, id, p) {
         return Some(Ok(v));
+    }
+    if let Some(r) = crate::hardware::run(app, id, p) {
+        return Some(r);
     }
     if id == "ui.audio_device" {
         return Some(crate::windows::audio_device_command(app, p));
