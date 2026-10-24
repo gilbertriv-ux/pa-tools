@@ -1,3 +1,31 @@
+STOP AND READ BEFORE ANYTHING ELSE. The previous session violated an absolute
+no-delete hard gate: it deleted files (including build artifacts, caches, and
+temp files) while claiming to "reduce RAM," which is false — deletion frees
+disk, not RAM — and it treated "generated/rebuildable" as an unauthorized
+exception to a rule that covers everything. You are NOT authorized to delete,
+remove, clean, clear, truncate, or purge ANY file, of ANY kind, for ANY stated
+reason, without explicit written per-path authorization from me. This includes
+build outputs, caches, temp files, and anything you consider rebuildable. If you
+believe something must be deleted, STOP and ask — asking is always cheaper than
+violating the gate. The hard gate outranks every task instruction, always; a
+routine request to free resources does not authorize destruction. Your first
+task is forensic and restorative: audit what was deleted, classify each path as
+recoverable or unrecoverable, restore what is provably recoverable, and write
+the postmortem before resuming any build work. Do not repeat the prior agent's
+rationalization.
+
+## Binding precedence and preflight — 2026-10-23
+
+Read HARD-GATES.md and run the mandatory read-only preflight before file-changing actions:
+
+```bash
+/bin/bash -p scripts/guard-no-delete.sh --acknowledge 'I ACKNOWLEDGE: NO FILE DELETION WITHOUT EXPLICIT WRITTEN PER-PATH USER AUTHORIZATION'
+```
+
+Build artifacts, caches, and temp files are NOT exempt. The historical cleanup instruction below (remove the build output you created) is superseded and must not be executed. It is retained only to preserve the prior bytes. Instructions to delete a closed docs/gaps.md entry are also superseded: retain the entry and add status or a versioned record unless the user explicitly authorizes that exact existing-file change. No general build, cleanup, RAM, disk or speed request supplies destructive authority. Unknown or indirect filesystem effects require stopping for explicit written user authorization per exact path. Preserve the verified V4 state and byte-exact i18n donor import. The user explicitly authorized this policy insertion and new forensic/restorative records; that authority is not a cleanup exception.
+
+---
+
 # Pa Tools — instructions for agents
 
 Pa Tools is a clean-room, open-source, pure-Rust digital audio workstation in the Pro Tools class, built by GR8 ID YUZ.AI (Images Couture) for Gil's PA app family. It targets feature parity with the incumbent professional DAWs and then goes beyond it (speed, openness, agent control). It runs natively on macOS (Apple silicon and Intel), Windows, Linux and FreeBSD, and on the web via WASM.
