@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Pa Tools hardware update 2026-10-24</title>
+<style>body{font:13px/1.5 -apple-system,Helvetica,Arial,sans-serif;max-width:760px;margin:24px auto;color:#111}h1{font-size:22px}h2{font-size:16px;margin-top:22px;border-bottom:1px solid #ccc}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f2f2f2}.ok{color:#0a6b2a;font-weight:600}.no{color:#a11;font-weight:600}code{background:#f3f3f3;padding:1px 4px}</style></head><body>
+<h1>Pa Tools hardware update</h1>
+<p><b>Date:</b> 2026-10-24 &nbsp; <b>Branch:</b> <code>claude/hardware-m1</code> (pushed, head 1e009b4) &nbsp; <b>Base:</b> <code>pa-tools</code> d1c5e6f</p>
+<p>Everything below was compiled and tested in a Linux cloud container with no audio or MIDI hardware. Nothing has been run against a real interface, keyboard or AAF file. Test results were re-run by the coordinator, not only reported by agents.</p>
+<h2>What landed (5 commits)</h2>
+<table><tr><th>Gap</th><th>Delivered</th><th>Not done</th></tr>
+<tr><td>G-01 audio interface</td><td>Latency math and measurement from stream timestamps; Player/Recorder latency accessors; opt-in record-latency compensation applied when a take becomes a clip (default off); Setup checkbox; command <code>setup.audio_latency</code></td><td>True duplex on one clock (cpal does not offer it); channel routing / I/O mapping; record-to-disk (G-06); ASIO in official builds; any real-device test</td></tr>
+<tr><td>G-02 MIDI devices</td><td>Port listing, live input (non-blocking bounded queue, drop counting) and output via the MIT <code>midir</code> crate, no unsafe; strict message parser; tick conversion; pure MIDI take recorder producing <code>soundcraft-midi</code> sequences; command <code>setup.midi_ports</code></td><td>Recorder is not connected to the transport or armed tracks; no live monitoring/thru; no clock/MTC; no real-port test</td></tr>
+<tr><td>G-03 session interchange</td><td>New crate <code>soundcraft-interchange</code>: hostile-input-safe Compound File reader and AAF identification, 12 tests</td><td>AAF composition parsing, import into sessions, export, OMF. No real AAF sample was available, so AAF structure details are unverified</td></tr></table>
+<h2>Verification (coordinator run)</h2>
+<table><tr><th>Check</th><th>Result</th></tr>
+<tr><td>cargo fmt --check</td><td class="ok">clean</td></tr>
+<tr><td>clippy -D warnings (playback, engine, ui-egui, interchange)</td><td class="ok">clean</td></tr>
+<tr><td>Tests: playback 73, engine 261+, interchange 12</td><td class="ok">pass</td></tr>
+<tr><td>cargo xtask layers</td><td class="ok">ok</td></tr>
+<tr><td>UI crate tests</td><td>Agent reported 121 lib tests pass; <code>theme_docking</code> cannot run here (no GPU); one recovery test was flaky once. Not independently re-run</td></tr>
+<tr><td>cargo xtask assets</td><td class="no">fails on two existing docs images missing from ATTRIBUTION.md (not caused by this work)</td></tr>
+<tr><td>Real hardware</td><td class="no">none available; all device paths unverified</td></tr></table>
+<h2>Corrections to earlier planning</h2>
+<ul><li>The earlier handover proposed hand-written CoreMIDI/WinMM/ALSA unsafe bindings. AGENTS.md forbids unsafe outside three plugin-host crates, so <code>midir</code> was used instead.</li>
+<li>Earlier hour estimates and cost figures were not measured and should be disregarded.</li></ul>
+<h2>Next work (needs real hardware or samples)</h2>
+<ol><li>Test latency and MIDI ports on a Mac with a real interface and keyboard.</li><li>Connect MidiTake to armed MIDI tracks and the transport.</li><li>Obtain real AAF files, then parse compositions and map to sessions.</li><li>Streaming record-to-disk (G-06).</li><li>Channel routing in I/O Setup.</li></ol>
+<p>Rule check: nothing was written to Gil's drives; all work is in the repository.</p></body></html>
