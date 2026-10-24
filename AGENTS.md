@@ -6,7 +6,7 @@ It is a fork of SoundCraft (storytold/soundcraft, MIT OR Apache-2.0, fork point 
 
 ## Start every session here
 1. Read this file, `ROADMAP.md` (stage, status, parity numbers) and `docs/gaps.md` (the ranked list of what is missing). Pick work from the gaps. The assessment docs are `docs/target-app-parity.md`, `docs/roadmap.md`, `docs/ui-parity.md`, `docs/file-format-parity.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md` and `docs/localization-parity.md`; `docs/parity-checklist.md` is generated. Update a doc's timestamp and revision history when you change it.
-2. Keep to the main work. Work autonomously and don't stop to ask unless a decision is genuinely Gil's.
+2. Keep to the main work. Work autonomously and don't stop to ask unless a decision is genuinely Gil's. **Always Be Building:** never sit idle with authorized work queued; the instant one task lands, verify/commit it and launch the next. Concurrency is bounded by physical reality — no two agents editing the same file, no two full `cargo` builds on one ~30 GB disk. See [`docs/AGENT-OPERATING-PRINCIPLES.md`](docs/AGENT-OPERATING-PRINCIPLES.md).
 3. After merging upstream or adding user-visible text, run `./rebrand.sh` and check the leftovers it prints.
 
 ## Gil's hard gates
