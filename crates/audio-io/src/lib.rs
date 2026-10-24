@@ -21,11 +21,13 @@ mod flac;
 mod mp4;
 mod pcm;
 pub mod peaks;
+pub mod stream;
 mod symph;
 mod wav;
 
 pub use buffer::AudioBuffer;
 use std::io::{Seek, Write};
+pub use stream::StreamReader;
 
 /// Errors from probing, decoding and encoding.
 #[derive(Debug, thiserror::Error)]

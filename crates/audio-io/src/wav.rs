@@ -232,7 +232,27 @@ pub(crate) fn parse(b: &[u8]) -> Result<WavParse> {
         return Err(AudioError::Malformed("WAV declares a zero sample rate".into()));
     }
     let channels = usize::from(fmt.channels);
-    let (kind, sample_format) = match (fmt.tag, fmt.bits) {
+    let (kind, sample_format) = match pcm_kind(&fmt)? {
+        Some(ks) => ks,
+        None => return Ok(WavParse::Foreign { bwf }),
+    };
+    let block = kind.bytes().checked_mul(channels).ok_or_else(|| AudioError::Malformed("block size overflow".into()))?;
+    if usize::from(fmt.block_align) != block {
+        log::debug!("WAV block_align {} disagrees with computed {block}; using computed", fmt.block_align);
+    }
+    let (data_start, data_len) = data.ok_or_else(|| AudioError::Malformed("WAV has no data chunk".into()))?;
+    let frames = (data_len / block) as u64;
+    Ok(WavParse::Native(WavLayout {
+        info: AudioInfo { format: FileFormat::Wav, sample_format, sample_rate: fmt.sample_rate, channels: fmt.channels, frames, bwf },
+        kind,
+        data_start,
+        data_len,
+    }))
+}
+
+/// The native PCM layout of a parsed `fmt ` chunk, or `None` for a codec symphonia must handle.
+fn pcm_kind(fmt: &Fmt) -> Result<Option<(PcmKind, SampleFormat)>> {
+    Ok(Some(match (fmt.tag, fmt.bits) {
         (WAVE_FORMAT_PCM, bits @ 1..=32) => {
             let bytes = usize::from(bits.div_ceil(8));
             let sf = match fmt.valid_bits.min(bits) {
@@ -248,20 +268,76 @@ pub(crate) fn parse(b: &[u8]) -> Result<WavParse> {
         (WAVE_FORMAT_PCM | WAVE_FORMAT_IEEE_FLOAT, bits) => {
             return Err(AudioError::Unsupported(format!("WAV format {} with {bits} bits per sample", fmt.tag)));
         }
-        _ => return Ok(WavParse::Foreign { bwf }),
-    };
-    let block = kind.bytes().checked_mul(channels).ok_or_else(|| AudioError::Malformed("block size overflow".into()))?;
-    if usize::from(fmt.block_align) != block {
-        log::debug!("WAV block_align {} disagrees with computed {block}; using computed", fmt.block_align);
-    }
-    let (data_start, data_len) = data.ok_or_else(|| AudioError::Malformed("WAV has no data chunk".into()))?;
-    let frames = (data_len / block) as u64;
-    Ok(WavParse::Native(WavLayout {
-        info: AudioInfo { format: FileFormat::Wav, sample_format, sample_rate: fmt.sample_rate, channels: fmt.channels, frames, bwf },
-        kind,
-        data_start,
-        data_len,
+        _ => return Ok(None),
     }))
+}
+
+/// Parse only the header (the `fmt ` and `data` chunks) from a header prefix `b`, computing the
+/// data length from the real file length `file_len` rather than from the prefix. Returns `None`
+/// for a valid WAV whose codec cannot be streamed natively (handed to symphonia on a full decode).
+/// Reuses the same chunk walk and helpers as [`parse`].
+pub(crate) fn stream_layout(b: &[u8], file_len: u64) -> Result<Option<crate::stream::NativeLayout>> {
+    if !is_wav(b) {
+        return Err(AudioError::Malformed("not a RIFF/RF64 WAVE file".into()));
+    }
+    let is_rf64 = tag(b, 0).is_some_and(|t| &t != b"RIFF");
+    let mut ds64_data: Option<u64> = None;
+    let mut fmt: Option<Fmt> = None;
+    let mut data: Option<(u64, u64)> = None; // (data_start, declared_len resolved against the file)
+
+    let mut pos: usize = 12;
+    let mut chunks = 0usize;
+    while let (Some(id), Some(size32)) = (tag(b, pos), le_u32(b, pos + 4)) {
+        chunks += 1;
+        if chunks > 100_000 {
+            break;
+        }
+        let body = pos.checked_add(8).ok_or_else(|| AudioError::Malformed("chunk offset overflow".into()))?;
+        let remaining = b.len().saturating_sub(body);
+        if &id == b"data" {
+            let body64 = body as u64;
+            let avail = file_len.saturating_sub(body64);
+            let declared = if is_rf64 && size32 == u32::MAX {
+                ds64_data.unwrap_or(avail)
+            } else if size32 == 0 && !is_rf64 {
+                avail // an unfinalised recording: audio runs to the end of the file
+            } else {
+                u64::from(size32)
+            };
+            if data.is_none() {
+                data = Some((body64, declared.min(avail)));
+            }
+            // The `fmt ` chunk precedes `data` in every file we can stream; stop once both are in.
+            break;
+        }
+        let declared = usize::try_from(u64::from(size32)).unwrap_or(usize::MAX);
+        if declared > remaining {
+            break; // a truncated non-audio chunk at the end of the prefix
+        }
+        let c = b.get(body..body + declared).unwrap_or_default();
+        match &id {
+            b"fmt " => fmt = Some(parse_fmt(c)?),
+            b"ds64" => ds64_data = le_u64(c, 8),
+            _ => {}
+        }
+        pos = match body.checked_add(declared).and_then(|p| p.checked_add(declared & 1)) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+
+    let fmt = fmt.ok_or_else(|| AudioError::Malformed("WAV has no fmt chunk before its data".into()))?;
+    if fmt.channels == 0 {
+        return Err(AudioError::Malformed("WAV declares zero channels".into()));
+    }
+    if fmt.sample_rate == 0 {
+        return Err(AudioError::Malformed("WAV declares a zero sample rate".into()));
+    }
+    let Some((kind, sample_format)) = pcm_kind(&fmt)? else {
+        return Ok(None);
+    };
+    let (data_start, data_len) = data.ok_or_else(|| AudioError::Malformed("WAV has no data chunk".into()))?;
+    Ok(Some(crate::stream::NativeLayout { sample_format, sample_rate: fmt.sample_rate, channels: fmt.channels, data_start, data_len, kind }))
 }
 
 pub(crate) fn decode(b: &[u8], layout: &WavLayout) -> Result<AudioBuffer> {

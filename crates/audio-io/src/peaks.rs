@@ -153,6 +153,73 @@ impl Peaks {
     }
 }
 
+/// A one-pass builder for [`Peaks`] that never holds the whole channel in memory.
+///
+/// Feed samples with [`PeaksBuilder::push`] / [`PeaksBuilder::push_samples`] (e.g. as a file is
+/// streamed from disk), then [`PeaksBuilder::finish`]. The result is bit-for-bit identical to
+/// [`Peaks::build`] over the same sequence; the builder keeps only the level-0 blocks (one
+/// [`Block`] per [`BLOCK`] samples, far smaller than the samples), plus the in-progress block.
+#[derive(Debug, Clone)]
+pub struct PeaksBuilder {
+    len: usize,
+    level0: Vec<Block>,
+    partial: Block,
+    partial_count: usize,
+}
+
+impl Default for PeaksBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeaksBuilder {
+    /// A fresh builder holding no samples.
+    pub fn new() -> Self {
+        PeaksBuilder { len: 0, level0: Vec::new(), partial: Block::EMPTY, partial_count: 0 }
+    }
+
+    /// Append one sample. NaN counts for nothing in the RMS (as in [`Peaks::build`]).
+    pub fn push(&mut self, s: f32) {
+        self.partial = self.partial.merge(Block::point(s));
+        self.partial_count += 1;
+        self.len += 1;
+        if self.partial_count == BLOCK {
+            self.level0.push(self.partial);
+            self.partial = Block::EMPTY;
+            self.partial_count = 0;
+        }
+    }
+
+    /// Append a run of samples.
+    pub fn push_samples(&mut self, samples: &[f32]) {
+        for &s in samples {
+            self.push(s);
+        }
+    }
+
+    /// Number of samples pushed so far.
+    pub fn len_samples(&self) -> usize {
+        self.len
+    }
+
+    /// Build the multi-resolution overview from everything pushed.
+    pub fn finish(mut self) -> Peaks {
+        if self.len == 0 {
+            return Peaks::default();
+        }
+        if self.partial_count > 0 {
+            self.level0.push(self.partial);
+        }
+        let mut levels = vec![self.level0];
+        while let Some(last) = levels.last().filter(|l| l.len() > 1) {
+            let next = last.chunks(FANOUT).map(|c| c.iter().fold(Block::EMPTY, |a, &b| a.merge(b))).collect();
+            levels.push(next);
+        }
+        Peaks { len: self.len, levels }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +324,31 @@ mod tests {
             let all = spans.iter().flatten().fold((f32::INFINITY, f32::NEG_INFINITY), |a, s| (a.0.min(s.0), a.1.max(s.1)));
             assert_eq!(all, brute(&x, 0, ((cols as f64 * step).floor() as usize + 1).min(10_000)), "step {step}");
         }
+    }
+
+    #[test]
+    fn streaming_builder_matches_build() {
+        for n in [0usize, 1, 7, 31, 32, 33, 127, 128, 129, 1000, 4096, 100_003] {
+            let x = signal(n);
+            let direct = Peaks::build(&x);
+            // One big push.
+            let mut b = PeaksBuilder::new();
+            b.push_samples(&x);
+            let streamed = b.finish();
+            assert_eq!(direct, streamed, "one-shot push, n={n}");
+            // Many small odd-sized pushes (never aligned to BLOCK).
+            let mut b = PeaksBuilder::new();
+            for chunk in x.chunks(7) {
+                b.push_samples(chunk);
+            }
+            assert_eq!(b.len_samples(), n);
+            assert_eq!(direct, b.finish(), "chunked push, n={n}");
+        }
+        // NaN handling matches build().
+        let x = [f32::NAN, 1.0, -0.5, f32::NAN];
+        let mut b = PeaksBuilder::new();
+        b.push_samples(&x);
+        assert_eq!(Peaks::build(&x), b.finish());
     }
 
     #[test]

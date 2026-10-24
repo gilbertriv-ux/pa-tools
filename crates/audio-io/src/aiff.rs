@@ -113,6 +113,24 @@ pub(crate) fn parse(b: &[u8]) -> Result<AiffParse> {
         return Err(AudioError::Malformed(format!("AIFF sample rate {rate} out of range")));
     }
     let sample_rate = rate.round() as u32;
+    let (kind, sample_format) = match aiff_kind(bits, &compression)? {
+        Some(ks) => ks,
+        None => return Ok(AiffParse::Foreign),
+    };
+    let (data_start, data_len) = ssnd.unwrap_or((b.len(), 0));
+    let block = kind.bytes().saturating_mul(channels as usize).max(1);
+    let frames = u64::from(frames).min((data_len / block) as u64);
+    Ok(AiffParse::Native(AiffLayout {
+        info: AudioInfo { format: FileFormat::Aiff, sample_format, sample_rate, channels: channels as u16, frames, bwf: None },
+        kind,
+        data_start,
+        data_len,
+    }))
+}
+
+/// The native PCM layout for an AIFF sample size and compression id, or `None` for a compressed
+/// AIFF-C codec symphonia must handle.
+fn aiff_kind(bits: i16, compression: &[u8; 4]) -> Result<Option<(PcmKind, SampleFormat)>> {
     let int_kind = |big_endian: bool| -> Result<(PcmKind, SampleFormat)> {
         if !(1..=32).contains(&bits) {
             return Err(AudioError::Unsupported(format!("AIFF sample size {bits}")));
@@ -126,22 +144,77 @@ pub(crate) fn parse(b: &[u8]) -> Result<AiffParse> {
         };
         Ok((PcmKind::Int { bytes, big_endian, unsigned: false }, sf))
     };
-    let (kind, sample_format) = match &compression {
+    Ok(Some(match compression {
         b"NONE" | b"twos" => int_kind(true)?,
         b"sowt" => int_kind(false)?,
         b"fl32" | b"FL32" => (PcmKind::Float { bytes: 4, big_endian: true }, SampleFormat::Float32),
         b"fl64" | b"FL64" => (PcmKind::Float { bytes: 8, big_endian: true }, SampleFormat::Float64),
-        _ => return Ok(AiffParse::Foreign),
-    };
-    let (data_start, data_len) = ssnd.unwrap_or((b.len(), 0));
-    let block = kind.bytes().saturating_mul(channels as usize).max(1);
-    let frames = u64::from(frames).min((data_len / block) as u64);
-    Ok(AiffParse::Native(AiffLayout {
-        info: AudioInfo { format: FileFormat::Aiff, sample_format, sample_rate, channels: channels as u16, frames, bwf: None },
-        kind,
-        data_start,
-        data_len,
+        _ => return Ok(None),
     }))
+}
+
+/// Parse only the header (`COMM` and `SSND`) from a header prefix `b`, computing the sample-data
+/// length from the real file length `file_len`. Returns `None` for a compressed AIFF-C. Reuses the
+/// same chunk walk and helpers as [`parse`].
+pub(crate) fn stream_layout(b: &[u8], file_len: u64) -> Result<Option<crate::stream::NativeLayout>> {
+    if !is_aiff(b) {
+        return Err(AudioError::Malformed("not an AIFF/AIFF-C file".into()));
+    }
+    let is_aifc = tag(b, 8).is_some_and(|t| &t == b"AIFC");
+    let mut comm: Option<(i16, i16, f64, [u8; 4])> = None;
+    let mut ssnd: Option<(u64, u64)> = None; // (data_start, declared_len against the file)
+
+    let mut pos: usize = 12;
+    let mut chunks = 0usize;
+    while let (Some(id), Some(size32)) = (tag(b, pos), be_u32(b, pos + 4)) {
+        chunks += 1;
+        if chunks > 100_000 {
+            break;
+        }
+        let body = pos.checked_add(8).ok_or_else(|| AudioError::Malformed("chunk offset overflow".into()))?;
+        let remaining = b.len().saturating_sub(body);
+        let declared = usize::try_from(size32).unwrap_or(usize::MAX);
+        match &id {
+            b"COMM" => {
+                let c = b.get(body..body + declared.min(remaining)).unwrap_or_default();
+                let short = || AudioError::Malformed("COMM chunk too short".into());
+                let channels = be_u16(c, 0).ok_or_else(short)? as i16;
+                let bits = be_u16(c, 6).ok_or_else(short)? as i16;
+                let rate = extended_to_f64(c.get(8..18).ok_or_else(short)?).ok_or_else(|| AudioError::Malformed("invalid sample rate".into()))?;
+                let compression = if is_aifc { tag(c, 18).ok_or_else(short)? } else { *b"NONE" };
+                comm = Some((channels, bits, rate, compression));
+            }
+            b"SSND" if ssnd.is_none() => {
+                let c = b.get(body..body + declared.min(remaining)).unwrap_or_default();
+                let offset = u64::from(be_u32(c, 0).unwrap_or(0));
+                let start = (body as u64).saturating_add(8).saturating_add(offset).min(file_len);
+                let avail = file_len.saturating_sub(start);
+                let dl = u64::from(size32).saturating_sub(8).saturating_sub(offset);
+                ssnd = Some((start, dl.min(avail)));
+            }
+            _ => {}
+        }
+        if declared > remaining {
+            break;
+        }
+        pos = match body.checked_add(declared).and_then(|p| p.checked_add(declared & 1)) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+
+    let (channels, bits, rate, compression) = comm.ok_or_else(|| AudioError::Malformed("AIFF has no COMM chunk".into()))?;
+    if channels <= 0 {
+        return Err(AudioError::Malformed("AIFF declares zero or negative channels".into()));
+    }
+    if !(1.0..=MAX_SAMPLE_RATE).contains(&rate) {
+        return Err(AudioError::Malformed(format!("AIFF sample rate {rate} out of range")));
+    }
+    let Some((kind, sample_format)) = aiff_kind(bits, &compression)? else {
+        return Ok(None);
+    };
+    let (data_start, data_len) = ssnd.ok_or_else(|| AudioError::Malformed("AIFF has no SSND chunk".into()))?;
+    Ok(Some(crate::stream::NativeLayout { sample_format, sample_rate: rate.round() as u32, channels: channels as u16, data_start, data_len, kind }))
 }
 
 pub(crate) fn decode(b: &[u8], layout: &AiffLayout) -> Result<AudioBuffer> {
