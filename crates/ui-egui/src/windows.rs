@@ -555,6 +555,21 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         ui.label(
             egui::RichText::new("Moves each finished take earlier by the measured round-trip latency. Off by default.").small().color(t.text_dim),
         );
+        let chosen = app.ui.midi_input.clone().unwrap_or_else(|| "None".into());
+        let mut pick: Option<Option<String>> = None;
+        egui::ComboBox::from_label("MIDI input for recording").selected_text(chosen).show_ui(ui, |ui| {
+            if ui.selectable_label(app.ui.midi_input.is_none(), "None").clicked() {
+                pick = Some(None);
+            }
+            for name in soundcraft_playback::midi_io::list_inputs().unwrap_or_default().into_iter().map(|p| p.name) {
+                if ui.selectable_label(app.ui.midi_input.as_deref() == Some(name.as_str()), &name).clicked() {
+                    pick = Some(Some(name));
+                }
+            }
+        });
+        if let Some(p) = pick {
+            let _ = app.run(crate::midi_capture::INPUT, json!({"port": p}));
+        }
         if ui.button("Reconnect audio device").clicked() {
             app.reconnect_audio();
         }

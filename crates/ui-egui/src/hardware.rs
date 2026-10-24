@@ -20,7 +20,7 @@ pub fn run(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, Stri
             Some(Ok(json!({"value": app.ui.compensate_latency})))
         }
         LATENCY => Some(Ok(audio_latency(app))),
-        _ => None,
+        _ => crate::midi_capture::run(app, id, p),
     }
 }
 

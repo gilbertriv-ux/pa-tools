@@ -15,6 +15,7 @@ pub mod fonts;
 pub mod hardware;
 pub mod icons;
 pub mod menus;
+pub mod midi_capture;
 pub mod midi_editor;
 pub mod mix_window;
 pub mod ops_windows;
@@ -103,6 +104,9 @@ pub struct UiState {
     /// Setup › Playback Engine › Compensate record latency: finished takes are moved earlier by the
     /// measured round-trip latency. Per machine; off by default.
     pub compensate_latency: bool,
+    /// The MIDI input that records with the transport (`setup.midi_input`): an index, a name or part
+    /// of one. Per machine; none by default.
+    pub midi_input: Option<String>,
     /// The Mix window lives in its own native window (Window › Mix in Separate Window); the main
     /// window then always shows Edit.
     pub mix_separate: bool,
@@ -170,6 +174,7 @@ impl Default for UiState {
             show_playback_engine: false,
             audio: soundcraft_playback::AudioConfig::default(),
             compensate_latency: false,
+            midi_input: None,
             mix_separate: false,
             show_io_setup: false,
             show_shortcuts: false,
@@ -262,6 +267,10 @@ pub struct SoundApp {
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
     record_start: Samples,
+    /// MIDI being recorded along with the audio, when a port is selected and a MIDI track is armed.
+    midi_capture: Option<midi_capture::MidiCapture>,
+    /// The opened port while a recording starts, until its start position is known.
+    pending_midi: Option<(midi_capture::Live, Vec<TrackId>)>,
     /// Punch range to trim the take to (pre/post-roll recordings).
     punch: Option<Range>,
     recorder_failed: bool,
@@ -360,6 +369,8 @@ impl SoundApp {
             player,
             recorder: None,
             record_start: 0,
+            midi_capture: None,
+            pending_midi: None,
             punch: None,
             recorder_failed: false,
             lost_shown: 0,
@@ -545,14 +556,36 @@ impl SoundApp {
             return;
         }
         self.ensure_input();
+        // MIDI needs a selected port and a record-enabled MIDI or instrument track; otherwise this is
+        // an audio recording exactly as before.
+        let midi_error = match self.open_midi_input() {
+            Ok(opened) => {
+                self.pending_midi = opened;
+                None
+            }
+            Err(e) => {
+                self.pending_midi = None;
+                Some(e)
+            }
+        };
         let takes = match self.arm_recorder() {
             Ok(takes) => takes,
+            // Only MIDI is armed: there is no audio take, and that is not an error.
+            Err(_) if self.pending_midi.is_some() && !midi_capture::any_armed_audio(self.engine.session()) => Vec::new(),
             Err(err) => {
-                self.ui.status = format!("Cannot record: {err}");
+                self.ui.status = match midi_error {
+                    Some(m) => format!("{m}. Cannot record: {err}"),
+                    None => format!("Cannot record: {err}"),
+                };
+                self.pending_midi = None;
                 return;
             }
         };
         self.lost_shown = 0;
+        if let Some(m) = midi_error {
+            // The audio still records; say why the MIDI will not.
+            self.ui.status = m;
+        }
         if let Some(p) = &self.player {
             p.set_recording(true);
         }
@@ -590,6 +623,8 @@ impl SoundApp {
     fn plan_recording(&mut self, takes: Vec<soundcraft_engine::io::Take>, pass: Option<Samples>) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        let live = self.pending_midi.take();
+        self.begin_midi_capture(live);
         if let Some(root) = self.autosave_dir.clone() {
             self.queue_autosave(root);
         }
@@ -926,8 +961,12 @@ impl SoundApp {
             p.set_recording(false);
         }
         let plan = self.take_plan.take();
-        let Some(r) = &mut self.recorder else { return };
-        let (takes, problem) = r.finish();
+        let midi = self.finish_midi_capture();
+        let audio = self.recorder.as_mut().map(|r| r.finish());
+        if audio.is_none() && midi.is_none() {
+            return;
+        }
+        let (takes, problem) = audio.unwrap_or_default();
         let tracks = takes.len().max(1);
         let plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
@@ -952,6 +991,12 @@ impl SoundApp {
         let ids = soundcraft_engine::io::place_recording_trimmed(&mut self.engine, &plan, takes, trim);
         self.ui.status =
             if plan.pass.is_some() { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
+        if let Some(m) = midi {
+            // Placed from where recording started (no latency offset); shares the audio take's undo step.
+            let clips = soundcraft_engine::io::place_midi_recording(&mut self.engine, m.start, m.len, &m.tracks, &m.sequence, ids.is_empty());
+            let said = midi_capture::summary(clips.len(), &m.stats);
+            self.ui.status = if ids.is_empty() { format!("Recorded {said}") } else { format!("{}; {said}", self.ui.status) };
+        }
         if let Some(p) = problem {
             log::warn!("recording: {p}");
             self.ui.status = format!("{} ({p})", self.ui.status);
@@ -1045,6 +1090,7 @@ impl SoundApp {
                     // The old capture belongs to the replaced document, never to the new one.
                     self.recorder = None;
                     self.recorder_failed = false;
+                    self.midi_capture = None;
                     self.punch = None;
                     self.gesture = None;
                     self.touched.clear();
@@ -1191,6 +1237,7 @@ impl SoundApp {
         }
         self.watch_output();
         self.watch_input();
+        self.drain_midi();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {

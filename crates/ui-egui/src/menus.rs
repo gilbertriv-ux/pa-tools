@@ -25,6 +25,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.audio_health", "Session Audio Health", "", None),
     ("window.about", "About Pa Tools", "", None),
     ("setup.audio_latency", "Audio Latency", "", None),
+    ("setup.midi_input", "MIDI Input", "", None),
     ("setup.record_latency_compensation", "Compensate Record Latency", "", None),
     ("window.close", "Close Window", "Window > Close Window", Some("Cmd+W")),
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),

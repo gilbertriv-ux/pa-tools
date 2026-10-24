@@ -16,6 +16,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::Instant;
 
 /// Longest message accepted (parser, output and the inline input buffer), in bytes.
 pub const MAX_MESSAGE_LEN: usize = 64;
@@ -246,11 +247,60 @@ pub fn list_outputs() -> Result<Vec<MidiPortInfo>, MidiIoError> {
     Ok(m.ports().iter().enumerate().map(|(index, p)| MidiPortInfo { index, name: m.port_name(p).unwrap_or_default() }).collect())
 }
 
+/// Pairs the backend clock (whose epoch differs per platform) with the local monotonic clock,
+/// using the first message seen: written once by the input callback, never blocking.
+#[derive(Debug)]
+pub struct ClockAnchor {
+    epoch: Instant,
+    /// Backend microseconds of the first message (valid once `elapsed_us` is set).
+    backend_us: AtomicU64,
+    /// Microseconds since `epoch` when the first message arrived; [`Self::UNSET`] before that.
+    elapsed_us: AtomicU64,
+}
+
+impl ClockAnchor {
+    const UNSET: u64 = u64::MAX;
+
+    /// A new anchor whose local clock starts at `epoch`.
+    pub fn new(epoch: Instant) -> Self {
+        Self { epoch, backend_us: AtomicU64::new(0), elapsed_us: AtomicU64::new(Self::UNSET) }
+    }
+
+    /// Callback side: remember the first message's pair. Later calls change nothing.
+    pub fn observe(&self, backend_micros: u64) {
+        if self.elapsed_us.load(Ordering::Acquire) != Self::UNSET {
+            return;
+        }
+        let elapsed = u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(Self::UNSET - 1).min(Self::UNSET - 1);
+        self.backend_us.store(backend_micros, Ordering::Relaxed);
+        self.elapsed_us.store(elapsed, Ordering::Release);
+    }
+
+    /// The backend timestamp that corresponds to the local instant `at`, or `None` until a
+    /// message has been seen. Saturates at 0 for instants before the backend epoch.
+    pub fn micros_at(&self, at: Instant) -> Option<u64> {
+        let seen = self.elapsed_us.load(Ordering::Acquire);
+        if seen == Self::UNSET {
+            return None;
+        }
+        let at_us = i128::try_from(at.saturating_duration_since(self.epoch).as_micros()).ok()?;
+        Some(anchor_to_backend(self.backend_us.load(Ordering::Relaxed), seen, at_us))
+    }
+}
+
+/// Map a local time `at_us` (microseconds since the anchor's epoch) to the backend clock, given
+/// that backend time `backend_us` was seen at local time `seen_us`. Saturating and never negative.
+pub fn anchor_to_backend(backend_us: u64, seen_us: u64, at_us: i128) -> u64 {
+    let v = i128::from(backend_us).saturating_add(at_us).saturating_sub(i128::from(seen_us));
+    u64::try_from(v.max(0)).unwrap_or(u64::MAX)
+}
+
 /// An open hardware MIDI input. Dropping it disconnects.
 pub struct MidiInput {
     conn: Option<midir::MidiInputConnection<()>>,
     dropped: Arc<AtomicU64>,
     port_name: String,
+    anchor: Arc<ClockAnchor>,
 }
 
 impl MidiInput {
@@ -262,6 +312,12 @@ impl MidiInput {
     /// Name of the connected port.
     pub fn port_name(&self) -> &str {
         &self.port_name
+    }
+
+    /// The backend timestamp matching the local instant `at` (see [`ClockAnchor`]); `None` until
+    /// the first message has arrived.
+    pub fn micros_at(&self, at: Instant) -> Option<u64> {
+        self.anchor.micros_at(at)
     }
 
     /// Disconnect explicitly.
@@ -287,10 +343,20 @@ pub fn open_input(name_or_index: &str, queue: usize) -> Result<(MidiInput, Recei
     let (tx, rx) = sync_channel(queue);
     let dropped = Arc::new(AtomicU64::new(0));
     let cb_dropped = Arc::clone(&dropped);
+    let anchor = Arc::new(ClockAnchor::new(Instant::now()));
+    let cb_anchor = Arc::clone(&anchor);
     let conn = backend
-        .connect(port, "pa-tools-in", move |micros, bytes, _| forward_message(&tx, &cb_dropped, micros, bytes), ())
+        .connect(
+            port,
+            "pa-tools-in",
+            move |micros, bytes, _| {
+                cb_anchor.observe(micros);
+                forward_message(&tx, &cb_dropped, micros, bytes);
+            },
+            (),
+        )
         .map_err(|e| MidiIoError::Connect(e.to_string()))?;
-    Ok((MidiInput { conn: Some(conn), dropped, port_name }, rx))
+    Ok((MidiInput { conn: Some(conn), dropped, port_name, anchor }, rx))
 }
 
 /// An open hardware MIDI output. Dropping it disconnects.
@@ -329,6 +395,27 @@ pub fn open_output(name_or_index: &str) -> Result<MidiOutput, MidiIoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchor_maps_local_time_to_the_backend_clock() {
+        assert_eq!(anchor_to_backend(5_000_000, 1_000, 3_000), 5_002_000);
+        assert_eq!(anchor_to_backend(5_000_000, 1_000, 0), 4_999_000);
+        assert_eq!(anchor_to_backend(10, 1_000, 0), 0, "before the backend epoch saturates at 0");
+        assert_eq!(anchor_to_backend(u64::MAX, 0, i128::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn anchor_is_set_once_by_the_first_message() {
+        let t0 = Instant::now();
+        let a = ClockAnchor::new(t0);
+        assert_eq!(a.micros_at(t0), None, "no message yet");
+        a.observe(7_000_000);
+        let first = a.micros_at(t0 + std::time::Duration::from_secs(1));
+        a.observe(99_000_000);
+        assert_eq!(a.micros_at(t0 + std::time::Duration::from_secs(1)), first, "later messages do not move it");
+        let (one, two) = (a.micros_at(t0 + std::time::Duration::from_secs(1)), a.micros_at(t0 + std::time::Duration::from_secs(2)));
+        assert_eq!(two.zip(one).map(|(b, a)| b - a), Some(1_000_000));
+    }
 
     #[test]
     fn parses_channel_messages() {

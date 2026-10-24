@@ -1502,6 +1502,40 @@ fn add_recording_in(
     out
 }
 
+/// Turn a recorded MIDI take into one clip per MIDI or instrument track in `tracks`, each holding
+/// a copy of `seq`, starting at `start` and `len` samples long (at least 1). Tracks that are gone
+/// or are not MIDI/instrument tracks are skipped, and an empty `seq` makes no clip at all.
+///
+/// With `own_undo` the change is one undo step ("Record"). Pass `false` when an audio take of
+/// the same recording has just been placed with [`place_recording_trimmed`]: that step already
+/// reverts to the session as it was before recording, so both share it.
+pub fn place_midi_recording(
+    e: &mut Engine,
+    start: Samples,
+    len: Samples,
+    tracks: &[TrackId],
+    seq: &soundcraft_midi::Sequence,
+    own_undo: bool,
+) -> Vec<soundcraft_model::ClipId> {
+    if seq.notes.is_empty() && seq.ctrls.is_empty() {
+        return Vec::new();
+    }
+    let before = e.session_arc();
+    let len = len.max(1);
+    let mut out = Vec::new();
+    for tid in tracks {
+        let Some(name) = e.session().track(*tid).filter(|t| t.kind.is_midi()).map(|t| t.name.clone()) else { continue };
+        let s = e.session_mut();
+        let cid = s.new_clip_id();
+        crate::edit::place_clip(s, *tid, Clip::midi(cid, name, start, len, seq.clone()));
+        out.push(cid);
+    }
+    if own_undo && !out.is_empty() {
+        e.push_undo("Record", before);
+    }
+    out
+}
+
 /// Where a take recording from `start` shows while it holds `len` samples, as it will be placed:
 /// just the pass under way when loop recording in passes of `pass`, within the `punch` range.
 /// Returns the timeline position of its first sample and the span it covers.
@@ -1631,6 +1665,57 @@ mod record_tests {
         let punch = Some(Range::new(1_200, 1_400));
         assert_eq!(live_span(1_000, None, punch, 150), None);
         assert_eq!(live_span(1_000, None, punch, 500), Some((1_000, Range::new(1_200, 1_400))));
+    }
+
+    fn take_seq() -> soundcraft_midi::Sequence {
+        use soundcraft_midi::{CtrlEvent, CtrlKind, Note, Sequence};
+        Sequence {
+            notes: vec![Note { pitch: 60, velocity: 90, release_velocity: 64, channel: 0, start: 10, length: 480 }],
+            ctrls: vec![CtrlEvent { tick: 5, channel: 0, kind: CtrlKind::Cc(64), value: 127 }],
+        }
+    }
+
+    #[test]
+    fn a_midi_take_becomes_a_clip_on_each_midi_track_as_one_undo_step() {
+        let mut e = Engine::default();
+        let keys = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        let pads = e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Stereo, Some("Pads"));
+        let vox = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Vox"));
+        let (steps, rev) = (e.undo_history().len(), e.revision);
+        let ids = place_midi_recording(&mut e, 48_000, 96_000, &[keys, pads, vox, TrackId(999)], &take_seq(), true);
+        assert!(e.revision != rev);
+        assert_eq!(ids.len(), 2, "the audio track and the missing track get nothing");
+        for (id, track) in ids.iter().zip([keys, pads]) {
+            let (t, clip) = e.session().find_clip(*id).unwrap();
+            assert_eq!((t, clip.start, clip.length), (track, 48_000, 96_000));
+            assert!(matches!(&clip.content, ClipContent::Midi { sequence } if *sequence == take_seq()));
+        }
+        assert_eq!(e.undo_history().len(), steps + 1, "one undo step for the whole take");
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert!(ids.iter().all(|id| e.session().find_clip(*id).is_none()));
+    }
+
+    #[test]
+    fn an_empty_midi_take_or_no_midi_track_changes_nothing() {
+        let mut e = Engine::default();
+        let keys = e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Stereo, Some("Keys"));
+        let vox = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Vox"));
+        let (steps, rev) = (e.undo_history().len(), e.revision);
+        assert!(place_midi_recording(&mut e, 0, 100, &[keys], &soundcraft_midi::Sequence::default(), true).is_empty());
+        assert!(place_midi_recording(&mut e, 0, 100, &[vox], &take_seq(), true).is_empty());
+        assert!(place_midi_recording(&mut e, 0, 100, &[], &take_seq(), true).is_empty());
+        assert_eq!((e.undo_history().len(), e.revision), (steps, rev));
+    }
+
+    #[test]
+    fn a_midi_take_shares_the_undo_step_of_the_audio_take_when_asked() {
+        let mut e = Engine::default();
+        let keys = e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Stereo, Some("Keys"));
+        let steps = e.undo_history().len();
+        assert_eq!(place_midi_recording(&mut e, 0, 0, &[keys], &take_seq(), false).len(), 1);
+        assert_eq!(e.undo_history().len(), steps, "the caller owns the step");
+        let clip = e.session().track(keys).and_then(|t| t.playlist()).and_then(|p| p.clips.first()).map(|c| c.length);
+        assert_eq!(clip, Some(1), "a zero length is raised to one sample");
     }
 }
 
