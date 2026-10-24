@@ -95,12 +95,14 @@ struct Shared {
     fault: AtomicU8,
     /// The first failure writing a take, until it's reported.
     failed: Mutex<Option<String>>,
+    /// Input latency (capture to callback) last measured from the stream timestamps, in frames.
+    latency: crate::latency::LatencyCell,
 }
 
 impl Shared {
     fn new(ring: CaptureRing) -> Shared {
         let (beats, fault, failed) = (AtomicU64::new(0), AtomicU8::new(0), Mutex::new(None));
-        Shared { armed: AtomicBool::new(false), ring, dropped: AtomicUsize::new(0), beats, fault, failed }
+        Shared { armed: AtomicBool::new(false), ring, dropped: AtomicUsize::new(0), beats, fault, failed, latency: Default::default() }
     }
 
     /// Run the input callback's `work`. After a panic in it, the input is broken and does
@@ -135,6 +137,11 @@ pub struct Recorder {
     writer: Option<(std::thread::JoinHandle<Takes>, Vec<(TrackId, Arc<Mutex<LiveTake>>)>)>,
     /// The callback count last seen, and since when.
     seen: (u64, Instant),
+    /// The device buffer in frames when one was chosen (0: the device default).
+    buffer_frames: u32,
+    /// Setting: shift finished takes earlier by the round-trip latency (see
+    /// [`Recorder::take_start`]). Off by default, which keeps takes where they were placed.
+    pub compensate_latency: bool,
 }
 
 /// The input stream: device samples are converted to f32 in a scratch buffer allocated here (so
@@ -157,10 +164,13 @@ where
     let mut scratch = vec![0.0f32; 8192 * usize::from(config.channels).max(1)];
     let chunk = scratch.len();
     let mut owed = 0;
+    let rate = config.sample_rate.0;
     device.build_input_stream(
         config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
+        move |data: &[T], info: &cpal::InputCallbackInfo| {
             crate::mark_audio_thread();
+            let ts = info.timestamp();
+            sh.latency.store(crate::latency::input_latency_frames(ts.callback.duration_since(&ts.capture), rate));
             sh.guarded(|| {
                 for part in data.chunks(chunk) {
                     let Some(s) = scratch.get_mut(..part.len()) else { return };
@@ -245,7 +255,22 @@ impl Recorder {
         };
         stream.play().map_err(|e| e.to_string())?;
         let seen = (0, Instant::now());
-        Ok(Recorder { monitor, shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels, writer: None, seen })
+        let buffer_frames = match config.buffer_size {
+            cpal::BufferSize::Fixed(n) => n,
+            cpal::BufferSize::Default => 0,
+        };
+        Ok(Recorder {
+            monitor,
+            shared,
+            _stream: Some(stream),
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels,
+            writer: None,
+            seen,
+            buffer_frames,
+            compensate_latency: false,
+        })
     }
 
     #[cfg(target_os = "freebsd")]
@@ -300,6 +325,32 @@ impl Recorder {
             self.seen = (beats, Instant::now());
         }
         (self.seen.1.elapsed() >= STALL).then(|| Trouble::Device(format!("“{name}” stopped sending audio")))
+    }
+
+    /// Input latency last measured from the stream's capture timestamps, in frames at the input
+    /// rate. 0 until the first callback.
+    pub fn input_latency_frames(&self) -> u32 {
+        self.shared.latency.load()
+    }
+
+    /// Latency report for this input paired with an output latency (`Player::output_latency_frames`).
+    /// Output frames are at the output rate; pass them already converted to the input rate if the
+    /// two differ.
+    pub fn latency_report(&self, output_frames: u32) -> crate::latency::LatencyReport {
+        crate::latency::LatencyReport {
+            input_frames: self.input_latency_frames(),
+            output_frames,
+            device_buffer_frames: self.buffer_frames,
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    /// Where a finished take should start on the timeline, given the start it was armed at.
+    /// With [`Recorder::compensate_latency`] off (the default) this is `start` unchanged; on, the
+    /// take moves earlier by the round-trip latency, never before 0. The caller that turns a take
+    /// into a clip uses this (and [`crate::latency::head_trim`] for any part that did not fit).
+    pub fn take_start(&self, start: i64, output_frames: u32) -> i64 {
+        if self.compensate_latency { crate::latency::shifted_start(start, self.latency_report(output_frames).record_offset_frames()) } else { start }
     }
 
     /// Input the current take has lost to a slow disk so far, in milliseconds.
@@ -474,7 +525,23 @@ mod tests {
             channels: 1,
             writer: None,
             seen: (0, Instant::now()),
+            buffer_frames: 0,
+            compensate_latency: false,
         }
+    }
+
+    #[test]
+    fn take_start_is_unchanged_unless_compensation_is_on() {
+        let shared = Arc::new(Shared::new(CaptureRing::new(64)));
+        let mut r = recorder(&shared);
+        shared.latency.store(100);
+        assert_eq!(r.input_latency_frames(), 100);
+        assert_eq!(r.take_start(1000, 200), 1000, "default behaviour");
+        r.compensate_latency = true;
+        assert_eq!(r.take_start(1000, 200), 700);
+        assert_eq!(r.take_start(50, 200), 0);
+        r.buffer_frames = 64;
+        assert_eq!(r.latency_report(0).round_trip_frames(), 100);
     }
 
     #[test]

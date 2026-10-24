@@ -475,6 +475,8 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+    /// Output latency (callback to sound) last measured from the stream timestamps, in frames.
+    output_latency: Arc<latency::LatencyCell>,
 }
 
 impl Player {
@@ -517,6 +519,7 @@ impl Player {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
+        let output_latency = Arc::new(latency::LatencyCell::default());
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
@@ -538,9 +541,9 @@ impl Player {
                         let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
                         let fault = Arc::new(Fault::default());
                         let stream = match format {
-                            cpal::SampleFormat::I32 => build_output::<i32>(&device, config, state, channels, &fault, &shared),
-                            cpal::SampleFormat::I16 => build_output::<i16>(&device, config, state, channels, &fault, &shared),
-                            _ => build_output::<f32>(&device, config, state, channels, &fault, &shared),
+                            cpal::SampleFormat::I32 => build_output::<i32>(&device, config, state, channels, &fault, &shared, &output_latency),
+                            cpal::SampleFormat::I16 => build_output::<i16>(&device, config, state, channels, &fault, &shared, &output_latency),
+                            _ => build_output::<f32>(&device, config, state, channels, &fault, &shared, &output_latency),
                         }?;
                         Ok(Opened { stream, tx, grx, fault })
                     },
@@ -571,13 +574,14 @@ impl Player {
                             device_channels: config.channels,
                             device_buffer: buffer,
                             silent: false,
+                            output_latency: Arc::clone(&output_latency),
                         }
                     }
                     None => {
                         log::warn!("no usable audio stream; using a silent clock");
                         let (tx, rx) = channel();
                         let (gtx, grx) = channel();
-                        Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
+                        Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx).with_latency(output_latency)
                     }
                 }
             }
@@ -585,7 +589,7 @@ impl Player {
                 log::warn!("no audio output: {e}; using a silent clock");
                 let (tx, rx) = channel();
                 let (gtx, grx) = channel();
-                Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
+                Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx).with_latency(output_latency)
             }
         }
     }
@@ -648,6 +652,7 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            output_latency: Arc::default(),
         }
     }
 
@@ -671,6 +676,28 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            output_latency: Arc::default(),
+        }
+    }
+
+    fn with_latency(mut self, cell: Arc<latency::LatencyCell>) -> Player {
+        self.output_latency = cell;
+        self
+    }
+
+    /// Output latency last measured from the stream's callback timestamps, in frames at the
+    /// device rate. 0 until the first callback, and always 0 for the silent clock.
+    pub fn output_latency_frames(&self) -> u32 {
+        self.output_latency.load()
+    }
+
+    /// A [`latency::LatencyReport`] for this output (input side supplied by the recorder).
+    pub fn latency_report(&self, input_frames: u32) -> latency::LatencyReport {
+        latency::LatencyReport {
+            input_frames,
+            output_frames: self.output_latency_frames(),
+            device_buffer_frames: self.device_buffer.unwrap_or(0),
+            sample_rate: self.device_rate,
         }
     }
 
@@ -928,6 +955,7 @@ fn build_output<T>(
     channels: usize,
     fault: &Arc<Fault>,
     shared: &Arc<Shared>,
+    latency: &Arc<latency::LatencyCell>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -937,10 +965,13 @@ where
     let mut scratch = vec![0.0f32; 8192 * frame];
     let chunk = scratch.len();
     let (failed, guard, gone) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault));
+    let (cell, rate) = (Arc::clone(latency), config.sample_rate.0);
     device.build_output_stream(
         config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             mark_audio_thread();
+            let ts = info.timestamp();
+            cell.store(latency::output_latency_frames(ts.playback.duration_since(&ts.callback), rate));
             for out in data.chunks_mut(chunk) {
                 let Some(s) = scratch.get_mut(..out.len()) else { return };
                 guarded_block(&failed, &guard, s, |d| state.fill(d, channels));
