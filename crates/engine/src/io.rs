@@ -986,7 +986,9 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
             }
         }
         let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
-        let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+        // A streamed source holds no resident samples; read it in to copy it into the folder.
+        let buf = audio.load_resident();
+        let bytes = soundcraft_audio_io::encode(&buf, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
         let (name, new) = store_wav(&audio_dir, &stem, &bytes)?;
         src.path = format!("Audio Files/{name}");
         src.unsaved = false;
@@ -1184,6 +1186,42 @@ fn decode_source(bytes: &[u8], ext: Option<&str>, rate: u32) -> std::result::Res
     Ok(Arc::new(SourceAudio::new(buf)))
 }
 
+/// Open an uncompressed PCM file (WAV / AIFF / CAF) at the session rate as a *streamed* source, so a
+/// long file never fully decodes into RAM: the mix engine reads frames on demand through the
+/// [`StreamReader`](soundcraft_audio_io::StreamReader) the returned source holds. Returns `None`
+/// (so the caller decodes resident instead) for a compressed file, a file whose rate differs from
+/// the session's (streaming does no on-the-fly resample), or anything that will not open.
+///
+/// The waveform overview is built here with one streaming pass over the file (it never holds the
+/// samples): bounded memory, and the pass costs no more than the full decode it replaces. (A future
+/// refinement can move this pass onto a background thread so playback starts before it finishes;
+/// the audio never needs it.)
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_pcm_source(p: &Path, rate: u32) -> Option<Arc<SourceAudio>> {
+    // Only a regular file can be streamed. A pipe or device would block the reader forever; fall
+    // back to the decode path, which refuses non-regular files (parity with `read_file`).
+    if !std::fs::metadata(p).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let reader = soundcraft_audio_io::StreamReader::open(p).ok()?;
+    if reader.sample_rate() != rate || reader.frames() == 0 || reader.channels() == 0 {
+        return None;
+    }
+    let peaks = reader.build_peaks().ok()?;
+    let format = match p.extension().and_then(|x| x.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("aif" | "aiff" | "aifc") => FileFormat::Aiff,
+        Some("caf") => FileFormat::Caf,
+        _ => FileFormat::Wav,
+    };
+    Some(Arc::new(SourceAudio::streamed(reader, p.to_string_lossy().into_owned(), format, peaks)))
+}
+
+/// On the web (no filesystem) there is nothing to stream from a path.
+#[cfg(target_arch = "wasm32")]
+fn stream_pcm_source(_p: &Path, _rate: u32) -> Option<Arc<SourceAudio>> {
+    None
+}
+
 /// Audio files decoded so far, by path: a session may name one file thousands of times.
 /// The one name of the file at `p` (links followed), so the same file named two ways is read once.
 pub(crate) fn file_key(p: &Path) -> PathBuf {
@@ -1200,6 +1238,11 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
     files
         .entry(file_key(p))
         .or_insert_with(|| {
+            // Uncompressed PCM at the session rate streams from disk; everything else (compressed,
+            // or needing a resample) decodes resident.
+            if let Some(streamed) = stream_pcm_source(p, rate) {
+                return Ok(streamed);
+            }
             let bytes = read_file(p).map_err(|_| p.display().to_string())?;
             decode_source(&bytes, p.extension().and_then(|x| x.to_str()), rate).map_err(|err| format!("{}: {err}", p.display()))
         })
@@ -1261,7 +1304,9 @@ pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
             k += 1;
         }
         let opts_wav = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
-        let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts_wav).map_err(|err| EngineError::Io(err.to_string()))?;
+        // A streamed source carries no resident samples; read it in to encode it into the bundle.
+        let buf = audio.load_resident();
+        let bytes = soundcraft_audio_io::encode(&buf, &opts_wav).map_err(|err| EngineError::Io(err.to_string()))?;
         w.start_file(target.as_str(), opts).map_err(zerr)?;
         w.write_all(&bytes).map_err(ioerr)?;
         taken.insert(target.clone());
@@ -1467,11 +1512,19 @@ fn add_recording_in(
         let resampled = buf.sample_rate != s.sample_rate.hz();
         let name = path.file_stem().and_then(|x| x.to_str()).unwrap_or("Take");
         let src = add_source(s, name, buf, Some(&path.to_string_lossy()), FileFormat::Wav);
-        let Some(x) = s.sources.last_mut() else { continue };
-        x.unsaved = resampled;
+        let frames_u = {
+            let Some(x) = s.sources.last_mut() else { continue };
+            x.unsaved = resampled;
+            x.frames
+        };
+        // A take written at the session rate streams from disk like any imported PCM, so the whole
+        // recording does not stay resident after it is placed.
+        if !resampled && let Some(streamed) = stream_pcm_source(&path, s.sample_rate.hz()) {
+            s.pool.insert(src, streamed);
+        }
         // Frames cut from the head of the take (latency compensation); the rest is placed as usual.
-        let head = trim.clamp(0, i64::try_from(x.frames).unwrap_or(0));
-        let len = i64::try_from(x.frames).unwrap_or(0).saturating_sub(head);
+        let head = trim.clamp(0, i64::try_from(frames_u).unwrap_or(0));
+        let len = i64::try_from(frames_u).unwrap_or(0).saturating_sub(head);
         let pass = pass.unwrap_or(len).max(1);
         for offset in (0..len).step_by(usize::try_from(pass).unwrap_or(usize::MAX)).take(1_000) {
             let n = pass.min(len - offset);
@@ -1768,7 +1821,10 @@ mod save_tests {
         save_session(&mut reopen(&path("B/B.scraft")), &path("A/B.scraft")).unwrap();
         let levels = ["A/A.scraft", "A/A v2.scraft", "B/B.scraft", "A/B.scraft"].map(|p| {
             let r = reopen(&path(p));
-            r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0]
+            let a = r.session().pool.get(r.session().sources[0].id).unwrap();
+            let mut v = [0.0f32];
+            a.read(0, 0, &mut v);
+            v[0]
         });
         assert_eq!(levels, [0.5, -0.25, 0.75, 0.75]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1810,7 +1866,12 @@ mod save_tests {
         let dir = std::env::temp_dir().join(format!("soundcraft-own-folder-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
-        let level = |r: &Engine| r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0];
+        let level = |r: &Engine| {
+            let a = r.session().pool.get(r.session().sources[0].id).unwrap();
+            let mut v = [0.0f32];
+            a.read(0, 0, &mut v);
+            v[0]
+        };
         save_session(&mut with_take(-0.25), &path("B/Other.scraft")).unwrap();
         let mut e = with_take(0.5);
         save_session(&mut e, &path("A/A.scraft")).unwrap();
@@ -1858,7 +1919,10 @@ mod save_tests {
         bare.execute("session.save", &json!({})).unwrap();
         second.execute("session.save_as", &json!({"path": path, "replace": true})).unwrap();
         let r = reopen(&path);
-        assert_eq!(r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0], -0.25);
+        let a = r.session().pool.get(r.session().sources[0].id).unwrap();
+        let mut v = [0.0f32];
+        a.read(0, 0, &mut v);
+        assert_eq!(v[0], -0.25);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

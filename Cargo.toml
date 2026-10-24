@@ -45,6 +45,9 @@ zip = { version = "9", default-features = false }
 cpal = "0.16"
 # Hardware MIDI ports (MIT); wraps CoreMIDI, WinMM and ALSA so Pa Tools stays unsafe-free.
 midir = "0.10"
+# Lock-free SPSC ring (MIT/Apache-2.0) for the streamed-audio pre-read worker → audio callback
+# hand-off: one producer (worker thread), one consumer (audio callback), no locks on the callback.
+rtrb = "0.3"
 
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }

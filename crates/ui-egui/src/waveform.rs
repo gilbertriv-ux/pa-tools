@@ -17,7 +17,12 @@ fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
 }
 
 fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, ch: usize, band: Rect, wave: Color32) {
-    let (Some(samples), Some(peaks)) = (audio.channel(ch), audio.peaks.get(ch)) else { return };
+    let Some(peaks) = audio.peaks.get(ch) else { return };
+    // A streamed source holds no resident samples, so it draws from the prebuilt overview alone
+    // (no per-sample disk reads on the UI thread).
+    let Some(samples) = audio.channel(ch) else {
+        return channel_overview(painter, s, tl, clip, peaks, band, wave);
+    };
     let Some(g) = Grid::new(painter, s, tl, band) else { return };
     let (rectified, power, outlines) = (s.edit.flag("waveform.rectified"), s.edit.flag("waveform.power"), s.edit.flag("waveform.outlines"));
     let origin = clip.start.saturating_sub(clip.source_offset()) as f64;
@@ -38,6 +43,37 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
         peaks.rms_spans(samples, start, g.step, overlap, g.cols).into_iter().map(|r| r.map(|r| (-r, r))).collect()
     } else {
         peaks.spans(samples, start, g.step, overlap, g.cols)
+    };
+    let base = g.cy + g.half;
+    let ys: Vec<Option<(f32, f32)>> = spans
+        .into_iter()
+        .enumerate()
+        .map(|(c, span)| {
+            let (lo, hi) = span?;
+            let k = gain((g.k0 + c as f64 + 0.5) * g.step);
+            Some(if rectified {
+                (base - level(lo.abs().max(hi.abs()) * k) * g.half * 2.0, base)
+            } else {
+                (g.cy - level(hi * k) * g.half, g.cy - level(lo * k) * g.half)
+            })
+        })
+        .collect();
+    g.paint(painter, &ys, wave, outlines, rectified);
+}
+
+/// Draw one channel of a streamed clip from its prebuilt overview alone (no resident samples). The
+/// overview is coarser than the resident per-pixel path by at most one block at a span's edges,
+/// invisible at the zoom a streamed clip is drawn at.
+fn channel_overview(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, peaks: &soundcraft_audio_io::peaks::Peaks, band: Rect, wave: Color32) {
+    let Some(g) = Grid::new(painter, s, tl, band) else { return };
+    let (rectified, power, outlines) = (s.edit.flag("waveform.rectified"), s.edit.flag("waveform.power"), s.edit.flag("waveform.outlines"));
+    let origin = clip.start.saturating_sub(clip.source_offset()) as f64;
+    let gain = |pos: f64| clip.gain_at((pos as Samples).saturating_sub(clip.start).min(clip.length).max(0)) * s.edit.zoom.waveform_zoom;
+    let (start, overlap) = (g.start() - origin, g.overlap());
+    let spans = if power {
+        peaks.rms_spans_overview(start, g.step, overlap, g.cols).into_iter().map(|r| r.map(|r| (-r, r))).collect()
+    } else {
+        peaks.spans_overview(start, g.step, overlap, g.cols)
     };
     let base = g.cy + g.half;
     let ys: Vec<Option<(f32, f32)>> = spans

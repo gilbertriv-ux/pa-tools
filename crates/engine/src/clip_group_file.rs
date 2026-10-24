@@ -140,7 +140,7 @@ pub fn import(e: &mut Engine, path: &str, first: Option<TrackId>, at: Samples) -
                 let channels = lane
                     .iter()
                     .find_map(|c| match c.content {
-                        ClipContent::Audio { source, .. } => map.get(&source.0).and_then(|n| s.pool.get(*n)).map(|a| a.buffer.num_channels()),
+                        ClipContent::Audio { source, .. } => map.get(&source.0).and_then(|n| s.pool.get(*n)).map(|a| a.num_channels()),
                         _ => None,
                     })
                     .unwrap_or(2);

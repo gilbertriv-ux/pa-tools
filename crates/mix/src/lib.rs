@@ -242,6 +242,15 @@ struct Strip {
     out_extra: DelayLine,
     outbuf: Vec<Vec<f32>>,
     failures: PluginFailures,
+    /// Ring consumers for this track's streamed sources (one per source), filled by the pre-read
+    /// worker; read only on the audio thread. Rebuilt by `sync` when the streamed-source set
+    /// changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    streams: Vec<stream::StreamVoice>,
+    /// Reusable planar window the streamed ring pops into before a block is rendered. Sized
+    /// `[MAX_STREAM_CH][max_block]` in `sync` so the audio thread never allocates it.
+    #[cfg(not(target_arch = "wasm32"))]
+    win: Vec<Vec<f32>>,
 }
 
 /// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
@@ -321,6 +330,10 @@ impl Strip {
             out_extra: DelayLine::default(),
             outbuf: Vec::new(),
             failures: PluginFailures::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            streams: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            win: Vec::new(),
         }
     }
 }
@@ -370,6 +383,14 @@ pub struct MixEngine {
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    /// The single background pre-read worker that fills every streamed source's ring. `None` when
+    /// the session has no streamed sources. Rebuilt by `provision_streams` when the set changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    stream_worker: Option<stream::StreamWorker>,
+    /// Fingerprint of the streamed sources in use, so `provision_streams` runs only when the set
+    /// changes. `u64::MAX` until the first sync.
+    #[cfg(not(target_arch = "wasm32"))]
+    stream_fp: u64,
 }
 
 /// What `sync` needs to fill a slot.
@@ -443,6 +464,10 @@ impl MixEngine {
             adopt: HashMap::new(),
             retired: Vec::new(),
             work: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            stream_worker: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            stream_fp: u64::MAX,
         }
     }
 
@@ -515,6 +540,8 @@ impl MixEngine {
             s.align.clear();
             s.align_pre.clear();
             s.out_extra.clear();
+            #[cfg(not(target_arch = "wasm32"))]
+            s.streams.iter_mut().for_each(stream::StreamVoice::invalidate);
             for fx in s.clip_fx.values_mut() {
                 fx.reset();
             }
@@ -610,6 +637,56 @@ impl MixEngine {
             self.order = processing_order(s);
             self.synced = key;
         }
+        // Streamed sources are provisioned independently of plugin/routing structure: the set
+        // changes when audio clips (and so their sources) change, which `structure_fingerprint`
+        // does not track. Rebuilding allocates rings and (re)spawns the worker, so a host that can
+        // calls `ensure_synced` off the audio thread after loading/swapping a session; on the audio
+        // thread it costs one block only when the streamed-source set actually changed.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let sfp = stream_fingerprint(s);
+            if sfp != self.stream_fp {
+                self.provision_streams(s);
+                self.stream_fp = sfp;
+            }
+        }
+    }
+
+    /// Tear down the old pre-read worker and build a ring per streamed source each track's active
+    /// playlist uses, giving the consumer to the strip and the producer to a freshly spawned
+    /// worker. Allocates and spawns a thread — never called from steady-state rendering, only when
+    /// the streamed-source set changed (see [`MixEngine::ensure_synced`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn provision_streams(&mut self, s: &Session) {
+        // Dropping the old worker signals it to stop and joins it (it exits within WORKER_POLL).
+        self.stream_worker = None;
+        let mb = self.max_block;
+        let mut workers = Vec::new();
+        for t in &s.tracks {
+            let Some(strip) = self.strips.get_mut(&t.id) else { continue };
+            strip.streams.clear();
+            if strip.win.len() < stream::MAX_STREAM_CH || strip.win.first().map_or(0, Vec::len) < mb {
+                strip.win = vec![vec![0.0; mb]; stream::MAX_STREAM_CH];
+            }
+            let mut seen: Vec<soundcraft_model::SourceId> = Vec::new();
+            for clip in t.clips() {
+                let ClipContent::Audio { source, .. } = clip.content else { continue };
+                if seen.contains(&source) {
+                    continue;
+                }
+                let Some(audio) = s.pool.get(source) else { continue };
+                if audio.is_resident() {
+                    continue;
+                }
+                seen.push(source);
+                let (voice, worker) = stream::provision(audio);
+                strip.streams.push(voice);
+                workers.push(worker);
+            }
+        }
+        if !workers.is_empty() {
+            self.stream_worker = Some(stream::StreamWorker::spawn(workers));
+        }
     }
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
@@ -623,6 +700,9 @@ impl MixEngine {
                 }
                 st.held.clear();
                 st.chase = true;
+                // The playhead jumped: streamed rings must refill from the new position.
+                #[cfg(not(target_arch = "wasm32"))]
+                st.streams.iter_mut().for_each(stream::StreamVoice::invalidate);
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
@@ -939,8 +1019,21 @@ fn process_strip(
                 if clip.muted || !clip.is_audio() || !clip.range().overlaps(&block) {
                     continue;
                 }
+                // On the realtime audio thread a streamed clip is read from its lock-free ring, not
+                // from disk; everywhere else (offline, the browser) `render_clip` reads it directly.
+                #[cfg(not(target_arch = "wasm32"))]
+                let rt = on_audio_thread() && clip_is_streamed(s, clip);
+                #[cfg(target_arch = "wasm32")]
+                let rt = false;
                 match clip_fx_params(s, clip.id.0) {
-                    None => render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch),
+                    None => {
+                        if rt {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            stream::render_clip_rt(&mut strip.streams, &mut strip.win, s, clip, pos, frames, &mut strip.buf);
+                        } else {
+                            render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch);
+                        }
+                    }
                     Some(params) => {
                         let nch = strip.buf.len();
                         if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
@@ -949,7 +1042,12 @@ fn process_strip(
                         for c in strip.clipbuf.iter_mut() {
                             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
                         }
-                        render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
+                        if rt {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            stream::render_clip_rt(&mut strip.streams, &mut strip.win, s, clip, pos, frames, &mut strip.clipbuf);
+                        } else {
+                            render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
+                        }
                         let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -1247,6 +1345,28 @@ fn structure_fingerprint(s: &Session) -> usize {
     h.finish() as usize
 }
 
+/// Fingerprint of the streamed sources each track's active playlist uses, with the pooled-audio
+/// identity so a changed pool re-provisions. `provision_streams` runs only when this changes.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_fingerprint(s: &Session) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in &s.tracks {
+        if !matches!(t.kind, TrackKind::Audio) {
+            continue;
+        }
+        for clip in t.clips() {
+            let ClipContent::Audio { source, .. } = clip.content else { continue };
+            if let Some(a) = s.pool.get(source).filter(|a| !a.is_resident()) {
+                t.id.hash(&mut h);
+                source.hash(&mut h);
+                (Arc::as_ptr(a) as *const () as usize).hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 std::thread_local! {
     static AUDIO_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1418,28 +1538,530 @@ mod click {
     }
 }
 
+/// Streamed-source playback.
+///
+/// A long uncompressed file never fully decodes into RAM: the audio callback reads it through a
+/// per-source, lock-free SPSC ring that a single background pre-read worker thread keeps filled
+/// (one producer = worker, one consumer = callback). The callback only ever *pops* — it never
+/// touches the disk, never allocates and never blocks; when the ring is short it outputs silence
+/// for the missing frames and logs at most once. A playhead jump (seek/loop) is signalled to the
+/// worker lock-free through an [`AtomicU64`] position + an [`AtomicU32`] generation it polls; the
+/// worker then refills from the new position and the consumer drops the pre-seek frames (tagged by
+/// the old generation) and outputs silence until the ring catches up.
+///
+/// Only realtime playback uses the ring. Offline bounces/consolidation/analysis are not realtime
+/// and read the source synchronously through [`SourceAudio::read`] (see [`render_clip`]); the
+/// browser (no worker threads) does the same.
+#[cfg(not(target_arch = "wasm32"))]
+mod stream {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// Per-source ring capacity, in frames. At 48 kHz this is ~0.68 s of read-ahead — far more than
+    /// any audio-callback period, so the worker (which wakes every [`WORKER_POLL`]) stays well ahead
+    /// of the callback. Each slot carries every channel of one frame, so the memory is bounded and
+    /// independent of file length: `RING_FRAMES * size_of::<RingFrame>()` (~2.6 MB for a
+    /// 16-channel ring).
+    pub const RING_FRAMES: usize = 1 << 15;
+
+    /// Frames the worker pulls from the disk per [`SourceAudio::read`] call while topping a ring up.
+    pub const CHUNK_FRAMES: usize = 1 << 12;
+
+    /// How often the worker wakes to top the rings up and to notice seeks and shutdown.
+    pub const WORKER_POLL: Duration = Duration::from_millis(2);
+
+    /// Channels carried per ring frame (wider sources are truncated, as the mix itself is).
+    pub const MAX_STREAM_CH: usize = MAX_CHANNELS;
+
+    /// One frame in a ring: the generation it was read under (so the consumer can drop frames left
+    /// over from before a seek), its source frame position (so an underrun can never silently
+    /// desync the consumer from the worker), and every channel's sample.
+    #[derive(Clone, Copy)]
+    pub struct RingFrame {
+        generation: u32,
+        pos: u64,
+        data: [f32; MAX_STREAM_CH],
+    }
+
+    /// Lock-free control the consumer uses to steer its worker: the source frame to (re)fill from
+    /// and a generation bumped on every seek. Nothing here ever blocks.
+    struct VoiceShared {
+        want_pos: AtomicU64,
+        generation: AtomicU32,
+    }
+
+    /// The consumer half of one source's ring, owned by the strip that renders the source and read
+    /// only by the audio callback (or a worker rendering strips on its behalf). Pop-only: never
+    /// allocates, never blocks.
+    pub struct StreamVoice {
+        /// Identity of the pooled audio this voice was built for.
+        src_ptr: usize,
+        consumer: rtrb::Consumer<RingFrame>,
+        shared: Arc<VoiceShared>,
+        nch: usize,
+        /// Generation this consumer is currently serving.
+        cur_gen: u32,
+        /// Source frame the next contiguous pop expects; `None` before the first block / after a
+        /// reset, forcing a seek.
+        next_pos: Option<u64>,
+        logged_underrun: bool,
+        logged_unsupported: bool,
+    }
+
+    impl std::fmt::Debug for StreamVoice {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StreamVoice").field("nch", &self.nch).field("next_pos", &self.next_pos).finish()
+        }
+    }
+
+    /// The producer half plus the reader, moved onto the worker thread.
+    pub struct WorkerVoice {
+        audio: Arc<SourceAudio>,
+        prod: rtrb::Producer<RingFrame>,
+        shared: Arc<VoiceShared>,
+        cur_gen: u32,
+        fill_pos: u64,
+        nch: usize,
+        frames: u64,
+        /// Channel-major read scratch (`nch * CHUNK_FRAMES`), allocated once on the worker thread.
+        scratch: Vec<f32>,
+    }
+
+    /// Build a ring and its two ends for `source`'s pooled audio. The [`StreamVoice`] goes to the
+    /// rendering strip, the [`WorkerVoice`] to the pre-read worker.
+    pub fn provision(audio: &Arc<SourceAudio>) -> (StreamVoice, WorkerVoice) {
+        let nch = audio.num_channels().min(MAX_STREAM_CH);
+        let frames = audio.frames() as u64;
+        let (prod, consumer) = rtrb::RingBuffer::new(RING_FRAMES);
+        let shared = Arc::new(VoiceShared { want_pos: AtomicU64::new(0), generation: AtomicU32::new(0) });
+        let voice = StreamVoice {
+            src_ptr: Arc::as_ptr(audio) as *const () as usize,
+            consumer,
+            shared: Arc::clone(&shared),
+            nch,
+            cur_gen: 0,
+            next_pos: None,
+            logged_underrun: false,
+            logged_unsupported: false,
+        };
+        let worker = WorkerVoice {
+            audio: Arc::clone(audio),
+            prod,
+            shared,
+            cur_gen: 0,
+            fill_pos: 0,
+            nch,
+            frames,
+            scratch: vec![0.0; nch.max(1) * CHUNK_FRAMES],
+        };
+        (voice, worker)
+    }
+
+    impl StreamVoice {
+        /// This voice is for the pooled audio at `ptr`.
+        pub fn is_for(&self, ptr: usize) -> bool {
+            self.src_ptr == ptr
+        }
+
+        /// Force the next block to reseek (playback stopped, or the playhead jumped).
+        pub fn invalidate(&mut self) {
+            self.next_pos = None;
+        }
+
+        /// Tell the worker (lock-free) to discard and refill from `pos`, and expect `pos` next.
+        fn seek(&mut self, pos: u64) {
+            self.cur_gen = self.cur_gen.wrapping_add(1);
+            self.shared.want_pos.store(pos, Ordering::Relaxed);
+            self.shared.generation.store(self.cur_gen, Ordering::Release);
+            self.next_pos = Some(pos);
+        }
+
+        /// Fill `win[ch][0..need]` with `need` source frames from `w0`, popping the ring. Missing
+        /// frames (the worker has not caught up, or we are past `frames_total`) stay at the silence
+        /// `win` is cleared to; a genuine underrun (inside the file) is logged at most once.
+        fn fill(&mut self, w0: u64, need: usize, nch: usize, frames_total: u64, win: &mut [Vec<f32>]) {
+            for ch in win.iter_mut().take(nch) {
+                for x in ch.iter_mut().take(need) {
+                    *x = 0.0;
+                }
+            }
+            let mut filled = 0usize;
+            while filled < need {
+                let want = w0.saturating_add(filled as u64);
+                let (g, p, data) = match self.consumer.peek() {
+                    Ok(f) => (f.generation, f.pos, f.data),
+                    Err(_) => break, // ring empty
+                };
+                if g != self.cur_gen {
+                    let _ = self.consumer.pop(); // stale: read before the last seek
+                    continue;
+                }
+                if p < want {
+                    let _ = self.consumer.pop(); // behind the window: drop
+                    continue;
+                }
+                if p > want {
+                    break; // a gap the worker has not filled yet
+                }
+                let _ = self.consumer.pop();
+                for ch in 0..nch {
+                    if let (Some(dst), Some(v)) = (win.get_mut(ch).and_then(|c| c.get_mut(filled)), data.get(ch)) {
+                        *dst = *v;
+                    }
+                }
+                filled += 1;
+            }
+            if filled < need && w0.saturating_add(filled as u64) < frames_total && !self.logged_underrun {
+                log::warn!("streamed audio ring underrun: {} frame(s) silent (pre-read worker fell behind)", need - filled);
+                self.logged_underrun = true;
+            }
+        }
+    }
+
+    /// Realtime render of one streamed audio clip into `buf`, popping from this strip's ring voices.
+    /// Reads nothing from disk, allocates nothing, never blocks. Time-stretched streamed clips are
+    /// not supported on the audio thread (they need non-sequential reads): such a clip is silent
+    /// (logged once); everything resident, and every offline render, stretches as before.
+    pub fn render_clip_rt(
+        voices: &mut [StreamVoice],
+        win: &mut [Vec<f32>],
+        s: &Session,
+        clip: &Clip,
+        pos: Samples,
+        frames: usize,
+        buf: &mut [Vec<f32>],
+    ) {
+        let ClipContent::Audio { source, offset } = clip.content else { return };
+        let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
+        let Some(isect) = clip.range().intersect(&block) else { return };
+        let Some(audio) = s.pool.get(source) else { return };
+        if audio.is_resident() {
+            return;
+        }
+        let nsrc = audio.num_channels().min(MAX_STREAM_CH);
+        if nsrc == 0 {
+            return;
+        }
+        let i0 = usize::try_from(isect.start - pos).unwrap_or(0);
+        let i1 = usize::try_from(isect.end - pos).unwrap_or(0).min(frames);
+        if i1 <= i0 {
+            return;
+        }
+        let need = i1 - i0;
+        let ptr = Arc::as_ptr(audio) as *const () as usize;
+        let Some(voice) = voices.iter_mut().find(|v| v.is_for(ptr)) else {
+            return; // unprovisioned (e.g. pool changed mid-block): silence until the next sync
+        };
+        let stretch = if clip.stretch.is_finite() && clip.stretch > 0.0 { clip.stretch } else { 1.0 };
+        if (stretch - 1.0).abs() > 1e-9 {
+            if !voice.logged_unsupported {
+                log::warn!("streamed time-stretch is not supported on the audio thread; clip plays silent until consolidated");
+                voice.logged_unsupported = true;
+            }
+            return;
+        }
+        let w0i = offset.saturating_add(isect.start.saturating_sub(clip.start));
+        if w0i < 0 {
+            return; // before the source start: silence
+        }
+        let w0 = w0i as u64;
+        // The window is pre-sized in provisioning to [MAX_STREAM_CH][max_block]; need ≤ frames ≤
+        // max_block, so this never fires on the audio thread — but bail to silence (no alloc) if it
+        // somehow would.
+        if win.len() < nsrc || win.first().map_or(0, Vec::len) < need {
+            return;
+        }
+        if voice.next_pos != Some(w0) {
+            voice.seek(w0);
+        }
+        let frames_total = audio.frames() as u64;
+        voice.fill(w0, need, nsrc, frames_total, win);
+        voice.next_pos = Some(w0.saturating_add(need as u64));
+        // Same gain evaluation/interpolation as the resident path, sampling the popped window
+        // (window index `k - i0` is source frame `offset + rel`).
+        const STEP: usize = 32;
+        for (ch, dst) in buf.iter_mut().enumerate() {
+            let Some(wch) = win.get(ch % nsrc).map(Vec::as_slice) else { continue };
+            let mut i = i0;
+            while i < i1 {
+                let seg_end = (i + STEP).min(i1);
+                let rel0 = pos.saturating_add(i as i64).saturating_sub(clip.start);
+                let rel1 = pos.saturating_add(seg_end.saturating_sub(1) as i64).saturating_sub(clip.start);
+                let g0 = clip.gain_at(rel0);
+                let g1 = clip.gain_at(rel1.min(clip.length));
+                let n = (seg_end - i).saturating_sub(1).max(1) as f32;
+                for k in i..seg_end {
+                    let v = wch.get(k - i0).copied().unwrap_or(0.0);
+                    let t = (k - i) as f32 / n;
+                    if let Some(d) = dst.get_mut(k) {
+                        *d += v * (g0 + (g1 - g0) * t);
+                    }
+                }
+                i = seg_end;
+            }
+        }
+    }
+
+    /// The single pre-read worker: tops every ring up, obeys seeks, and exits when `stop` is set.
+    pub struct StreamWorker {
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StreamWorker {
+        pub fn spawn(voices: Vec<WorkerVoice>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop2 = Arc::clone(&stop);
+            let join = std::thread::Builder::new().name("pa-stream-preread".into()).spawn(move || worker_loop(voices, &stop2)).ok();
+            StreamWorker { stop, join }
+        }
+    }
+
+    impl Drop for StreamWorker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn worker_loop(mut voices: Vec<WorkerVoice>, stop: &AtomicBool) {
+        while !stop.load(Ordering::Acquire) {
+            let mut did = false;
+            for v in &mut voices {
+                let g = v.shared.generation.load(Ordering::Acquire);
+                if g != v.cur_gen {
+                    v.cur_gen = g;
+                    v.fill_pos = v.shared.want_pos.load(Ordering::Relaxed);
+                    // We cannot pop the ring (the consumer owns that end), but every frame from here
+                    // carries the new generation, so the consumer drops the stale leftovers itself.
+                }
+                while v.fill_pos < v.frames {
+                    let space = v.prod.slots();
+                    if space == 0 {
+                        break;
+                    }
+                    let remaining = v.frames.saturating_sub(v.fill_pos);
+                    let n = space.min(CHUNK_FRAMES).min(usize::try_from(remaining).unwrap_or(CHUNK_FRAMES));
+                    if n == 0 {
+                        break;
+                    }
+                    for ch in 0..v.nch {
+                        if let Some(dst) = v.scratch.get_mut(ch * n..ch * n + n) {
+                            v.audio.read(ch, v.fill_pos, dst);
+                        }
+                    }
+                    for f in 0..n {
+                        let mut data = [0.0f32; MAX_STREAM_CH];
+                        for ch in 0..v.nch {
+                            if let (Some(d), Some(sv)) = (data.get_mut(ch), v.scratch.get(ch * n + f)) {
+                                *d = *sv;
+                            }
+                        }
+                        if v.prod.push(RingFrame { generation: v.cur_gen, pos: v.fill_pos + f as u64, data }).is_err() {
+                            break;
+                        }
+                    }
+                    v.fill_pos = v.fill_pos.saturating_add(n as u64);
+                    did = true;
+                    // A seek that arrived mid-fill: stop pushing stale frames and pick it up.
+                    if v.shared.generation.load(Ordering::Acquire) != v.cur_gen {
+                        break;
+                    }
+                }
+            }
+            if !did {
+                std::thread::park_timeout(WORKER_POLL);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions};
+
+        fn streamed(channels: Vec<Vec<f32>>, sr: u32) -> Arc<SourceAudio> {
+            let buf = AudioBuffer { sample_rate: sr, channels };
+            let opts = EncodeOptions { format: soundcraft_audio_io::FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
+            let bytes = soundcraft_audio_io::encode(&buf, &opts).expect("encode");
+            let len = bytes.len() as u64;
+            let reader = soundcraft_audio_io::StreamReader::from_source(std::io::Cursor::new(bytes), len, Some("wav")).expect("open");
+            let peaks = reader.build_peaks().expect("peaks");
+            Arc::new(SourceAudio::streamed(reader, "audio/t.wav", soundcraft_audio_io::FileFormat::Wav, peaks))
+        }
+
+        /// The worker fills the ring and the consumer pops exactly the source samples, in sequence,
+        /// across contiguous blocks — the realtime read path end to end (no mix engine).
+        #[test]
+        fn worker_feeds_consumer_in_order() {
+            let left: Vec<f32> = (0..20_000).map(|i| (i as f32 * 0.01).sin()).collect();
+            let right: Vec<f32> = (0..20_000).map(|i| (i as f32 * 0.02).cos() * 0.5).collect();
+            let audio = streamed(vec![left.clone(), right.clone()], 48_000);
+            let (mut voice, worker) = provision(&audio);
+            let _w = StreamWorker::spawn(vec![worker]);
+            let mut win = vec![vec![0.0f32; 1024]; MAX_STREAM_CH];
+            let mut l = Vec::new();
+            let mut r = Vec::new();
+            let mut pos = 0u64;
+            // Read 16 blocks of 512 frames, waiting briefly for the worker to keep up.
+            for _ in 0..16 {
+                let need = 512;
+                if voice.next_pos != Some(pos) {
+                    voice.seek(pos);
+                }
+                // Give the worker time to fill before popping (test only; the callback never waits).
+                for _ in 0..200 {
+                    if voice.consumer.slots() >= need {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                voice.fill(pos, need, 2, 20_000, &mut win);
+                voice.next_pos = Some(pos + need as u64);
+                l.extend_from_slice(&win[0][..need]);
+                r.extend_from_slice(&win[1][..need]);
+                pos += need as u64;
+            }
+            assert_eq!(l, left[..l.len()]);
+            assert_eq!(r, right[..r.len()]);
+        }
+
+        /// After a seek, the consumer drops the pre-seek frames and lands on the new position.
+        #[test]
+        fn seek_lands_on_the_new_position() {
+            let mono: Vec<f32> = (0..30_000).map(|i| i as f32 / 30_000.0 - 0.5).collect();
+            let audio = streamed(vec![mono.clone()], 48_000);
+            let (mut voice, worker) = provision(&audio);
+            let _w = StreamWorker::spawn(vec![worker]);
+            let mut win = vec![vec![0.0f32; 1024]; MAX_STREAM_CH];
+            // Prime at 0, then jump to 10_000.
+            voice.seek(0);
+            std::thread::sleep(Duration::from_millis(10));
+            voice.fill(0, 256, 1, 30_000, &mut win);
+            voice.seek(10_000);
+            let need = 256;
+            // A full ring of pre-seek frames must be drained (by generation) before the worker can
+            // refill from 10_000. In playback render_clip_rt does this every block; here we drop the
+            // stale frames, wait for the worker to buffer the window, then read it once.
+            let mut landed = false;
+            for _ in 0..400 {
+                while let Ok(f) = voice.consumer.peek() {
+                    if f.generation == voice.cur_gen {
+                        break;
+                    }
+                    let _ = voice.consumer.pop();
+                }
+                if voice.consumer.slots() >= need {
+                    voice.fill(10_000, need, 1, 30_000, &mut win);
+                    if win[0][..need] == mono[10_000..10_000 + need] {
+                        landed = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(landed, "seek did not land on the new position within the deadline");
+        }
+    }
+}
+
+/// Whether `clip` plays a streamed (on-demand) source — such clips are read through the ring on
+/// the audio thread rather than from disk.
+#[cfg(not(target_arch = "wasm32"))]
+fn clip_is_streamed(s: &Session, clip: &Clip) -> bool {
+    matches!(clip.content, ClipContent::Audio { source, .. } if s.pool.get(source).is_some_and(|a| !a.is_resident()))
+}
+
+/// Render one audio clip into `buf` on a non-realtime path (offline bounce/consolidation/analysis,
+/// and the browser). Resident sources read their in-memory slices; streamed sources read
+/// synchronously through [`SourceAudio::read`] — bounded, allocating a per-call window off the
+/// audio thread. The realtime audio thread never calls this for a streamed clip; [`process_strip`]
+/// routes those to the lock-free ring in [`mod@stream`].
 fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
     let Some(audio) = s.pool.get(source) else { return };
-    let nsrc = audio.buffer.channels.len();
-    if nsrc == 0 {
-        return;
-    }
     let stretch = if clip.stretch.is_finite() && clip.stretch > 0.0 { clip.stretch } else { 1.0 };
     let i0 = usize::try_from(isect.start - pos).unwrap_or(0);
     let i1 = usize::try_from(isect.end - pos).unwrap_or(0).min(frames);
     // Gain is evaluated every 32 samples and interpolated (fades and envelopes stay smooth).
     const STEP: usize = 32;
+    if audio.is_resident() {
+        let nsrc = audio.buffer.channels.len();
+        if nsrc == 0 {
+            return;
+        }
+        for (ch, dst) in buf.iter_mut().enumerate() {
+            let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+            let mut i = i0;
+            while i < i1 {
+                let seg_end = (i + STEP).min(i1);
+                let rel0 = pos.saturating_add(i as i64).saturating_sub(clip.start);
+                // The last sample of this step, not the first sample of the next one, so a breakpoint
+                // on the boundary does not ramp the audio before it.
+                let rel1 = pos.saturating_add(seg_end.saturating_sub(1) as i64).saturating_sub(clip.start);
+                let g0 = clip.gain_at(rel0);
+                let g1 = clip.gain_at(rel1.min(clip.length));
+                let n = (seg_end - i).saturating_sub(1).max(1) as f32;
+                for k in i..seg_end {
+                    let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
+                    let v = if (stretch - 1.0).abs() < 1e-9 {
+                        usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    } else {
+                        let f = offset as f64 + rel as f64 / stretch;
+                        let x0 = f.floor();
+                        let fr = (f - x0) as f32;
+                        let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
+                        let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                        a + (b - a) * fr
+                    };
+                    let t = (k - i) as f32 / n;
+                    if let Some(d) = dst.get_mut(k) {
+                        *d += v * (g0 + (g1 - g0) * t);
+                    }
+                }
+                i = seg_end;
+            }
+        }
+        return;
+    }
+    // Streamed source, read synchronously (never on the audio thread). Read the whole source window
+    // this block touches once, then sample it exactly as the resident path samples its slices.
+    let nsrc = audio.num_channels();
+    if nsrc == 0 || i1 <= i0 {
+        return;
+    }
+    let rel0 = isect.start.saturating_sub(clip.start);
+    let rel_last = isect.end.saturating_sub(1).saturating_sub(clip.start);
+    let (a0, a1) = if (stretch - 1.0).abs() < 1e-9 {
+        (offset.saturating_add(rel0) as f64, offset.saturating_add(rel_last) as f64)
+    } else {
+        (offset as f64 + rel0 as f64 / stretch, offset as f64 + rel_last as f64 / stretch)
+    };
+    let w0 = a0.floor().max(0.0) as i64;
+    let w1 = (a1.floor() as i64).saturating_add(2);
+    // Bound a pathological tiny-stretch window; beyond it the clip is simply silent.
+    const MAX_WIN: usize = 1 << 24;
+    let len = usize::try_from(w1 - w0).unwrap_or(0);
+    if len == 0 || len > MAX_WIN {
+        return;
+    }
+    let mut win: Vec<Vec<f32>> = Vec::with_capacity(nsrc);
+    for ch in 0..nsrc {
+        let mut c = vec![0.0f32; len];
+        audio.read(ch, w0 as u64, &mut c);
+        win.push(c);
+    }
     for (ch, dst) in buf.iter_mut().enumerate() {
-        let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let wch = win.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
             let rel0 = pos.saturating_add(i as i64).saturating_sub(clip.start);
-            // The last sample of this step, not the first sample of the next one, so a breakpoint
-            // on the boundary does not ramp the audio before it.
             let rel1 = pos.saturating_add(seg_end.saturating_sub(1) as i64).saturating_sub(clip.start);
             let g0 = clip.gain_at(rel0);
             let g1 = clip.gain_at(rel1.min(clip.length));
@@ -1447,13 +2069,15 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    let idx = offset.saturating_add(rel).saturating_sub(w0);
+                    if idx < 0 { 0.0 } else { wch.get(idx as usize).copied().unwrap_or(0.0) }
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                    let ia = (x0 as i64).saturating_sub(w0);
+                    let a = if x0 >= 0.0 && ia >= 0 { wch.get(ia as usize).copied().unwrap_or(0.0) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 && ia + 1 >= 0 { wch.get((ia + 1) as usize).copied().unwrap_or(0.0) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -1610,18 +2234,43 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
     }
 }
 
-/// Session audio shared with a sample-playing instrument.
-struct PoolSample(Arc<SourceAudio>);
+/// Session audio shared with a sample-playing instrument. A sample-playing instrument reads whole
+/// channel slices on the audio thread, so a streamed source is loaded resident once here (off the
+/// audio thread, in `sync`); a resident source is shared by `Arc` with no copy.
+enum PoolSample {
+    Resident(Arc<SourceAudio>),
+    Loaded { sample_rate: f32, channels: Vec<Vec<f32>> },
+}
+
+impl PoolSample {
+    fn new(audio: &Arc<SourceAudio>) -> Self {
+        if audio.is_resident() {
+            PoolSample::Resident(Arc::clone(audio))
+        } else {
+            let buf = audio.load_resident();
+            PoolSample::Loaded { sample_rate: buf.sample_rate as f32, channels: buf.channels }
+        }
+    }
+}
 
 impl SampleSource for PoolSample {
     fn sample_rate(&self) -> f32 {
-        self.0.buffer.sample_rate as f32
+        match self {
+            PoolSample::Resident(a) => a.sample_rate() as f32,
+            PoolSample::Loaded { sample_rate, .. } => *sample_rate,
+        }
     }
     fn num_channels(&self) -> usize {
-        self.0.buffer.num_channels()
+        match self {
+            PoolSample::Resident(a) => a.num_channels(),
+            PoolSample::Loaded { channels, .. } => channels.len(),
+        }
     }
     fn channel(&self, ch: usize) -> Option<&[f32]> {
-        self.0.channel(ch)
+        match self {
+            PoolSample::Resident(a) => a.channel(ch),
+            PoolSample::Loaded { channels, .. } => channels.get(ch).map(Vec::as_slice),
+        }
     }
 }
 
@@ -1638,7 +2287,7 @@ fn sync_sample(strip: &mut Strip, want: Option<&soundcraft_model::Insert>, s: &S
         return;
     }
     if let Some(inst) = strip.instrument.as_mut() {
-        let shared = audio.map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
+        let shared = audio.map(|a| Arc::new(PoolSample::new(a)) as Arc<dyn SampleSource>);
         inst.plugin.set_sample(shared);
     }
     strip.sample = audio.cloned();
@@ -2343,6 +2992,54 @@ mod tests {
             pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
         }
         t
+    }
+
+    fn session_with_source(audio: Arc<SourceAudio>, frames: i64, offset: i64) -> Session {
+        let mut s = Session::default();
+        let ch = audio.num_channels().max(1);
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(ch), None);
+        s.pool.insert(SourceId(901), audio);
+        let id = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(Clip::audio(id, "src", SourceId(901), offset, 0, frames));
+        }
+        s
+    }
+
+    /// An offline render of a streamed source must equal the render of the same audio resident:
+    /// the streamed-sync path in `render_clip` samples the file exactly as the resident path
+    /// samples its slices (same gains, same fades, same offset).
+    #[test]
+    fn offline_streamed_render_matches_resident() {
+        let left: Vec<f32> = (0..12_000).map(|i| (i as f32 * 0.011).sin() * 0.7).collect();
+        let right: Vec<f32> = (0..12_000).map(|i| (i as f32 * 0.019).cos() * 0.4).collect();
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![left.clone(), right.clone()] };
+        let opts = soundcraft_audio_io::EncodeOptions {
+            format: soundcraft_audio_io::FileFormat::Wav,
+            bit_depth: soundcraft_audio_io::BitDepth::Float32,
+            dither: false,
+            bwf: None,
+        };
+        let bytes = soundcraft_audio_io::encode(&buf, &opts).expect("encode");
+        let len = bytes.len() as u64;
+        let reader = soundcraft_audio_io::StreamReader::from_source(std::io::Cursor::new(bytes), len, Some("wav")).expect("open");
+        let peaks = reader.build_peaks().expect("peaks");
+        let streamed = Arc::new(SourceAudio::streamed(reader, "audio/t.wav", soundcraft_audio_io::FileFormat::Wav, peaks));
+        let resident = Arc::new(SourceAudio::new(buf));
+        assert!(!streamed.is_resident() && resident.is_resident());
+
+        let offset = 1500;
+        let frames = 9000;
+        let a = render_range(&session_with_source(streamed, frames, offset), Range::new(0, frames), 512);
+        let b = render_range(&session_with_source(resident, frames, offset), Range::new(0, frames), 512);
+        assert_eq!(a.len(), b.len());
+        for (ca, cb) in a.iter().zip(b.iter()) {
+            assert_eq!(ca.len(), cb.len());
+            for (x, y) in ca.iter().zip(cb.iter()) {
+                assert!((x - y).abs() < 1e-6, "streamed {x} vs resident {y}");
+            }
+        }
+        assert!(a.iter().any(|c| c.iter().any(|v| v.abs() > 0.01)), "rendered something");
     }
 
     #[test]

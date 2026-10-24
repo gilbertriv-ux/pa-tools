@@ -209,7 +209,10 @@ impl Autosave {
                     let name = format!("{} {}.wav", sanitize_name(&src.name), self.next);
                     self.next += 1;
                     let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
-                    let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+                    // A streamed source holds no resident samples; read it in so the autosave copy
+                    // is the real audio, not a silent buffer.
+                    let buf = audio.load_resident();
+                    let bytes = soundcraft_audio_io::encode(&buf, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
                     std::fs::create_dir_all(&audio_dir)
                         .and_then(|()| write_synced(&audio_dir.join(&name), &bytes))
                         .map_err(|err| io_error(&audio_dir, err))?;
@@ -443,7 +446,16 @@ mod tests {
 
     fn levels(e: &Engine) -> Vec<f32> {
         let s = e.session();
-        s.sources.iter().map(|src| s.pool.get(src.id).map_or(f32::NAN, |a| a.buffer.channels[0][0])).collect()
+        s.sources
+            .iter()
+            .map(|src| {
+                s.pool.get(src.id).map_or(f32::NAN, |a| {
+                    let mut v = [0.0f32];
+                    a.read(0, 0, &mut v);
+                    v[0]
+                })
+            })
+            .collect()
     }
 
     #[test]

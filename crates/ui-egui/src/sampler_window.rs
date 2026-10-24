@@ -175,9 +175,9 @@ pub fn sample_strip(app: &mut SoundApp, ui: &mut Ui, tid: TrackId, ins: &Insert)
     });
     let info = match (&source, &audio) {
         (Some(src), Some(a)) => {
-            let rate = a.buffer.sample_rate.max(1);
+            let rate = a.sample_rate().max(1);
             let secs = a.frames() as f64 / f64::from(rate);
-            let width = match a.buffer.num_channels() {
+            let width = match a.num_channels() {
                 1 => "mono".to_string(),
                 2 => "stereo".to_string(),
                 n => format!("{n} ch"),
@@ -215,11 +215,15 @@ pub fn sample_strip(app: &mut SoundApp, ui: &mut Ui, tid: TrackId, ins: &Insert)
     for (c, peaks) in audio.peaks.iter().take(lanes).enumerate() {
         let mid = r.min.y + lane_h * (c as f32 + 0.5);
         let half = lane_h * 0.45;
-        let samples = audio.channel(c).unwrap_or_default();
+        // Streamed sources hold no resident samples; draw them from the overview alone.
+        let samples = audio.channel(c);
         for i in 0..cols {
             let a = frames.saturating_mul(i) / cols;
             let b = (frames.saturating_mul(i + 1) / cols).max(a + 1);
-            let (lo, hi) = peaks.minmax(samples, a, b);
+            let (lo, hi) = match samples {
+                Some(s) => peaks.minmax(s, a, b),
+                None => peaks.minmax_overview(a, b),
+            };
             let x = r.min.x + i as f32 + 0.5;
             p.line_segment([pos2(x, mid - hi.clamp(-1.0, 1.0) * half), pos2(x, mid - lo.clamp(-1.0, 1.0) * half)], Stroke::new(1.0, wave));
         }

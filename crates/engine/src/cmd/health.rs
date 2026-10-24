@@ -47,13 +47,15 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
                     );
                     continue;
                 };
-                if audio.buffer.sample_rate != s.sample_rate.hz() {
+                if audio.sample_rate() != s.sample_rate.hz() {
                     add("sample_rate_mismatch", "Loaded audio differs from the session sample rate. Reimport it to convert to the session rate.");
                 }
-                if audio.buffer.channels.is_empty() || audio.frames() == 0 {
+                if audio.num_channels() == 0 || audio.frames() == 0 {
                     add("empty_audio", "Loaded audio has no playable frames. Reimport a valid audio file.");
                     continue;
                 }
+                // A streamed source has uniform channel lengths by construction, so this only
+                // applies to resident audio.
                 if audio.buffer.channels.iter().any(|channel| channel.len() != audio.frames()) {
                     add(
                         "uneven_channels",

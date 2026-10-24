@@ -114,13 +114,58 @@ impl Peaks {
     /// The spans of sample positions `[start + c * step, start + (c + 1) * step + overlap]` that
     /// reach the data, clamped to it.
     fn windows(&self, samples: &[f32], start: f64, step: f64, overlap: f64, cols: usize) -> impl Iterator<Item = Option<(f64, f64)>> {
-        let n = self.len.min(samples.len());
+        self.windows_n(self.len.min(samples.len()), start, step, overlap, cols)
+    }
+
+    /// [`Peaks::windows`] against an explicit sample count `n` (so the overview-only methods can run
+    /// without the samples themselves).
+    fn windows_n(&self, n: usize, start: f64, step: f64, overlap: f64, cols: usize) -> impl Iterator<Item = Option<(f64, f64)>> {
         let valid = n > 0 && start.is_finite() && step.is_finite() && step > 0.0 && overlap.is_finite() && overlap >= 0.0;
         let last = n.saturating_sub(1) as f64;
         (0..cols.min(MAX_COLUMNS)).map(move |c| {
             let (a, b) = (start + step * c as f64, start + step * (c + 1) as f64 + overlap);
             (valid && b >= 0.0 && a <= last).then(|| (a.max(0.0), b.min(last)))
         })
+    }
+
+    /// (min, max) over `[start, end)` from the overview alone (no samples). The ragged edges are
+    /// rounded out to whole level-0 blocks, so it is coarser than [`Peaks::minmax`] by at most
+    /// [`BLOCK`] samples on each side — invisible at the zoomed-out levels a streamed source draws
+    /// its waveform at, where no resident samples are held to refine the edges.
+    pub fn minmax_overview(&self, start: usize, end: usize) -> (f32, f32) {
+        self.sum_pyramid(start, end).range()
+    }
+
+    /// [`Peaks::sum`] from the overview alone: whole level-0 blocks covering `[start, end)`.
+    fn sum_pyramid(&self, start: usize, end: usize) -> Block {
+        let end = end.min(self.len);
+        if start >= end {
+            return Block::EMPTY;
+        }
+        let first = start / BLOCK;
+        let last = (end - 1) / BLOCK + 1;
+        self.blocks(first, last)
+    }
+
+    /// [`Peaks::spans`] from the overview alone (no samples), for streamed sources. Fractional
+    /// span ends round out to whole samples; the per-sample interpolation `spans` does at its ends
+    /// is dropped (there are no resident samples to interpolate between).
+    pub fn spans_overview(&self, start: f64, step: f64, overlap: f64, cols: usize) -> Vec<Option<(f32, f32)>> {
+        self.windows_n(self.len, start, step, overlap, cols)
+            .map(|w| w.map(|(a, b)| self.sum_pyramid(a.floor() as usize, (b.ceil() as usize).saturating_add(1)).range()))
+            .collect()
+    }
+
+    /// [`Peaks::rms_spans`] from the overview alone (no samples), for streamed sources.
+    pub fn rms_spans_overview(&self, start: f64, step: f64, overlap: f64, cols: usize) -> Vec<Option<f32>> {
+        self.windows_n(self.len, start, step, overlap, cols)
+            .map(|w| {
+                w.map(|(a, b)| {
+                    let (s, e) = (a.floor() as usize, (b.ceil() as usize).saturating_add(1).min(self.len));
+                    (self.sum_pyramid(s, e).squares / e.saturating_sub(s).max(1) as f32).sqrt()
+                })
+            })
+            .collect()
     }
 
     /// (min, max) of the line through `samples` over each of `cols` spans of sample positions
@@ -231,6 +276,27 @@ mod tests {
 
     fn signal(n: usize) -> Vec<f32> {
         (0..n).map(|i| ((i as f32 * 0.037).sin() * (i as f32 * 0.0011).cos()) + if i % 997 == 0 { 0.5 } else { 0.0 }).collect()
+    }
+
+    #[test]
+    fn overview_minmax_covers_the_exact_range() {
+        // The overview-only query rounds out to whole blocks, so it must contain the exact (min,
+        // max) of any range — never clip it — and must agree exactly on block-aligned ranges.
+        let x = signal(50_000);
+        let p = Peaks::build(&x);
+        for &(a, b) in &[(0, BLOCK), (0, 50_000), (BLOCK, 64 * BLOCK), (100, 200), (12_345, 23_456)] {
+            let (elo, ehi) = brute(&x, a, b);
+            let (olo, ohi) = p.minmax_overview(a, b);
+            assert!(olo <= elo + 1e-6 && ohi >= ehi - 1e-6, "overview {a}..{b} must contain the exact range");
+        }
+        // Block-aligned ranges are exact.
+        assert_eq!(p.minmax_overview(0, 64 * BLOCK), p.minmax(&x, 0, 64 * BLOCK));
+        // Empty overview is silent.
+        assert_eq!(Peaks::default().minmax_overview(0, 10), (0.0, 0.0));
+        // spans_overview produces the requested column count and no sample panics.
+        let spans = p.spans_overview(0.0, 123.0, 0.0, 300);
+        assert_eq!(spans.len(), 300);
+        assert!(p.rms_spans_overview(0.0, 123.0, 0.0, 300).iter().all(|r| r.is_none_or(f32::is_finite)));
     }
 
     #[test]

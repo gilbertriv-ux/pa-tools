@@ -158,6 +158,39 @@ impl SourceAudio {
         }
     }
 
+    /// The whole source as a resident [`AudioBuffer`], reading every frame of a streamed source
+    /// into fresh `Vec`s (a plain clone for an already-resident one). Offline/analysis code that
+    /// needs whole channels as slices uses this; it allocates the full audio, so callers keep it to
+    /// bounded sizes. Never called from the audio callback.
+    pub fn load_resident(&self) -> AudioBuffer {
+        match &self.backing {
+            Backing::Resident => self.buffer.clone(),
+            Backing::Streamed(_) => {
+                let frames = self.frames();
+                let nch = self.num_channels();
+                let sr = self.sample_rate();
+                // Read each channel in bounded chunks so a huge file never over-allocates scratch;
+                // `read` zero-pads past EOF, so the tail is already silent.
+                const CHUNK: usize = 1 << 16;
+                let channels = (0..nch)
+                    .map(|ch| {
+                        let mut c = vec![0.0f32; frames];
+                        let mut done = 0usize;
+                        while done < frames {
+                            let n = (frames - done).min(CHUNK);
+                            if let Some(dst) = c.get_mut(done..done + n) {
+                                self.read(ch, done as u64, dst);
+                            }
+                            done += n;
+                        }
+                        c
+                    })
+                    .collect();
+                AudioBuffer { sample_rate: sr, channels }
+            }
+        }
+    }
+
     /// The streamed source's file path, or `None` for a resident source.
     pub fn stream_path(&self) -> Option<&str> {
         match &self.backing {
@@ -321,6 +354,22 @@ mod tests {
         assert!(streamed.buffer.channels.is_empty());
         assert_eq!(streamed.buffer.sample_rate, 48_000);
         assert_eq!(streamed.peaks.len(), 2);
+    }
+
+    #[test]
+    fn load_resident_matches_the_samples() {
+        let left = tone(900, 0.013);
+        let right = tone(900, 0.021);
+        let streamed = streamed_source(&left, &right);
+        assert!(!streamed.is_resident());
+        let buf = streamed.load_resident();
+        assert_eq!(buf.sample_rate, 48_000);
+        assert_eq!(buf.channels.len(), 2);
+        assert_eq!(buf.channels[0], left);
+        assert_eq!(buf.channels[1], right);
+        // A resident source just clones.
+        let resident = SourceAudio::new(AudioBuffer { sample_rate: 44_100, channels: vec![left.clone()] });
+        assert_eq!(resident.load_resident().channels[0], left);
     }
 
     #[test]
