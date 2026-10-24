@@ -12,6 +12,7 @@ It is a fork of SoundCraft (storytold/soundcraft, MIT OR Apache-2.0, fork point 
 ## Gil's hard gates
 These apply to every agent and every session, on top of everything below.
 - **Never overwrite, delete, move or rename anything on Gil's drives.** To relocate, copy to the new path and leave the original. If a write would hit an existing file, stop and ask.
+- **Scope of the no-delete gate:** it covers Gil's computer and external drives (`/Volumes`, `/Users`, `~`, `/Applications`). Scratch inside a cloud container (`/tmp`, build output, caches the agent itself created) may be deleted freely; say which path you removed. `.claude/hooks/block-drive-deletes.sh` enforces this for shell commands.
 - **Write only to `4 TB Q`** (`/Volumes/4 TB Q`) on Gil's machines. In a cloud or scratch checkout, work inside that checkout.
 - **A redo is a new version, in a new folder** (V1, V2, V3…) kept beside the old one. Never replace it. Don't patch a defect: rebuild it from the originals at full quality.
 - **Announce every folder and file at the moment you create it**, with its exact name and full path.
