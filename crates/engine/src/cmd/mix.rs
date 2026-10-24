@@ -60,6 +60,20 @@ pub fn specs() -> Vec<CommandSpec> {
             },
             |tr| tr.mixer.input_monitor
         )),
+        cmd!("mix.midi_monitor", "MIDI Input Monitoring", [], None, "{tracks?, value?: bool}", has_selection, |e, p| toggle(
+            e,
+            p,
+            "mix.midi_monitor",
+            // MIDI thru / live monitoring: hear a hosted instrument played in live from a hardware
+            // MIDI input, without recording. Reuses the input-monitor flag, but only on MIDI and
+            // instrument tracks (where live MIDI goes).
+            |s, t, v| {
+                if let Some(tr) = s.track_mut(t).filter(|tr| tr.kind.is_midi()) {
+                    tr.mixer.input_monitor = v
+                }
+            },
+            |tr| tr.kind.is_midi() && tr.mixer.input_monitor
+        )),
         cmd!("mix.phase_invert", "Phase Invert", [], None, "{tracks?, value?: bool}", has_selection, |e, p| toggle(
             e,
             p,
@@ -1006,5 +1020,28 @@ mod tests {
         assert_eq!(r["slot"], 0);
         let r = e.execute("mix.send", &json!({"track": "Gtr", "bus": "Verb"})).unwrap();
         assert_eq!(r["slot"], 0);
+    }
+
+    #[test]
+    fn midi_monitor_toggles_only_midi_and_instrument_tracks() {
+        let mut e = Engine::default();
+        let keys = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        let pads = e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Stereo, Some("Pads"));
+        let vox = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Vox"));
+        let on = |e: &Engine, t: TrackId| e.session().track(t).map(|tr| tr.mixer.input_monitor).unwrap_or(false);
+
+        // Explicit value on the MIDI/instrument tracks.
+        let r = e.execute("mix.midi_monitor", &json!({"tracks": [keys.0, pads.0], "value": true})).unwrap();
+        assert_eq!(r, json!({"value": true}));
+        assert!(on(&e, keys) && on(&e, pads));
+
+        // An audio track is left untouched even if named.
+        e.execute("mix.midi_monitor", &json!({"tracks": [vox.0], "value": true})).unwrap();
+        assert!(!on(&e, vox), "live MIDI monitoring does not apply to audio tracks");
+
+        // No value flips the current state (both on → off).
+        let r = e.execute("mix.midi_monitor", &json!({"tracks": [keys.0, pads.0]})).unwrap();
+        assert_eq!(r, json!({"value": false}));
+        assert!(!on(&e, keys) && !on(&e, pads));
     }
 }

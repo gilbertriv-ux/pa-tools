@@ -13,6 +13,7 @@
 use serde_json::Value;
 use soundcraft_midi::{PPQ, Sequence};
 use soundcraft_model::{Session, TrackId};
+use soundcraft_playback::live_midi::LiveMidiSender;
 use soundcraft_playback::midi_io::{self, MAX_QUEUE, MidiInput, TimedMessage};
 use soundcraft_playback::midi_record::{DEFAULT_MAX_EVENTS, MidiTake, TakeStats};
 use soundcraft_time::Samples;
@@ -65,6 +66,39 @@ impl Live {
     /// The port's name as the system reports it.
     pub fn name(&self) -> &str {
         self.input.port_name()
+    }
+
+    /// Non-blocking drain of whatever the port has queued since the last call (for live monitoring,
+    /// which forwards the bytes into the player's lock-free live-MIDI ring).
+    pub fn try_messages(&self) -> std::sync::mpsc::TryIter<'_, TimedMessage> {
+        self.rx.try_iter()
+    }
+}
+
+/// MIDI tracks that hear live input monitoring (MIDI thru): instrument/MIDI tracks whose input is
+/// monitored. These sound what is played in, live, through the mix engine without recording.
+pub fn midi_monitored_tracks(s: &Session) -> Vec<TrackId> {
+    s.tracks.iter().filter(|t| t.kind.is_midi() && t.mixer.input_monitor && !t.inactive).map(|t| t.id).collect()
+}
+
+/// An open MIDI input kept for live monitoring and the lock-free sender that forwards its events to
+/// the audio thread. Independent of the recording take: monitoring sounds the notes live; recording
+/// (a [`MidiCapture`]) captures them. Both can be active at once.
+pub struct MidiMonitor {
+    live: Live,
+    sender: LiveMidiSender,
+    port: String,
+}
+
+impl MidiMonitor {
+    /// Drops since this monitor opened (ring full or unusable bytes).
+    pub fn dropped(&self) -> u64 {
+        self.sender.dropped()
+    }
+
+    /// The open port's name.
+    pub fn port(&self) -> &str {
+        &self.port
     }
 }
 
@@ -210,6 +244,54 @@ impl SoundApp {
     pub(crate) fn finish_midi_capture(&mut self) -> Option<Outcome> {
         self.midi_capture.take().map(MidiCapture::finish_now)
     }
+
+    /// Keep live MIDI monitoring in step with the session each frame. When a MIDI input port is
+    /// selected and an Instrument/MIDI track is input-monitored, open the port (once) and forward
+    /// its events into the player's live-MIDI ring so a hosted instrument sounds what is played in,
+    /// without recording. Closes the port when nothing is monitored or the choice changed. Never
+    /// touches the recording path — a take opens its own connection and both receive the input.
+    pub(crate) fn update_midi_monitor(&mut self) {
+        /// Live-MIDI ring size (messages): a few seconds of dense playing.
+        const QUEUE: usize = 4_096;
+        /// Messages forwarded into the ring per frame at most.
+        const DRAIN: usize = MAX_QUEUE;
+
+        let want = self.ui.midi_input.clone().filter(|p| !p.trim().is_empty());
+        let active = self.player.is_some() && !midi_monitored_tracks(self.engine.session()).is_empty();
+        let Some(port) = want.filter(|_| active) else {
+            if self.midi_monitor.take().is_some()
+                && let Some(p) = &self.player
+            {
+                p.disconnect_midi_input();
+            }
+            return;
+        };
+        if self.midi_monitor.as_ref().map(MidiMonitor::port) != Some(port.as_str()) {
+            match (Live::open(&port), &self.player) {
+                (Ok(live), Some(p)) => {
+                    let sender = p.connect_midi_input(QUEUE);
+                    self.midi_monitor = Some(MidiMonitor { live, sender, port });
+                }
+                (Err(e), _) => {
+                    self.ui.status = format!("Cannot open MIDI input “{port}” for monitoring: {e}");
+                    if self.midi_monitor.take().is_some()
+                        && let Some(p) = &self.player
+                    {
+                        p.disconnect_midi_input();
+                    }
+                    return;
+                }
+                (Ok(_), None) => return,
+            }
+        }
+        if let Some(m) = &mut self.midi_monitor {
+            // Collect first so the port borrow ends before the sender is written.
+            let msgs: Vec<TimedMessage> = m.live.try_messages().take(DRAIN).collect();
+            for msg in &msgs {
+                m.sender.push_bytes(msg.bytes());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +408,34 @@ mod tests {
         assert_eq!(ui.midi_input.as_deref(), Some("Keys"), "kept with the preferences");
         let old: crate::UiState = serde_json::from_value(json!({})).unwrap();
         assert_eq!(old.midi_input, None, "preferences saved before this one load unchanged");
+    }
+
+    #[test]
+    fn midi_monitored_tracks_are_the_input_monitored_midi_tracks() {
+        let mut e = Engine::default();
+        let keys = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        let pads = e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Stereo, Some("Pads"));
+        let vox = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Vox"));
+        assert!(midi_monitored_tracks(e.session()).is_empty());
+        for t in [keys, pads, vox] {
+            e.execute("mix.input_monitor", &json!({"tracks": [t.0], "value": true})).unwrap();
+        }
+        // Only the MIDI/instrument tracks count, not the audio track.
+        assert_eq!(midi_monitored_tracks(e.session()), vec![keys, pads]);
+        // The dedicated MIDI-monitor command drives the same flag on MIDI tracks only.
+        e.execute("mix.midi_monitor", &json!({"tracks": [keys.0], "value": false})).unwrap();
+        assert_eq!(midi_monitored_tracks(e.session()), vec![pads]);
+    }
+
+    #[test]
+    fn monitor_update_without_a_port_or_player_opens_nothing() {
+        // No player and no port selected: updating the monitor is a no-op and never panics, even with
+        // a monitored instrument track present. (Opening a real device is unverified here.)
+        let mut app = SoundApp::new(Engine::default(), None, crate::Services::default());
+        let keys = app.engine.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        app.engine.execute("mix.input_monitor", &json!({"tracks": [keys.0], "value": true})).unwrap();
+        app.update_midi_monitor();
+        assert!(app.midi_monitor.is_none());
     }
 
     #[test]

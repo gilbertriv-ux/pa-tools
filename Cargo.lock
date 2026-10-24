@@ -3798,6 +3798,7 @@ dependencies = [
  "log",
  "midir",
  "proptest",
+ "rtrb",
  "serde",
  "serde_json",
  "soundcraft-audio-io",

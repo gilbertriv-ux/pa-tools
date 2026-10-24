@@ -24,6 +24,7 @@
 
 pub mod devices;
 pub mod latency;
+pub mod live_midi;
 pub mod midi_io;
 pub mod midi_record;
 pub mod record;
@@ -32,7 +33,7 @@ pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
-use soundcraft_model::{Session, TrackId};
+use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -67,6 +68,8 @@ enum Cmd {
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
+    /// Connect (`Some`) or disconnect (`None`) the live-MIDI monitoring consumer.
+    MidiInput(Option<live_midi::LiveMidiReceiver>),
     Recording(bool),
     Play {
         from: Samples,
@@ -170,16 +173,24 @@ struct AudioState {
     read: f64,
     device_rate: f64,
     input: Option<Arc<record::InputRing>>,
+    /// Live-MIDI monitoring consumer, drained into the mix engine at the start of each block.
+    midi_in: Option<live_midi::LiveMidiReceiver>,
     recording: bool,
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
 }
 
+/// Most live-MIDI messages drained into the engine per block. Beyond this they wait for the next
+/// block; the ring bounds how many can pile up. Pre-reserved so the drain never allocates.
+const LIVE_MIDI_PER_BLOCK: usize = 512;
+
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
     m.set_external_instances(true);
     m.metronome = true;
+    // Pre-size the live-MIDI buffer so filling it on the audio thread never allocates.
+    m.live_midi = Vec::with_capacity(LIVE_MIDI_PER_BLOCK);
     m
 }
 
@@ -204,6 +215,7 @@ impl AudioState {
             read: 0.0,
             device_rate,
             input: None,
+            midi_in: None,
             recording: false,
         }
     }
@@ -213,6 +225,7 @@ impl AudioState {
         while let Ok(c) = self.rx.try_recv() {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
+                Cmd::MidiInput(r) => self.midi_in = r,
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
                     changed = true;
@@ -308,6 +321,12 @@ impl AudioState {
             }
             ring.pop_into(&mut self.mix.input, n, self.session.sample_rate.hz());
         }
+        // Drain live MIDI played in since the last block into the engine's buffer (consumed by
+        // monitored Instrument tracks). No consumer → no live events this block.
+        match &mut self.midi_in {
+            Some(r) => r.drain_into(&mut self.mix.live_midi),
+            None => self.mix.live_midi.clear(),
+        }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
@@ -334,7 +353,16 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let audio_monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        // Live MIDI monitoring keeps the engine rendering while stopped so a played-in note sounds
+        // through a monitored Instrument/MIDI track, even with no audio input open.
+        let midi_monitoring = self.midi_in.is_some()
+            && self
+                .session
+                .tracks
+                .iter()
+                .any(|t| matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && (t.mixer.input_monitor || t.mixer.record_arm));
+        let monitoring = audio_monitoring || midi_monitoring;
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -783,6 +811,22 @@ impl Player {
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
         let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    /// Open a live-MIDI monitoring channel: the audio thread drains the returned ring at the start
+    /// of each block into monitored Instrument/MIDI tracks. Push played-in bytes through the
+    /// returned sender from the UI/input thread (never the audio thread). Replaces any previous
+    /// channel. `capacity` is the ring size in messages (see [`live_midi::MAX_CAPACITY`]).
+    pub fn connect_midi_input(&self, capacity: usize) -> live_midi::LiveMidiSender {
+        let (tx, rx) = live_midi::channel(capacity);
+        let _ = self.tx.send(Cmd::MidiInput(Some(rx)));
+        tx
+    }
+
+    /// Stop draining live MIDI (the sender can be dropped). Monitored notes still sounding are
+    /// released by the engine on the next stop/seek or when the track is no longer monitored.
+    pub fn disconnect_midi_input(&self) {
+        let _ = self.tx.send(Cmd::MidiInput(None));
     }
 
     pub fn set_recording(&self, on: bool) {

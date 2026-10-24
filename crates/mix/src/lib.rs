@@ -72,6 +72,35 @@ pub fn main_channels(s: &Session) -> usize {
     s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
 }
 
+/// A short live-MIDI channel message (note on/off, control change, pitch bend, pressure, program)
+/// played in from a hardware input for monitoring. Fixed-size and `Copy`, so a host can carry it
+/// across a lock-free ring to the audio thread without allocating. Longer messages (SysEx) are not
+/// representable and are dropped by [`LiveMidiMsg::new`]; they are not meaningful to an instrument's
+/// per-block note/controller entry points anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveMidiMsg {
+    bytes: [u8; 3],
+    len: u8,
+}
+
+impl LiveMidiMsg {
+    /// Build from raw MIDI bytes. `None` when empty or longer than three bytes (the longest channel
+    /// voice message), or when the first byte is not a status byte.
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > 3 || *bytes.first()? < 0x80 {
+            return None;
+        }
+        let mut b = [0u8; 3];
+        b.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(LiveMidiMsg { bytes: b, len: u8::try_from(bytes.len()).ok()? })
+    }
+
+    /// The message bytes.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+}
+
 /// Slot index used for a track's instrument plugin in [`InstanceSpec`] and [`PreparedInstance`]
 /// (insert slots use their index).
 pub const INSTRUMENT_SLOT: usize = usize::MAX;
@@ -226,6 +255,9 @@ struct Strip {
     sample: Option<Arc<SourceAudio>>,
     /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
     held: Vec<u8>,
+    /// Notes sounding from live input monitoring (pitch), tracked apart from clip-played `held` so
+    /// they can be released when the track stops being monitored (disarm), not only at stops/seeks.
+    live_held: Vec<u8>,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     chase: bool,
     muted: bool,
@@ -319,6 +351,7 @@ impl Strip {
             instrument: None,
             sample: None,
             held: Vec::new(),
+            live_held: Vec::new(),
             chase: true,
             muted: false,
             gr: 0.0,
@@ -351,6 +384,10 @@ pub struct MixEngine {
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
     last_end: Samples,
+    /// Start position of the previous render. A parked transport (input monitoring with playback
+    /// stopped) renders the same position every block, so `pos != last_end` alone would read every
+    /// parked block as a seek and cut live-monitored notes; a genuine seek also differs from this.
+    last_pos: Samples,
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
     order: Vec<usize>,
@@ -368,6 +405,11 @@ pub struct MixEngine {
     aux_latency: usize,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
+    /// Live MIDI played in for the next block, set by the audio host (drained from its lock-free
+    /// input ring at the start of the block). Applied to monitored Instrument/MIDI tracks before
+    /// the instrument renders, at frame offset 0 (one block of latency). The host clears and refills
+    /// it each block; `sync` pre-reserves its capacity so filling it never allocates on the callback.
+    pub live_midi: Vec<LiveMidiMsg>,
     /// Transport stopped: only monitored inputs sound (no clips).
     pub monitor_only: bool,
     /// Recording: record-armed tracks hear their input (auto input).
@@ -450,6 +492,7 @@ impl MixEngine {
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
             last_end: 0,
+            last_pos: 0,
             synced: (0, 0, 0),
             order: Vec::new(),
             latency: 0,
@@ -457,6 +500,7 @@ impl MixEngine {
             aux_fed: Vec::new(),
             aux_latency: 0,
             input: Vec::new(),
+            live_midi: Vec::new(),
             monitor_only: false,
             recording: false,
             metronome: false,
@@ -536,6 +580,7 @@ impl MixEngine {
                 i.failed = false;
             }
             s.held.clear();
+            s.live_held.clear();
             s.chase = true;
             s.align.clear();
             s.align_pre.clear();
@@ -692,19 +737,22 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
-        if pos != self.last_end {
-            // Seek: silence held notes and ringing plugins.
+        if pos != self.last_end && pos != self.last_pos {
+            // Seek: silence held notes and ringing plugins. A parked transport (monitoring with
+            // playback stopped) repeats the same position, which is not a seek.
             for st in self.strips.values_mut() {
                 if let Some(i) = &mut st.instrument {
                     i.plugin.all_notes_off();
                 }
                 st.held.clear();
+                st.live_held.clear();
                 st.chase = true;
                 // The playhead jumped: streamed rings must refill from the new position.
                 #[cfg(not(target_arch = "wasm32"))]
                 st.streams.iter_mut().for_each(stream::StreamVoice::invalidate);
             }
         }
+        self.last_pos = pos;
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
         for b in self.busses.values_mut() {
@@ -734,7 +782,7 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_in = LiveInput { input: &self.input, midi: &self.live_midi, monitor_only: self.monitor_only, recording: self.recording };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -815,7 +863,7 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_in = LiveInput { input: &self.input, midi: &self.live_midi, monitor_only: self.monitor_only, recording: self.recording };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -975,8 +1023,60 @@ impl MixEngine {
 /// Live input routed to monitored tracks.
 struct LiveInput<'a> {
     input: &'a [Vec<f32>],
+    /// Live MIDI for this block, applied to monitored Instrument/MIDI tracks.
+    midi: &'a [LiveMidiMsg],
     monitor_only: bool,
     recording: bool,
+}
+
+impl LiveInput<'_> {
+    /// Whether an Instrument/MIDI track hears live input this block: explicitly input-monitored, or
+    /// record-armed while the transport is monitoring or recording (auto input). Mirrors the audio
+    /// input-monitoring condition.
+    fn midi_monitored(&self, t: &Track) -> bool {
+        matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
+            && (t.mixer.input_monitor || (t.mixer.record_arm && (self.monitor_only || self.recording)))
+    }
+}
+
+/// Apply one live MIDI message to an instrument, mirroring how [`schedule_notes`] feeds clip notes:
+/// note-ons/offs go through the note entry points (tracked in `held` so they can be released on
+/// stop/disarm), every other channel message through [`Plugin::midi`]. All at offset 0 (one block of
+/// latency). Allocation-free. System messages are ignored (an instrument has no use for them).
+fn apply_live_msg(msg: LiveMidiMsg, inst: &mut PluginSlot, held: &mut Vec<u8>) {
+    let b = msg.bytes();
+    let Some(&status) = b.first() else { return };
+    let d1 = b.get(1).copied().unwrap_or(0);
+    let d2 = b.get(2).copied().unwrap_or(0);
+    match status & 0xF0 {
+        0x90 if d2 > 0 => {
+            inst.plugin.note_on(0, d1, d2);
+            if !held.contains(&d1) && held.len() < 128 {
+                held.push(d1);
+            }
+        }
+        0x80 | 0x90 => {
+            inst.plugin.note_off(0, d1);
+            held.retain(|p| *p != d1);
+        }
+        0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => inst.plugin.midi(0, [status, d1, d2]),
+        _ => {}
+    }
+}
+
+/// Drain one block of live MIDI into the instrument. Factored out so tests can inject events
+/// without a ring or a device.
+fn apply_live_block(events: &[LiveMidiMsg], inst: &mut PluginSlot, held: &mut Vec<u8>) {
+    for &m in events {
+        apply_live_msg(m, inst, held);
+    }
+}
+
+/// Release every live-sounding note (track disarmed / no longer monitored while still running).
+fn release_live_notes(inst: &mut PluginSlot, held: &mut Vec<u8>) {
+    for p in held.drain(..) {
+        inst.plugin.note_off(0, p);
+    }
 }
 
 fn process_strip(
@@ -1012,7 +1112,9 @@ fn process_strip(
             }
         }
         TrackKind::Audio if live.monitor_only => {}
-        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
+        // Transport stopped and not monitoring live MIDI (and nothing left sounding to release):
+        // the instrument stays silent, as before live monitoring existed.
+        TrackKind::Instrument | TrackKind::Midi if live.monitor_only && !live.midi_monitored(t) && strip.live_held.is_empty() => {}
         TrackKind::Audio => {
             let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
             for clip in t.clips() {
@@ -1092,10 +1194,22 @@ fn process_strip(
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
-                if std::mem::take(&mut strip.chase) {
-                    chase_controllers(s, t, pos, inst);
+                // Clip playback: only while the transport is running. When stopped (monitor_only)
+                // there is no playhead sweeping the clips, so notes come only from live input.
+                if !live.monitor_only {
+                    if std::mem::take(&mut strip.chase) {
+                        chase_controllers(s, t, pos, inst);
+                    }
+                    schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 }
-                schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+                // Live MIDI monitoring: feed what was played in through the same note/controller
+                // entry points. When the track stops being monitored, release any still-sounding
+                // live notes so they do not hang.
+                if live.midi_monitored(t) {
+                    apply_live_block(live.midi, inst, &mut strip.live_held);
+                } else if !strip.live_held.is_empty() {
+                    release_live_notes(inst, &mut strip.live_held);
+                }
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
                 } else if let Some(c0) = strip.buf.first_mut() {
@@ -4086,5 +4200,217 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+
+    // ---- Live MIDI input monitoring (G-02 MIDI thru). ----
+
+    /// A fake instrument that records every note/controller event it receives and sounds (fills its
+    /// output with a constant) while at least one note is held, so a test can assert both routing
+    /// and that audio is produced.
+    struct LiveInst {
+        info: &'static soundcraft_dsp::PluginInfo,
+        log: Arc<std::sync::Mutex<Vec<LiveEvent>>>,
+        sounding: std::collections::BTreeSet<u8>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LiveEvent {
+        On(u8, u8),
+        Off(u8),
+        Midi([u8; 3]),
+        AllOff,
+    }
+
+    impl LiveInst {
+        fn new(log: Arc<std::sync::Mutex<Vec<LiveEvent>>>) -> Self {
+            LiveInst { info: soundcraft_dsp::create("gain").unwrap().info(), log, sounding: std::collections::BTreeSet::new() }
+        }
+    }
+
+    impl Plugin for LiveInst {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.info
+        }
+        fn prepare(&mut self, _sr: f32, _mb: usize, _ch: usize) {}
+        fn reset(&mut self) {}
+        fn set_param(&mut self, _id: &str, _v: f32) -> bool {
+            false
+        }
+        fn param(&self, _id: &str) -> Option<f32> {
+            None
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            let v = if self.sounding.is_empty() { 0.0 } else { 0.5 };
+            for c in io.iter_mut() {
+                c.iter_mut().take(frames).for_each(|x| *x = v);
+            }
+        }
+        fn note_on(&mut self, _offset: usize, note: u8, velocity: u8) {
+            self.sounding.insert(note);
+            self.log.lock().unwrap().push(LiveEvent::On(note, velocity));
+        }
+        fn note_off(&mut self, _offset: usize, note: u8) {
+            self.sounding.remove(&note);
+            self.log.lock().unwrap().push(LiveEvent::Off(note));
+        }
+        fn midi(&mut self, _offset: usize, msg: [u8; 3]) {
+            self.log.lock().unwrap().push(LiveEvent::Midi(msg));
+        }
+        fn all_notes_off(&mut self) {
+            self.sounding.clear();
+            self.log.lock().unwrap().push(LiveEvent::AllOff);
+        }
+    }
+
+    /// An Instrument track with no clips and the fake instrument adopted. Returns the engine, the
+    /// session, the track id and the shared event log.
+    fn live_monitor_setup() -> (MixEngine, Session, TrackId, Arc<std::sync::Mutex<Vec<LiveEvent>>>) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.live"));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inst = LiveInst::new(Arc::clone(&log));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.live".into(), ch: 2, plugin: Box::new(inst) }]);
+        (eng, s, t, log)
+    }
+
+    fn note_on(note: u8, vel: u8) -> LiveMidiMsg {
+        LiveMidiMsg::new(&[0x90, note, vel]).unwrap()
+    }
+
+    #[test]
+    fn live_midi_message_rejects_empty_long_and_non_status() {
+        assert!(LiveMidiMsg::new(&[]).is_none());
+        assert!(LiveMidiMsg::new(&[0x90, 60, 100, 1]).is_none(), "longer than a channel message");
+        assert!(LiveMidiMsg::new(&[60, 100]).is_none(), "no status byte");
+        assert_eq!(LiveMidiMsg::new(&[0x90, 60, 100]).map(|m| m.bytes().to_vec()), Some(vec![0x90, 60, 100]));
+        assert_eq!(LiveMidiMsg::new(&[0xF8]).map(|m| m.bytes().to_vec()), Some(vec![0xF8]));
+    }
+
+    #[test]
+    fn live_midi_reaches_a_monitored_instrument_and_sounds_with_the_transport_stopped() {
+        let (mut eng, mut s, t, log) = live_monitor_setup();
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        // Transport stopped: no clips, yet a played note must sound.
+        eng.monitor_only = true;
+        eng.live_midi = vec![note_on(60, 100)];
+        let out = render_block_stereo(&mut eng, &s, 0);
+        assert_eq!(*log.lock().unwrap(), vec![LiveEvent::On(60, 100)]);
+        assert!(out > 0.4, "the monitored instrument should be heard live: {out}");
+        // A matching note-off (0x80, and a velocity-0 note-on) stops it.
+        eng.live_midi = vec![LiveMidiMsg::new(&[0x80, 60, 0]).unwrap()];
+        log.lock().unwrap().clear();
+        let out = render_block_stereo(&mut eng, &s, 0);
+        assert_eq!(*log.lock().unwrap(), vec![LiveEvent::Off(60)]);
+        assert!(out < 1e-6, "released: {out}");
+    }
+
+    #[test]
+    fn velocity_zero_note_on_is_a_note_off_on_the_live_path() {
+        let (mut eng, mut s, t, log) = live_monitor_setup();
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        eng.monitor_only = true;
+        eng.live_midi = vec![note_on(64, 90)];
+        render_block_stereo(&mut eng, &s, 0);
+        eng.live_midi = vec![note_on(64, 0)]; // 0x90 with velocity 0
+        log.lock().unwrap().clear();
+        render_block_stereo(&mut eng, &s, 0);
+        assert_eq!(*log.lock().unwrap(), vec![LiveEvent::Off(64)]);
+    }
+
+    #[test]
+    fn live_controllers_reach_the_instrument_as_midi() {
+        let (mut eng, mut s, t, log) = live_monitor_setup();
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        eng.monitor_only = true;
+        eng.live_midi = vec![LiveMidiMsg::new(&[0xB0, 1, 64]).unwrap(), LiveMidiMsg::new(&[0xE0, 0, 0x40]).unwrap()];
+        render_block_stereo(&mut eng, &s, 0);
+        assert_eq!(*log.lock().unwrap(), vec![LiveEvent::Midi([0xB0, 1, 64]), LiveEvent::Midi([0xE0, 0, 0x40])]);
+    }
+
+    #[test]
+    fn live_midi_is_ignored_when_the_track_is_not_monitored() {
+        let (mut eng, s, _t, log) = live_monitor_setup(); // input_monitor left false
+        eng.monitor_only = true;
+        eng.live_midi = vec![note_on(60, 100)];
+        let out = render_block_stereo(&mut eng, &s, 0);
+        assert!(log.lock().unwrap().is_empty(), "an unmonitored track must not hear live input");
+        assert!(out < 1e-6, "and must stay silent: {out}");
+    }
+
+    #[test]
+    fn live_notes_are_released_when_the_track_is_disarmed_so_they_do_not_hang() {
+        let (mut eng, mut s, t, log) = live_monitor_setup();
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        eng.monitor_only = true;
+        eng.live_midi = vec![note_on(72, 100)];
+        let out = render_block_stereo(&mut eng, &s, 0);
+        assert!(out > 0.4, "sounding while held: {out}");
+        // Stop monitoring without any note-off arriving: the held note must be released.
+        s.track_mut(t).unwrap().mixer.input_monitor = false;
+        eng.live_midi.clear();
+        log.lock().unwrap().clear();
+        let out = render_block_stereo(&mut eng, &s, 0);
+        assert_eq!(*log.lock().unwrap(), vec![LiveEvent::Off(72)], "exactly one note-off, the held one");
+        assert!(out < 1e-6, "no hung note: {out}");
+        // And it is not released twice on the next block.
+        log.lock().unwrap().clear();
+        render_block_stereo(&mut eng, &s, 0);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_notes_are_released_on_stop_via_reset() {
+        let (mut eng, mut s, t, log) = live_monitor_setup();
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        eng.monitor_only = true;
+        eng.live_midi = vec![note_on(48, 100)];
+        render_block_stereo(&mut eng, &s, 0);
+        log.lock().unwrap().clear();
+        eng.reset(); // transport stop
+        assert!(log.lock().unwrap().contains(&LiveEvent::AllOff), "stop sends all-notes-off to the instrument");
+        // After a stop the note is no longer counted as held, so nothing is re-released.
+        eng.live_midi.clear();
+        log.lock().unwrap().clear();
+        render_block_stereo(&mut eng, &s, 0);
+        assert!(log.lock().unwrap().is_empty(), "no stray note-off after a reset cleared the held set");
+    }
+
+    #[test]
+    fn live_monitoring_coexists_with_clip_playback_while_recording() {
+        // A record-armed instrument track during playback/recording hears both its clip notes and
+        // what is played in live.
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.live"));
+        s.track_mut(t).unwrap().mixer.record_arm = true;
+        let mut seq = soundcraft_midi::Sequence::default();
+        seq.notes.push(soundcraft_midi::Note { pitch: 36, velocity: 80, release_velocity: 64, channel: 0, start: 0, length: 960 });
+        let cid = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 48_000, seq));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: INSTRUMENT_SLOT,
+            id: "clap:test.live".into(),
+            ch: 2,
+            plugin: Box::new(LiveInst::new(Arc::clone(&log))),
+        }]);
+        eng.recording = true; // transport running and recording
+        eng.live_midi = vec![note_on(60, 100)];
+        render_block_stereo(&mut eng, &s, 0);
+        let heard = log.lock().unwrap();
+        assert!(heard.contains(&LiveEvent::On(36, 80)), "clip note still plays: {heard:?}");
+        assert!(heard.contains(&LiveEvent::On(60, 100)), "live note also sounds: {heard:?}");
+    }
+
+    fn render_block_stereo(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        eng.render(s, pos, 512, &mut out);
+        out[0][500].abs()
     }
 }

@@ -16,6 +16,9 @@ soundcraft-mix.workspace = true
 soundcraft-dsp.workspace = true
 log.workspace = true
 serde.workspace = true
+# Lock-free SPSC ring for the live-MIDI hand-off: UI/input thread (producer) → audio callback
+# (consumer), drained at the start of each block. Pure Rust, so it builds on every target.
+rtrb.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true

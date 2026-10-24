@@ -271,6 +271,9 @@ pub struct SoundApp {
     midi_capture: Option<midi_capture::MidiCapture>,
     /// The opened port while a recording starts, until its start position is known.
     pending_midi: Option<(midi_capture::Live, Vec<TrackId>)>,
+    /// Live MIDI monitoring (MIDI thru): the open input and lock-free sender while an Instrument/MIDI
+    /// track is input-monitored. Independent of recording.
+    midi_monitor: Option<midi_capture::MidiMonitor>,
     /// Punch range to trim the take to (pre/post-roll recordings).
     punch: Option<Range>,
     recorder_failed: bool,
@@ -371,6 +374,7 @@ impl SoundApp {
             record_start: 0,
             midi_capture: None,
             pending_midi: None,
+            midi_monitor: None,
             punch: None,
             recorder_failed: false,
             lost_shown: 0,
@@ -1238,6 +1242,7 @@ impl SoundApp {
         self.watch_output();
         self.watch_input();
         self.drain_midi();
+        self.update_midi_monitor();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {
