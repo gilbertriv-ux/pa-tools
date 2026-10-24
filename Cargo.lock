@@ -3736,6 +3736,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-interchange"
+version = "0.11.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.11.0"
 dependencies = [
