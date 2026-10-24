@@ -982,6 +982,13 @@ impl InputRing {
         self.head.store(head, Ordering::Release);
     }
 
+    /// Consumer-only: forget queued monitor frames and interpolation phase without touching
+    /// producer state or storage. Frames published concurrently remain for the next callback.
+    pub fn discard_pending(&self) {
+        self.tail.store(self.head.load(Ordering::Acquire), Ordering::Release);
+        self.phase.store(0.0f64.to_bits(), Ordering::Relaxed);
+    }
+
     /// Consumer-only linear sample-rate conversion into existing planar output buffers.
     pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize, session_rate: u32) {
         for channel in out.iter_mut() {
@@ -1026,6 +1033,20 @@ impl InputRing {
 #[cfg(test)]
 mod ring_tests {
     use super::InputRing;
+
+    #[test]
+    fn monitor_discard_resets_backlog_and_fractional_phase() {
+        let ring = InputRing::new(1, 48_000);
+        ring.push(&[0.9; 32]);
+        let mut output = vec![vec![0.0; 4]];
+        ring.pop_into(&mut output, 1, 44_100);
+        ring.discard_pending();
+        ring.pop_into(&mut output, 4, 44_100);
+        assert!(output[0].iter().all(|x| *x == 0.0));
+        ring.push(&[0.2; 32]);
+        ring.pop_into(&mut output, 4, 48_000);
+        assert!(output[0].iter().all(|x| (*x - 0.2).abs() < 1e-6));
+    }
 
     #[test]
     fn oversized_monitor_callback_keeps_memory_bounded_and_channels_aligned() {

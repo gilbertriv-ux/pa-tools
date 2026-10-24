@@ -194,6 +194,7 @@ struct AudioState {
     midi_input: Option<LiveMidiInput>,
     midi_retired: [Option<midi_devices::MidiInputReceiver>; 16],
     midi_flush: bool,
+    stop_muted: bool,
     rx: Receiver<Cmd>,
     shared: Arc<Shared>,
     session: Arc<Session>,
@@ -232,6 +233,7 @@ impl AudioState {
             midi_input: None,
             midi_retired: std::array::from_fn(|_| None),
             midi_flush: false,
+            stop_muted: false,
             garbage,
             old_sessions: None,
             fold: fold_gains(&session),
@@ -290,7 +292,7 @@ impl AudioState {
         }
         for _ in 0..soundcraft_mix::MAX_LIVE_MIDI_EVENTS {
             match input.receiver.try_receive() {
-                Ok(Some(event)) if !input.discard => {
+                Ok(Some(event)) if !input.discard && !self.stop_muted => {
                     let bytes = event.message.as_bytes();
                     let status = bytes.first().copied().unwrap_or(0);
                     if (0x80..0xf0).contains(&status) && input.channel.is_none_or(|c| c == status & 15) {
@@ -411,12 +413,7 @@ impl AudioState {
                     self.playing = false;
                     let _ = self.shared.starting.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 }
-                Cmd::Stop => {
-                    self.playing = false;
-                    self.end = None;
-                    self.looped = None;
-                    self.mix.reset();
-                }
+                Cmd::Stop => self.hard_stop(),
                 Cmd::Locate(at) => {
                     self.pos = at;
                     self.pending_len = 0;
@@ -434,7 +431,39 @@ impl AudioState {
         self.shared.playing.store(self.playing || self.shared.starting.load(Ordering::Acquire) != 0, Ordering::Relaxed);
     }
 
+    fn hard_stop(&mut self) {
+        self.stop_muted = true;
+        self.playing = false;
+        self.end = None;
+        self.looped = None;
+        self.pending_len = 0;
+        self.read = 0.0;
+        for channel in &mut self.pending {
+            channel.fill(0.0);
+        }
+        for channel in &mut self.mix.input {
+            channel.fill(0.0);
+        }
+        if let Some(input) = &self.input {
+            input.discard_pending();
+        }
+        self.midi_flush = false;
+        if let Some(input) = &mut self.midi_input {
+            input.discard = true;
+        }
+        self.recording = false;
+        self.shared.clock.invalidate();
+        self.shared.playing.store(false, Ordering::Relaxed);
+        self.mix.reset();
+    }
+
     fn begin_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        if self.stop_muted {
+            if let Some(input) = &self.input {
+                input.discard_pending();
+            }
+        }
+        self.stop_muted = false;
         self.pos = from;
         self.end = end;
         self.looped = looped.filter(|range| range.len() > 64);
@@ -463,9 +492,7 @@ impl AudioState {
             n = n.min(usize::try_from((l.end - self.pos).max(1)).unwrap_or(BLOCK));
         } else if let Some(e) = self.end {
             if self.pos >= e {
-                self.playing = false;
-                self.end = None;
-                self.shared.playing.store(false, Ordering::Relaxed);
+                self.hard_stop();
                 n = 0;
             } else {
                 n = n.min(usize::try_from(e - self.pos).unwrap_or(BLOCK));
@@ -513,6 +540,14 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         self.drain_live_midi();
+        if self.stop_muted {
+            if let Some(input) = &self.input {
+                input.discard_pending();
+            }
+            self.midi_flush = false;
+            out.fill(0.0);
+            return;
+        }
         let channels = channels.max(1);
         let monitoring = self.midi_input.is_some()
             || self.midi_flush
@@ -530,6 +565,10 @@ impl AudioState {
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
         for frame in out.chunks_mut(channels) {
+            if self.stop_muted {
+                frame.fill(0.0);
+                continue;
+            }
             while self.read >= self.pending_len as f64 {
                 self.read -= self.pending_len as f64;
                 if !self.playing && !monitoring {
@@ -1425,6 +1464,57 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn explicit_stop_silences_pending_armed_input_and_midi_until_resume() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let (tx, _, mut state) = control_test_state();
+        let mut session = Session::default();
+        let audio = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        session.track_mut(audio).unwrap().mixer.record_arm = true;
+        session.track_mut(audio).unwrap().mixer.input_monitor = true;
+        let synth = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        session.track_mut(synth).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+        tx.send(Cmd::Session(Arc::new(session), Vec::new())).unwrap();
+        let ring = record::InputRing::new(1, 48_000);
+        tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
+        let (mut sender, receiver) = midi_devices::input_queue(16).unwrap();
+        tx.send(Cmd::MidiAttach(receiver, synth, None)).unwrap();
+        state.drain();
+        state.playing = true;
+        state.pending_len = BLOCK;
+        state.read = 100.5;
+        for channel in &mut state.pending {
+            channel.fill(0.9);
+        }
+        ring.push(&[0.8; 1024]);
+        tx.send(Cmd::Stop).unwrap();
+        let event = midi_devices::TimedShortMessage { timestamp_us: 0, message: midi_devices::ShortMessage::new(&[0x90, 60, 127]).unwrap() };
+        let mut output = [0.7; 1024];
+        for _ in 0..8 {
+            sender.try_send(event).unwrap();
+            ring.push(&[0.8; 1024]);
+            state.fill(&mut output, 2);
+            assert!(output.iter().all(|x| *x == 0.0), "Stop must produce exact silence despite armed input/MIDI");
+        }
+        assert_eq!(state.pending_len, 0);
+        assert_eq!(state.read, 0.0);
+        assert!(!state.playing);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        state.fill(&mut output, 2);
+        assert!(!state.stop_muted);
+        assert!(output.iter().all(|x| *x == 0.0), "resume must not replay queued pre-stop input or MIDI");
+        ring.push(&[0.25; 1024]);
+        state.fill(&mut output, 2);
+        assert!(output.iter().any(|x| x.abs() > 0.1), "intentional resume accepts fresh input");
+        ring.discard_pending();
+        for _ in 0..4 { state.fill(&mut output, 2); }
+        assert!(output.iter().all(|x| *x == 0.0), "fresh MIDI test requires silence after input/pending audio drains");
+        sender.try_send(event).unwrap();
+        state.fill(&mut output, 2);
+        assert!(output.iter().any(|x| x.abs() > 1e-5), "intentional resume accepts fresh MIDI");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn midi_does_not_discard_partially_consumed_playback() {
         let (tx, _, mut state) = control_test_state();
         state.playing = true;
@@ -2026,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_tracks_are_heard_and_metered_after_playback_stops() {
+    fn natural_playback_end_keeps_armed_input_silent() {
         use soundcraft_model::{ChannelFormat, TrackKind};
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
@@ -2051,7 +2141,7 @@ mod tests {
         assert!(!shared.playing.load(Ordering::Relaxed));
         ring.push(&[0.5; 4096]);
         st.fill(&mut out, 2);
-        assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
-        assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+        assert!(out.iter().all(|x| *x == 0.0), "armed input must stay silent after natural end");
+        assert!(st.stop_muted);
     }
 }
