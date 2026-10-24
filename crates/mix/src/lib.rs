@@ -1102,7 +1102,7 @@ fn process_strip(
                             inst.plugin.midi(offset, [0xb0, 121, velocity]);
                         }
                         0xb0 if pitch == 120 || pitch == 123 => {
-                            release_live_notes(inst.plugin.as_mut(), &strip.held, &mut strip.live_held, &mut strip.live_sustain, offset);
+                            release_live_channels(inst.plugin.as_mut(), &strip.held, &mut strip.live_held, &mut strip.live_sustain, bit, offset);
                         }
                         _ => inst.plugin.midi(offset, [status & 0xf0, pitch, velocity]),
                     }
@@ -1599,15 +1599,23 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
 /// Sustain is currently one merged controller channel; releasing it can also release a
 /// sequenced pedal-only tail, although physically held sequenced pitches remain protected.
 fn release_live_notes(plugin: &mut dyn Plugin, timeline: &[u8], live: &mut [u16; 128], pedal: &mut u16, offset: usize) {
-    if *pedal != 0 {
+    release_live_channels(plugin, timeline, live, pedal, u16::MAX, offset);
+}
+
+/// Channel-mode cleanup removes only the sending channel's ownership. Another live
+/// channel can still hold the same pitch or sustain pedal on the shared instrument.
+fn release_live_channels(plugin: &mut dyn Plugin, timeline: &[u8], live: &mut [u16; 128], pedal: &mut u16, channels: u16, offset: usize) {
+    let had_pedal = *pedal != 0;
+    *pedal &= !channels;
+    if had_pedal && *pedal == 0 {
         plugin.midi(offset, [0xb0, 64, 0]);
     }
-    *pedal = 0;
     for (pitch, mask) in live.iter_mut().enumerate() {
-        if *mask != 0 && !timeline.contains(&(pitch as u8)) {
+        let before = *mask;
+        *mask &= !channels;
+        if before != 0 && *mask == 0 && !timeline.contains(&(pitch as u8)) {
             plugin.note_off(offset, pitch as u8);
         }
-        *mask = 0;
     }
 }
 
@@ -2606,6 +2614,94 @@ mod tests {
         }
         assert!(out[0].iter().all(|x| x.abs() < 1e-7), "live-only held/pedal voices survived disconnect");
         assert!(eng.strips[&target].live_held.iter().all(|mask| *mask == 0));
+    }
+
+    #[test]
+    fn live_cc123_and_sustain_off_release_pedal_latched_notes() {
+        for channel in [0, 7, 15] {
+            let mut s = Session::default();
+            let target = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+            let mut instrument = Insert::new("subtractive_synth");
+            instrument.params.insert("amp_release".into(), 1.0);
+            s.track_mut(target).unwrap().instrument = Some(instrument);
+            let mut eng = MixEngine::new(48_000.0, 512);
+            eng.monitor_only = true;
+            let mut out = vec![vec![0.0; 512]; 2];
+            eng.queue_live_midi(target, 0, [0xb0 | channel, 64, 127]);
+            eng.queue_live_midi(target, 0, [0x90 | channel, 60, 100]);
+            eng.render(&s, 0, 512, &mut out);
+            eng.queue_live_midi(target, 0, [0x80 | channel, 60, 0]);
+            for _ in 0..8 {
+                eng.render(&s, 0, 512, &mut out);
+            }
+            assert!(out[0].iter().any(|x| x.abs() > 1e-5), "fixture must be sustained");
+            eng.queue_live_midi(target, 0, [0xb0 | channel, 123, 0]);
+            eng.queue_live_midi(target, 0, [0xb0 | channel, 64, 0]);
+            for _ in 0..16 {
+                eng.render(&s, 0, 512, &mut out);
+            }
+            assert!(out[0].iter().all(|x| x.abs() < 1e-7), "pedal tail survived channel {channel} cleanup");
+            assert_eq!(eng.strips[&target].live_sustain, 0);
+            assert!(eng.strips[&target].live_held.iter().all(|mask| *mask == 0));
+        }
+    }
+
+    #[test]
+    fn live_channel_panic_preserves_other_channel_note_and_pedal() {
+        let mut s = Session::default();
+        let target = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let mut instrument = Insert::new("subtractive_synth");
+        instrument.params.insert("amp_release".into(), 1.0);
+        s.track_mut(target).unwrap().instrument = Some(instrument);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.monitor_only = true;
+        let mut out = vec![vec![0.0; 512]; 2];
+        for channel in [0, 3] {
+            eng.queue_live_midi(target, 0, [0xb0 | channel, 64, 127]);
+            eng.queue_live_midi(target, 0, [0x90 | channel, 60, 100]);
+        }
+        eng.render(&s, 0, 512, &mut out);
+        eng.queue_live_midi(target, 0, [0xb0, 123, 0]);
+        eng.queue_live_midi(target, 0, [0xb0, 64, 0]);
+        for _ in 0..16 {
+            eng.render(&s, 0, 512, &mut out);
+        }
+        assert_eq!(eng.strips[&target].live_held[60], 1 << 3);
+        assert_eq!(eng.strips[&target].live_sustain, 1 << 3);
+        assert!(out[0].iter().any(|x| x.abs() > 1e-5), "other channel was silenced");
+        eng.queue_live_midi(target, 0, [0xb3, 123, 0]);
+        eng.queue_live_midi(target, 0, [0xb3, 64, 0]);
+        for _ in 0..16 {
+            eng.render(&s, 0, 512, &mut out);
+        }
+        assert!(out[0].iter().all(|x| x.abs() < 1e-7));
+        assert_eq!(eng.strips[&target].live_held[60], 0);
+        assert_eq!(eng.strips[&target].live_sustain, 0);
+    }
+
+    #[test]
+    fn live_sustain_off_alone_releases_latched_notes() {
+        let mut s = Session::default();
+        let target = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let mut instrument = Insert::new("subtractive_synth");
+        instrument.params.insert("amp_release".into(), 1.0);
+        s.track_mut(target).unwrap().instrument = Some(instrument);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.monitor_only = true;
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.queue_live_midi(target, 0, [0xb0, 64, 127]);
+        eng.queue_live_midi(target, 0, [0x90, 60, 100]);
+        eng.render(&s, 0, 512, &mut out);
+        eng.queue_live_midi(target, 0, [0x80, 60, 0]);
+        for _ in 0..8 {
+            eng.render(&s, 0, 512, &mut out);
+        }
+        assert!(out[0].iter().any(|x| x.abs() > 1e-5));
+        eng.queue_live_midi(target, 0, [0xb0, 64, 0]);
+        for _ in 0..16 {
+            eng.render(&s, 0, 512, &mut out);
+        }
+        assert!(out[0].iter().all(|x| x.abs() < 1e-7));
     }
 
     #[test]
