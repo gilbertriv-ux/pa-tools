@@ -99,6 +99,22 @@ impl Transcript {
             self.speaker_names.pop();
         }
     }
+
+    /// Replaces the text of word `index`, trimmed and capped at 128 characters. An empty result is
+    /// refused so a word never becomes blank. Returns true when the text actually changed.
+    pub fn set_word_text(&mut self, index: usize, text: &str) -> bool {
+        let text: String = text.trim().chars().take(128).collect();
+        if text.is_empty() {
+            return false;
+        }
+        match self.words.get_mut(index) {
+            Some(w) if w.text != text => {
+                w.text = text;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
