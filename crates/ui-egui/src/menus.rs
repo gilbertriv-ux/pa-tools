@@ -580,6 +580,7 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Event > Time Operations > Time Operations Window", "window.time_ops"),
     ("Event > MIDI Operations > MIDI Operations Window", "window.midi_ops"),
     ("Event > MIDI Real-Time Properties", "window.rtp"),
+    ("Window > Transcript", "window.transcript"),
 ];
 
 /// The shortcut of an engine or window command.
