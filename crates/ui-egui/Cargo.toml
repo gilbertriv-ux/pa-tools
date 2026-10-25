@@ -11,7 +11,9 @@ repository.workspace = true
 default = []
 # Local speech-to-text and the verified model downloader, forwarded to the engine; off by default.
 whisper = ["soundcraft-engine/whisper"]
-download = ["soundcraft-engine/download"]
+# The in-app model downloader: forwards `download` to the engine, and pulls in `soundcraft-pa-speech`
+# (its catalogue + verified downloader) so the Transcript window can offer and drive a download.
+download = ["soundcraft-engine/download", "soundcraft-pa-speech/download"]
 
 [dependencies]
 soundcraft-brand.workspace = true
@@ -28,6 +30,9 @@ soundcraft-mix.workspace = true
 soundcraft-engine.workspace = true
 soundcraft-playback.workspace = true
 soundcraft-video.workspace = true
+# Optional: enabled by the `download` feature. The model catalogue and the verified downloader the
+# Transcript window drives. Also a dev-dependency below (the fixed recogniser the tests inject).
+soundcraft-pa-speech = { workspace = true, optional = true }
 egui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
