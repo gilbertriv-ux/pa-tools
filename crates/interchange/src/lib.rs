@@ -6,15 +6,21 @@
 //! - [`Cfb::identify`] / [`AafIdentity`]: decides whether a container looks like an AAF file.
 //! - [`Cfb::aaf_header`] / [`AafHeader`]: the few header facts that can be read without a full
 //!   AAF object model.
+//! - [`Composition`]: the neutral tracks/clips model an AAF import produces. [`Cfb::composition`]
+//!   is the entry point; the object-model decoding that fills it needs a real `.aaf` sample to pin
+//!   the class/property GUIDs and is not implemented yet.
 //!
-//! Not supported: writing, AAF object/composition mapping, import into sessions.
+//! Not supported: writing, AAF object/composition decoding (the mapping into [`Composition`]),
+//! import into sessions.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod aaf;
 mod cfb;
+mod composition;
 
 pub use aaf::{AAF_ROOT_CLSID, AafHeader, AafIdentity, Confidence, PropertyIndexEntry};
 pub use cfb::{Cfb, Clsid, Entry, EntryKind, MAX_ENTRIES, MAX_FILE_BYTES};
+pub use composition::{CompClip, CompTrack, Composition, TrackKind};
 
 /// Errors from reading a container.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
