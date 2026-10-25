@@ -1,6 +1,6 @@
 //! Window ▸ Transcript: a track's speech as text, one line per phrase, each with its timecode and
 //! speaker. Click a word to move the playhead there; Shift-click selects a run of words; double-click
-//! a speaker to name them.
+//! a speaker to name them; double-click a word to correct its text.
 //!
 //! The speech model runs on a background thread (`track.transcribe`'s own job, see
 //! [`soundcraft_engine::cmd::transcribe_job`]) so the app keeps drawing. Starting the job only takes a
@@ -215,6 +215,8 @@ pub struct TranscriptState {
     view: Option<View>,
     shown: Option<TrackId>,
     editing: Option<SpeakerEdit>,
+    /// A word whose text is being corrected inline (see [`WordEdit`]); double-clicking a word opens it.
+    word_editing: Option<WordEdit>,
     /// The word last plain-clicked: where Shift-click starts a selection.
     anchor: Option<usize>,
     /// The line last scrolled to by Follow.
@@ -237,6 +239,7 @@ impl Default for TranscriptState {
             view: None,
             shown: None,
             editing: None,
+            word_editing: None,
             anchor: None,
             followed: None,
         }
@@ -302,12 +305,29 @@ struct SpeakerEdit {
     seen: bool,
 }
 
+/// A word's text being corrected inline, in the word's place.
+struct WordEdit {
+    /// The word's index into the transcript's `words` (not into a line).
+    index: usize,
+    /// The text being typed.
+    text: String,
+    /// The word's text when editing began: a commit that matches it dispatches nothing.
+    original: String,
+    /// Take focus and select the text on the first frame.
+    focus: bool,
+    /// Created this frame, so it cannot have been drawn yet.
+    fresh: bool,
+    /// Drawn this frame; an editor whose line scrolled away is dropped.
+    seen: bool,
+}
+
 /// What the window asks for; applied after drawing, through commands.
 #[derive(Debug, Clone, PartialEq)]
 enum Action {
     Locate(Samples),
     Select { track: TrackId, start: Samples, end: Samples },
     Rename { track: TrackId, speaker: u8, name: String },
+    EditWord { track: TrackId, index: usize, text: String },
     Anchor(Option<usize>),
     Transcribe(TrackId),
     Cancel,
@@ -632,6 +652,12 @@ pub(crate) fn rename_speaker(app: &mut SoundApp, track: TrackId, speaker: u8, na
     app.run("track.rename_speaker", json!({"track": track.0, "speaker": speaker, "name": name})).is_ok()
 }
 
+/// Corrects the text of one word in a track's transcript (`track.edit_word`). The command trims and
+/// caps the text and no-ops an empty or unchanged value.
+pub(crate) fn edit_word(app: &mut SoundApp, track: TrackId, index: usize, text: &str) -> bool {
+    app.run("track.edit_word", json!({"track": track.0, "index": index, "text": text})).is_ok()
+}
+
 /// What clicking word `index` does: move the playhead to its start; with Shift also select the
 /// words from the last plain-clicked one (else just this one).
 fn click_actions(track: TrackId, words: &[TranscriptWord], index: usize, anchor: Option<usize>, shift: bool) -> Vec<Action> {
@@ -661,6 +687,9 @@ fn apply(app: &mut SoundApp, ctx: &egui::Context, actions: Vec<Action>) {
             }
             Action::Rename { track, speaker, name } => {
                 let _ = rename_speaker(app, track, speaker, &name);
+            }
+            Action::EditWord { track, index, text } => {
+                let _ = edit_word(app, track, index, &text);
             }
             Action::Anchor(a) => app.transcript.anchor = a,
             Action::Transcribe(track) => start(app, ctx, track),
@@ -789,7 +818,7 @@ fn body(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, out: &mut Vec<Action>)
     let Some(shown) = shown else { return };
     if st.shown != Some(shown) {
         st.shown = Some(shown);
-        (st.anchor, st.followed, st.editing) = (None, None, None);
+        (st.anchor, st.followed, st.editing, st.word_editing) = (None, None, None, None);
     }
     let Some(tr) = f.s.transcript(shown) else {
         let msg = "No transcript yet. Choose Transcribe Track to turn this track's speech into text.";
@@ -854,7 +883,7 @@ fn transcript_view(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, tr: &Transc
     let rows = &view.rows;
     let segs = &view.segments;
     let query = view.query.as_str();
-    let (editing, anchor, followed) = (&mut st.editing, st.anchor, &mut st.followed);
+    let (editing, word_editing, anchor, followed) = (&mut st.editing, &mut st.word_editing, st.anchor, &mut st.followed);
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
         if let Some((line, row)) = follow_row {
             let top = ui.max_rect().top() - range.start as f32 * rhs;
@@ -867,7 +896,7 @@ fn transcript_view(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, tr: &Transc
         for row in range {
             let Some((seg_i, seg)) = rows.get(row).and_then(|i| segs.get(*i).map(|s| (*i, s))) else { continue };
             let env = RowEnv { s: f.s, tr, track, query, shift, anchor, current: highlighted == Some(seg_i) };
-            draw_row(ui, &env, seg_i, seg, editing, out);
+            draw_row(ui, &env, seg_i, seg, editing, word_editing, out);
         }
     });
     // An editor whose line scrolled out of view cannot be typed into: drop it.
@@ -876,6 +905,13 @@ fn transcript_view(ui: &mut Ui, st: &mut TranscriptState, f: &Frame, tr: &Transc
             (ed.seen, ed.fresh) = (false, false);
         } else {
             st.editing = None;
+        }
+    }
+    if let Some(ed) = &mut st.word_editing {
+        if ed.seen || ed.fresh {
+            (ed.seen, ed.fresh) = (false, false);
+        } else {
+            st.word_editing = None;
         }
     }
     st.view = Some(view);
@@ -903,7 +939,15 @@ struct RowEnv<'a> {
     current: bool,
 }
 
-fn draw_row(ui: &mut Ui, env: &RowEnv, seg_i: usize, seg: &Segment, editing: &mut Option<SpeakerEdit>, out: &mut Vec<Action>) {
+fn draw_row(
+    ui: &mut Ui,
+    env: &RowEnv,
+    seg_i: usize,
+    seg: &Segment,
+    editing: &mut Option<SpeakerEdit>,
+    word_editing: &mut Option<WordEdit>,
+    out: &mut Vec<Action>,
+) {
     let t = Tokens::current();
     let words = segment_words(env.tr, seg);
     let hits = match_flags(words, env.query);
@@ -946,9 +990,14 @@ fn draw_row(ui: &mut Ui, env: &RowEnv, seg_i: usize, seg: &Segment, editing: &mu
                 }
             }
 
-            // The words, each clickable.
+            // The words, each clickable; double-click one to correct its text in place.
             ui.spacing_mut().item_spacing.x = 4.0;
             for (k, w) in words.iter().enumerate() {
+                let word_index = seg.first + k;
+                if word_editing.as_ref().is_some_and(|e| e.index == word_index) {
+                    word_editor(ui, env, word_editing, out);
+                    continue;
+                }
                 let hit = hits.get(k).copied().unwrap_or(false);
                 let mut text = RichText::new(&w.text).font(regular(WORD_SIZE)).color(t.text);
                 if hit {
@@ -959,12 +1008,17 @@ fn draw_row(ui: &mut Ui, env: &RowEnv, seg_i: usize, seg: &Segment, editing: &mu
                     ui.painter().rect_filled(resp.rect.expand2(vec2(2.0, 0.0)), 3.0, t.accent.gamma_multiply(0.22));
                 }
                 let full = || segment_text(words);
-                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_ui(|ui| {
-                    ui.set_max_width(420.0);
-                    ui.label(full());
-                });
-                if resp.clicked() {
-                    out.extend(click_actions(env.track, &env.tr.words, seg.first + k, env.anchor, env.shift));
+                let resp =
+                    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Double-click to correct this word").on_hover_ui(|ui| {
+                        ui.set_max_width(420.0);
+                        ui.label(full());
+                    });
+                // A double-click opens the inline editor; a plain or Shift-click still seeks or selects.
+                if resp.double_clicked() {
+                    *word_editing =
+                        Some(WordEdit { index: word_index, text: w.text.clone(), original: w.text.clone(), focus: true, fresh: true, seen: false });
+                } else if resp.clicked() {
+                    out.extend(click_actions(env.track, &env.tr.words, word_index, env.anchor, env.shift));
                 }
             }
         });
@@ -1000,6 +1054,37 @@ fn speaker_editor(ui: &mut Ui, env: &RowEnv, editing: &mut Option<SpeakerEdit>, 
         let name = if ed.text.trim() == default_label { String::new() } else { ed.text.clone() };
         out.push(Action::Rename { track: env.track, speaker: ed.speaker, name });
         *editing = None;
+    }
+}
+
+/// The inline word field in a word's place: Enter (or clicking away) keeps the correction, Esc drops
+/// it. An empty or unchanged value dispatches nothing — the word is left as it was.
+fn word_editor(ui: &mut Ui, env: &RowEnv, word_editing: &mut Option<WordEdit>, out: &mut Vec<Action>) {
+    let Some(ed) = word_editing.as_mut() else { return };
+    let id = ui.id().with(("word_edit", ed.index));
+    // Wide enough for the current text, so correcting a word does not jump the layout about.
+    let width = (ed.text.chars().count() as f32 * WORD_SIZE * 0.62 + 16.0).clamp(48.0, 240.0);
+    let field = egui::TextEdit::singleline(&mut ed.text).id(id).font(regular(WORD_SIZE)).char_limit(128).desired_width(width);
+    let resp = ui.add(field);
+    ed.seen = true;
+    if ed.focus {
+        ed.focus = false;
+        resp.request_focus();
+        let end = egui::text::CCursor::new(ed.text.chars().count());
+        let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+        egui::TextEdit::store_state(ui.ctx(), id, state);
+    }
+    let escaped = ui.input(|i| i.key_pressed(Key::Escape));
+    if escaped {
+        *word_editing = None;
+    } else if resp.lost_focus() {
+        // Normalise as the command would, so an unchanged or blank value dispatches nothing.
+        let normalized: String = ed.text.trim().chars().take(128).collect();
+        if !normalized.is_empty() && normalized != ed.original {
+            out.push(Action::EditWord { track: env.track, index: ed.index, text: ed.text.clone() });
+        }
+        *word_editing = None;
     }
 }
 

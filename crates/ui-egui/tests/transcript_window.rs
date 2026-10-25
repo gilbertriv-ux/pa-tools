@@ -327,6 +327,108 @@ fn escape_leaves_the_name_alone() {
     assert!(rig.find("Speaker 0").is_some(), "the badge is back: {:?}", rig.texts());
 }
 
+/// Double-clicks whatever the rig has at `at` (press-release twice), the way a person opens an
+/// inline editor.
+fn double_click(rig: &mut Rig, at: Pos2) {
+    for pressed in [true, false, true, false] {
+        rig.button(at, pressed);
+    }
+    rig.frames(3);
+}
+
+#[test]
+fn double_clicking_a_word_opens_an_editor_and_enter_commits_the_correction() {
+    let mut rig = Rig::new();
+    let track = store(&mut rig, 120);
+    open(&mut rig);
+    let steps = rig.app.engine.undo_history().len();
+    // The editor opens seeded with the word (select-all on open), so typing replaces it.
+    let at = rig.at("w0003");
+    double_click(&mut rig, at);
+    rig.frame(vec![Event::Text("corrected".into())]);
+    rig.frames(1);
+    rig.key(egui::Key::Enter);
+    rig.frames(3);
+    assert_eq!(rig.app.engine.session().transcript(track).unwrap().words[3].text, "corrected", "{:?}", rig.texts());
+    assert!(rig.find("corrected").is_some(), "the displayed word updates");
+    assert!(rig.find("w0003").is_none(), "the old text is gone");
+    assert_eq!(rig.app.engine.undo_label(), Some("Edit Word"), "stored through track.edit_word");
+    assert_eq!(rig.app.engine.undo_history().len(), steps + 1, "one undo step");
+    // Undo brings the original word back.
+    assert!(rig.app.engine.undo());
+    assert_eq!(rig.app.engine.session().transcript(track).unwrap().words[3].text, "w0003");
+}
+
+#[test]
+fn escape_leaves_a_word_as_it_was() {
+    let mut rig = Rig::new();
+    let track = store(&mut rig, 120);
+    open(&mut rig);
+    let steps = rig.app.engine.undo_history().len();
+    let at = rig.at("w0003");
+    double_click(&mut rig, at);
+    rig.frame(vec![Event::Text("nope".into())]);
+    rig.key(egui::Key::Escape);
+    rig.frames(3);
+    assert_eq!(rig.app.engine.session().transcript(track).unwrap().words[3].text, "w0003");
+    assert!(rig.find("w0003").is_some(), "the word is back: {:?}", rig.texts());
+    assert_eq!(rig.app.engine.undo_history().len(), steps, "Escape dispatches nothing");
+}
+
+#[test]
+fn committing_an_unchanged_word_dispatches_nothing() {
+    let mut rig = Rig::new();
+    let track = store(&mut rig, 120);
+    open(&mut rig);
+    let steps = rig.app.engine.undo_history().len();
+    // Open and commit with Enter without typing: nothing changed, so no command runs.
+    let at = rig.at("w0003");
+    double_click(&mut rig, at);
+    rig.key(egui::Key::Enter);
+    rig.frames(3);
+    assert_eq!(rig.app.engine.session().transcript(track).unwrap().words[3].text, "w0003");
+    assert_eq!(rig.app.engine.undo_history().len(), steps, "an unchanged commit adds no undo step");
+}
+
+#[test]
+fn committing_an_empty_word_leaves_the_word() {
+    let mut rig = Rig::new();
+    let track = store(&mut rig, 120);
+    open(&mut rig);
+    let steps = rig.app.engine.undo_history().len();
+    // Clear the field to whitespace, then commit: a word is never blanked, so the text stays.
+    let at = rig.at("w0003");
+    double_click(&mut rig, at);
+    rig.frame(vec![Event::Text("   ".into())]);
+    rig.key(egui::Key::Enter);
+    rig.frames(3);
+    assert_eq!(rig.app.engine.session().transcript(track).unwrap().words[3].text, "w0003", "an empty value leaves the word");
+    assert_eq!(rig.app.engine.undo_history().len(), steps, "no undo step");
+}
+
+#[test]
+fn single_click_still_seeks_and_shift_click_still_selects_with_word_editing_present() {
+    // A regression guard: adding double-click-to-edit must not break click-to-seek or shift-select.
+    let mut rig = Rig::new();
+    let track = store(&mut rig, 300);
+    open(&mut rig);
+    rig.app.run("transport.locate", json!({"at": 0})).unwrap();
+    rig.frames(2);
+
+    let at = rig.at("w0003");
+    rig.click(at);
+    assert_eq!(rig.app.position(), 3 * 14_400, "a single click still seeks to the word's start");
+    assert!(rig.app.engine.session().transcript(track).unwrap().words[3].text == "w0003", "and it opened no editor: the word is unchanged");
+
+    rig.modifiers = Modifiers::SHIFT;
+    let at = rig.at("w0006");
+    rig.click(at);
+    rig.modifiers = Modifiers::NONE;
+    let s = &rig.app.engine.session().edit;
+    assert_eq!((s.selection.start, s.selection.end), (3 * 14_400, 6 * 14_400 + 9_600), "shift-click still selects the run");
+    assert_eq!(s.selected_tracks, vec![track]);
+}
+
 #[test]
 fn a_missing_model_is_reported_and_nothing_is_stored() {
     let mut rig = Rig::new();
