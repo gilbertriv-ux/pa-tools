@@ -133,8 +133,8 @@ fi
 # Licence files for distribution: the .app itself must carry them, not only the CLI zip.
 copy_docs "$APP/Contents/Resources"
 # Whisper model weights licence, beside the bundled weights (openai/whisper-* is MIT).
-if [ -d "$APP/Contents/Resources/models" ]; then
-  cat > "$APP/Contents/Resources/models/WHISPER-LICENSE.txt" <<'WL'
+if [ -d "$APP/Contents/Resources/models/whisper-base" ]; then
+  cat > "$APP/Contents/Resources/models/whisper-base/WHISPER-LICENSE.txt" <<'WL'
 Whisper model weights (openai/whisper-*)
 Copyright (c) 2022 OpenAI
 Licensed under the MIT License: https://github.com/openai/whisper/blob/main/LICENSE
