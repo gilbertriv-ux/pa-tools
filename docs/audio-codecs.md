@@ -1,15 +1,17 @@
 # Audio codecs
 
-> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** major (created: native Ogg Opus and AAC export crates for G-21)
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (created: native Ogg Opus and AAC export crates for G-21)
 
 What `crates/opus` (package `soundcraft-opus`) and `crates/aac` (package `soundcraft-aac`) can write, which
 of them ship, and why AAC is compiled out of shipped builds. For the format table see
 [`file-format-parity.md`](file-format-parity.md); for what is still missing see G-21 in [`gaps.md`](gaps.md).
 For the video side, see `docs/video-codecs.md` (added with the video decoders, G-17).
 
-**Status.** These are crates, tested on their own. Bounce, the CLI and the control channel do not call them
-yet: that wiring is a later lane (see "Wiring" below). Nothing in `crates/engine`, `crates/mix`,
-`crates/ui-egui` or `crates/cli` changed.
+**Status (2026-10-30 working patch; not compiled here).** Ogg Opus is connected to the existing
+`Bounce` job, `file.bounce_mix`, CLI `--bounce mix.opus` / `--cmd`, and control commands.
+AAC remains disabled by default and application export requests return an unsupported error.
+Desktop format-picker and packaging changes are not included. The earlier codec-only CI results
+do not validate this integration patch.
 
 ## What exports
 
@@ -197,18 +199,34 @@ Against hostile input and the never-crash rule (`AGENTS.md`):
 - `RangeDecoder::uint` returns 0 for `ft < 2` in debug and release alike (an empty range also sets the decoder's
   error flag), instead of asserting.
 
-## Wiring (what the engine lane does later)
+## Ogg Opus wiring (working patch, verification pending)
 
-- Depend on the crates; take `soundcraft-aac` as an optional dependency behind an engine feature that
-  forwards `aac-encode`, off in shipped builds.
-- Add the bounce formats (Ogg Opus, M4A, ADTS) as commands with the usual params, using the streaming
-  writers for progress and cancel, and pass the product name from `crates/brand` as the Opus vendor string
-  and the `©too` tag.
-- Decide the bounce's limiter or clipping policy (the crates clamp, and count what they clamped).
-- Decide the channel layout for sessions wider than stereo (the crates take 1 or 2 channels).
-- Show the `Error::NotBuilt` message and offer another format.
-- Coordinate the format table with Phase 5 (`pa-formats`).
-- Fix the importer's edit-list and 88.2/96 kHz `.m4a` limits above before promising bounce-and-reimport.
+- `file.bounce_mix` infers Opus from `.opus`, or accepts `format: "opus"` and optional
+  `bitrate_bps` (total bitrate, default 128000). The existing range, bus source and normalization
+  parameters still apply. CLI `--bounce mix.opus` uses this command; custom parameters use `--cmd`.
+- `Bounce::new_opus` uses `OpusOggWriter` block by block, with the product name from the brand
+  crate as vendor. It retains both normalization passes, slice progress, temporary-file completion
+  and drop-to-cancel cleanup. Memory for interleaving is bounded by one render block.
+- Mono and stereo sources only. Wider layouts and any Opus `fold_down` request are unsupported;
+  no surround mapping or new downmix policy is introduced.
+- Existing optional peak normalization is unchanged. No limiter is added. The codec silences
+  non-finite samples and clamps finite samples beyond full scale. The command result reports
+  `clipped_samples` and `non_finite_samples`; levels describe the rendered signal before codec
+  sanitization and lossy encoding. An encoder packet-budget overflow fails before publication.
+- Control `engine.execute` remains synchronous. For responsive progress/cancel, send
+  `bounce.start` with the same bounce parameters, poll `bounce.status`, and use `bounce.cancel`.
+  These control methods drive the application's existing frame-based bounce job. Status returns
+  `running`, plus `progress` and `path` while active, or the application status string when inactive;
+  it is not a persistent job history. CLI headless bounce remains synchronous and has no new
+  graceful signal-cancellation or progress flags in this patch.
+- AAC is neither added as an engine dependency nor enabled by an application feature.
+  `.aac`, `.m4a` and `format: "adts"` requests return "AAC export is not included in this build".
+- Regression tests cover byte equality against one-shot encoding for mono/stereo and normalization,
+  progress, dropped-job cancellation, unsupported layouts/fold-down/bitrates, command dispatch,
+  CLI export/AAC rejection and control cancellation. They have not run in this environment:
+  `cargo xtask ci` cannot start because Cargo is not installed.
+- Remaining: compile/fmt/clippy/tests and platform verification, UI format picker, release packaging,
+  AAC integration, MP3, Opus import and AAC importer timing/rate limitations.
 
 ## Later: dedupe
 
@@ -227,3 +245,5 @@ other copy. Until then a fix to an MP4 box has to be made twice.
 |---|---|---|
 | 2026-10-23 | major | Created: Ogg Opus (ships) and AAC `.m4a` / ADTS (feature `aac-encode`, off in shipped builds) export crates for G-21, with limits, timing, measurements, patent posture and provenance |
 | 2026-10-23 | minor | Review follow-ups: dead `video-codecs.md` link made plain text, `.m4a` writer memory stated accurately, "Later: dedupe" note for the two ISOBMFF copies, `rayon` does not imply `aac-encode`, Opus frame-overflow count |
+
+| 2026-10-30 | minor | Working Opus bounce/CLI/control integration patch; regression tests added, execution blocked by absent Rust toolchain |

@@ -103,6 +103,31 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
                 Err(e) => err(e),
             }
         }
+        "bounce.start" => {
+            if app.bounce.is_some() {
+                err("A bounce is already running")
+            } else {
+                app.capture_plugin_states();
+                match soundcraft_engine::cmd::bounce_job(&app.engine, p) {
+                    Ok(job) => {
+                        app.bounce = Some(job);
+                        ok(json!({"running": true}))
+                    }
+                    Err(e) => err(e),
+                }
+            }
+        }
+        "bounce.status" => ok(match &app.bounce {
+            Some(job) => json!({"running": true, "progress": job.progress(), "path": job.path()}),
+            None => json!({"running": false, "status": app.ui.status}),
+        }),
+        "bounce.cancel" => {
+            let cancelled = app.bounce.take().is_some();
+            if cancelled {
+                app.ui.status = "Bounce cancelled".into();
+            }
+            ok(json!({"cancelled": cancelled}))
+        }
         "engine.commands" => {
             let mut list = match app.engine.execute("engine.commands", p) {
                 Ok(v) => v,
@@ -344,5 +369,38 @@ mod tests {
         assert_eq!(super::base64(b"Man"), "TWFu");
         assert_eq!(super::base64(b"Ma"), "TWE=");
         assert_eq!(super::base64(b"M"), "TQ==");
+    }
+}
+
+#[cfg(test)]
+mod opus_bounce_tests {
+    use super::*;
+
+    #[test]
+    fn control_bounce_progress_and_cancel_keep_previous_file() {
+        let dir = std::env::temp_dir().join(format!("pa-control-opus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mix.opus");
+        std::fs::write(&path, b"old").unwrap();
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, crate::Services::default());
+        let ctx = egui::Context::default();
+        let request = |app: &mut SoundApp, method: &str, params: Value| {
+            let (req, _reply) = ControlRequest::new(method, params);
+            handle(app, &ctx, &req).unwrap()
+        };
+        let started = request(&mut app, "bounce.start", json!({"path":path, "start":0, "end":48000}));
+        assert_eq!(started["ok"], true);
+        assert_eq!(started["result"]["running"], true);
+        let job = app.bounce.as_mut().unwrap();
+        job.step(|| false).unwrap();
+        assert!(job.progress() > 0.0 && job.progress() < 1.0);
+        let status = request(&mut app, "bounce.status", json!({}));
+        assert_eq!(status["result"]["running"], true);
+        assert!(status["result"]["progress"].as_f64().unwrap() > 0.0);
+        request(&mut app, "bounce.cancel", json!({}));
+        assert!(app.bounce.is_none());
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** trivial (mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pa Tools is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -179,3 +179,14 @@ mutated and truncated movies. Field reports from the first public week are track
 | 2026-10-10 | major | Rewritten to the progress-docs standard: stage alpha (re-normalized the same day), two numbers (breadth ~70 %, ready ~40 %), dimension/feature/language tables, hours re-calibrated; area table moved to docs/target-app-parity.md, milestones to docs/roadmap.md |
 | 2026-10-07 | major | Menu parity 94 %, ~65 % estimated feature parity, alpha list |
 | 2026-10-06 | minor | Alpha and parity estimates |
+
+## 2026-10-30 Opus integration working patch
+
+Ogg Opus now has source wiring through the existing Bounce job and `file.bounce_mix`,
+CLI `--bounce mix.opus`, and control `bounce.start` / `bounce.status` / `bounce.cancel`.
+Only mono/stereo sources are accepted; AAC stays disabled. Compilation and runtime verification
+are pending because this environment has no Rust/Cargo toolchain. Desktop picker and release
+packaging are unchanged. Earlier codec-only CI is not evidence for this patch.
+See [audio-codecs.md](docs/audio-codecs.md) for behavior, tests and remaining limitations.
+
+Revision: 2026-10-30 — added unverified Opus integration status; no readiness estimates changed.

@@ -105,3 +105,14 @@ A center `move` can include `before` (panel ID or null to append) for tab order.
 The equivalent `{"action": ...}` form accepts a serialized shared docking action;
 this is also the form emitted by the renderer. Protected-canvas and app-specific panel
 rules apply equally to both forms.
+
+## 2026-10-30 Opus integration working patch
+
+Ogg Opus now has source wiring through the existing Bounce job and `file.bounce_mix`,
+CLI `--bounce mix.opus`, and control `bounce.start` / `bounce.status` / `bounce.cancel`.
+Only mono/stereo sources are accepted; AAC stays disabled. Compilation and runtime verification
+are pending because this environment has no Rust/Cargo toolchain. Desktop picker and release
+packaging are unchanged. Earlier codec-only CI is not evidence for this patch.
+See [audio-codecs.md](audio-codecs.md) for behavior, tests and remaining limitations.
+
+Revision: 2026-10-30 — added unverified Opus integration status; no readiness estimates changed.

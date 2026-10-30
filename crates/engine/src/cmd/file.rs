@@ -84,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 crate::io::import_video_bytes(e, &path, bytes, at)
             }
         ),
-        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo}", always, bounce),
+        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac|opus, bitrate_bps?: 128000, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo}", always, bounce),
         cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, fold_down?: stereo}", has_tracks, |e, p| {
             let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
             let r = range_param(e, "file.bounce_stems", p)?;
@@ -291,6 +291,8 @@ fn bounce(e: &mut Engine, p: &Value) -> Result<Value> {
         "peak_db": done.peak_db,
         "lufs": done.lufs,
         "true_peak_db": done.true_peak_db,
+        "clipped_samples": done.clipped_samples,
+        "non_finite_samples": done.non_finite_samples,
     }))
 }
 
@@ -301,6 +303,29 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
     let r = if r.is_empty() { soundcraft_time::Range::new(0, e.session().content_end().max(1)) } else { r };
     let ext = std::path::Path::new(&path).extension().and_then(|x| x.to_str()).unwrap_or("wav").to_ascii_lowercase();
     let format_name = str_param(p, "format").unwrap_or(ext.as_str());
+    if format_name == "opus" {
+        if p.get("fold_down").is_some() {
+            return Err(EngineError::Unsupported("Ogg Opus export does not define a surround fold-down policy".into()));
+        }
+        let bitrate = match p.get("bitrate_bps") {
+            None => 128_000,
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| bad("file.bounce_mix", "bitrate_bps must be an unsigned 32-bit integer"))?,
+        };
+        return crate::io::Bounce::new_opus(
+            e.session_arc(),
+            std::path::Path::new(&path),
+            r,
+            bounce_bus(e, p)?,
+            bool_or(p, "normalize", false),
+            bitrate,
+        );
+    }
+    if matches!(format_name, "aac" | "m4a" | "adts") {
+        return Err(EngineError::Unsupported("AAC export is not included in this build".into()));
+    }
     let format = soundcraft_audio_io::encode_format_for(format_name).ok_or_else(|| {
         bad("file.bounce_mix", format!("cannot write `{format_name}` files (supported: {})", soundcraft_audio_io::ENCODE_EXTENSIONS))
     })?;

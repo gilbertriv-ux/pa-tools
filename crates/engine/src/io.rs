@@ -391,7 +391,8 @@ pub struct Bounce {
     gain: f32,
     peak: f32,
     meter: soundcraft_dsp::meter::LoudnessMeter,
-    enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
+    enc: Option<BounceEncoder>,
+    opus_stats: soundcraft_opus::Stats,
 }
 
 /// A finished bounce: the size of its file and its levels.
@@ -401,6 +402,8 @@ pub struct Bounced {
     pub peak_db: f32,
     pub lufs: f32,
     pub true_peak_db: f32,
+    pub clipped_samples: u64,
+    pub non_finite_samples: u64,
 }
 
 impl Bounce {
@@ -416,6 +419,25 @@ impl Bounce {
         normalize: bool,
         fold_stereo: bool,
     ) -> Result<Bounce> {
+        Self::new_encoded(s, path, r, opts, bus, normalize, fold_stereo, None)
+    }
+
+    /// Native Ogg Opus; only mono/stereo sources, with no implicit surround mapping.
+    pub fn new_opus(s: Arc<Session>, path: &Path, r: Range, bus: Option<BusId>, normalize: bool, bitrate_bps: u32) -> Result<Bounce> {
+        Self::new_encoded(s, path, r, &EncodeOptions::default(), bus, normalize, false, Some(bitrate_bps))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_encoded(
+        s: Arc<Session>,
+        path: &Path,
+        r: Range,
+        opts: &EncodeOptions,
+        bus: Option<BusId>,
+        normalize: bool,
+        fold_stereo: bool,
+        opus: Option<u32>,
+    ) -> Result<Bounce> {
         if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
             return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
         }
@@ -424,14 +446,36 @@ impl Bounce {
         let part = path.with_file_name(format!("{name}.part"));
         crate::file_access::check_write(path).map_err(EngineError::Io)?;
         crate::file_access::check_write(&part).map_err(EngineError::Io)?;
-        let enc = (|| -> std::result::Result<_, soundcraft_audio_io::AudioError> {
-            let enc = soundcraft_audio_io::FileEncoder::new(Out::create(&part)?, opts, channels, s.sample_rate.hz(), Some(fmt.channel_mask()))?;
-            enc.check_room(u64::try_from(r.len()).unwrap_or(0))?;
-            Ok(enc)
+        if opus.is_some() && !(1..=2).contains(&channels) {
+            return Err(EngineError::Unsupported("Ogg Opus export supports mono and stereo sources only".into()));
+        }
+        let enc = (|| -> Result<BounceEncoder> {
+            if let Some(bitrate) = opus {
+                let mut options = soundcraft_opus::OpusOptions::new(bitrate);
+                options.vendor = soundcraft_brand::APP_NAME.into();
+                let writer = soundcraft_opus::OpusOggWriter::new(
+                    Out::create(&part).map_err(|e| EngineError::Io(e.to_string()))?,
+                    channels as u16,
+                    s.sample_rate.hz(),
+                    &options,
+                )
+                .map_err(|e| EngineError::Io(e.to_string()))?;
+                Ok(BounceEncoder::Opus(Box::new(writer)))
+            } else {
+                let enc = soundcraft_audio_io::FileEncoder::new(
+                    Out::create(&part).map_err(|e| EngineError::Io(e.to_string()))?,
+                    opts,
+                    channels,
+                    s.sample_rate.hz(),
+                    Some(fmt.channel_mask()),
+                )
+                .map_err(|e| EngineError::Io(e.to_string()))?;
+                enc.check_room(u64::try_from(r.len()).unwrap_or(0)).map_err(|e| EngineError::Io(e.to_string()))?;
+                Ok(BounceEncoder::Pcm(Box::new(enc)))
+            }
         })()
-        .map_err(|err| {
+        .inspect_err(|_| {
             let _ = std::fs::remove_file(&part);
-            EngineError::Io(format!("{}: {err}", path.display()))
         })?;
         let render = soundcraft_mix::RangeRender::new(&s, bus, r, 1024);
         let meter = soundcraft_dsp::meter::LoudnessMeter::new(s.sample_rate.as_f64() as f32, channels);
@@ -451,6 +495,7 @@ impl Bounce {
             peak: 0.0,
             meter,
             enc: Some(enc),
+            opus_stats: soundcraft_opus::Stats::default(),
         })
     }
 
@@ -484,7 +529,7 @@ impl Bounce {
                     if !self.measuring {
                         self.meter.process(&self.block, n);
                         if let Some(enc) = &mut self.enc {
-                            enc.write(&self.block, n).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
+                            enc.write(&self.block, n)?;
                         }
                     }
                 }
@@ -514,7 +559,11 @@ impl Bounce {
 
     fn finish(&mut self) -> Result<Bounced> {
         let bytes = match self.enc.take() {
-            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?.complete(&self.part, &self.path)?,
+            Some(enc) => {
+                let (out, stats) = enc.finish()?;
+                self.opus_stats = stats;
+                out.complete(&self.part, &self.path)?
+            }
             None => 0,
         };
         Ok(Bounced {
@@ -522,6 +571,8 @@ impl Bounce {
             peak_db: soundcraft_dsp::gain_to_db(self.peak),
             lufs: self.meter.integrated_lufs(),
             true_peak_db: self.meter.true_peak_db(),
+            clipped_samples: self.opus_stats.clipped,
+            non_finite_samples: self.opus_stats.non_finite,
         })
     }
 }
@@ -531,6 +582,41 @@ impl Drop for Bounce {
     fn drop(&mut self) {
         drop(self.enc.take());
         let _ = std::fs::remove_file(&self.part);
+    }
+}
+
+enum BounceEncoder {
+    Pcm(Box<soundcraft_audio_io::FileEncoder<Out>>),
+    Opus(Box<soundcraft_opus::OpusOggWriter<Out>>),
+}
+
+impl BounceEncoder {
+    fn write(&mut self, block: &[Vec<f32>], n: usize) -> Result<()> {
+        match self {
+            Self::Pcm(enc) => enc.write(block, n).map_err(|e| EngineError::Io(e.to_string())),
+            Self::Opus(enc) => {
+                let mut samples = Vec::with_capacity(n.saturating_mul(block.len()));
+                for frame in 0..n {
+                    for channel in block {
+                        samples.push(channel.get(frame).copied().unwrap_or(0.0));
+                    }
+                }
+                enc.write_interleaved(&samples).map_err(|e| EngineError::Io(e.to_string()))
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(Out, soundcraft_opus::Stats)> {
+        match self {
+            Self::Pcm(enc) => (*enc).finish().map(|out| (out, soundcraft_opus::Stats::default())).map_err(|e| EngineError::Io(e.to_string())),
+            Self::Opus(enc) => {
+                let (out, stats) = (*enc).finish().map_err(|e| EngineError::Io(e.to_string()))?;
+                if stats.frame_overflows != 0 {
+                    return Err(EngineError::Io("Opus encoder exceeded its packet budget".into()));
+                }
+                Ok((out, stats))
+            }
+        }
     }
 }
 

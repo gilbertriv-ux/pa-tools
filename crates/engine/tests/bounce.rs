@@ -85,3 +85,77 @@ fn dropping_an_unfinished_bounce_cancels_it_and_keeps_the_old_file() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn opus_bounce_matches_codec_output_for_mono_stereo_and_normalization() {
+    let mut e = soundcraft_engine::demo::demo_engine();
+    let mono = e.session_mut().add_bus("Opus Mono", soundcraft_model::ChannelFormat::Mono);
+    let dir = scratch("opus-exact");
+    let path = dir.join("Mix.opus");
+    let r = Range::new(7, 4807);
+    for bus in [None, Some(mono)] {
+        for normalize in [false, true] {
+            let mut mix = match bus {
+                Some(id) => soundcraft_mix::render_bus(e.session(), id, r, 1024),
+                None => soundcraft_mix::render_range(e.session(), r, 1024),
+            };
+            if normalize {
+                soundcraft_dsp::offline::normalize(&mut mix, -0.1, false);
+            }
+            let samples: Vec<f32> = (0..r.len() as usize).flat_map(|i| mix.iter().map(move |c| c[i])).collect();
+            let mut options = soundcraft_opus::OpusOptions::new(128_000);
+            options.vendor = soundcraft_brand::APP_NAME.into();
+            let (expected, stats) =
+                soundcraft_opus::encode_opus_ogg_with(&samples, mix.len() as u16, e.session().sample_rate.hz(), &options).unwrap();
+            let mut job = Bounce::new_opus(e.session_arc(), &path, r, bus, normalize, 128_000).unwrap();
+            let mut previous = 0.0;
+            let done = loop {
+                if let Some(done) = job.step(|| false).unwrap() {
+                    break done;
+                }
+                assert!(job.progress() >= previous && job.progress() <= 1.0);
+                previous = job.progress();
+            };
+            assert_eq!(job.progress(), 1.0);
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(done.bytes, expected.len() as u64);
+            assert_eq!(done.clipped_samples, stats.clipped);
+            assert_eq!(done.non_finite_samples, stats.non_finite);
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn opus_commands_validate_and_cancel_without_replacing_destination() {
+    use serde_json::json;
+    let mut e = soundcraft_engine::demo::demo_engine();
+    e.session_mut().add_bus("Wide", soundcraft_model::ChannelFormat::Surround51);
+    let dir = scratch("opus-errors");
+    let path = dir.join("Mix.opus");
+    std::fs::write(&path, b"old").unwrap();
+    for extra in [
+        json!({"source":"Wide"}),
+        json!({"bitrate_bps":0}),
+        json!({"bitrate_bps":-1}),
+        json!({"bitrate_bps":4294967296u64}),
+        json!({"fold_down":"stereo"}),
+        json!({"format":"m4a"}),
+    ] {
+        let mut p = json!({"path":path, "start":0, "end":4800});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert!(soundcraft_engine::cmd::bounce_job(&e, &p).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+    let p = json!({"path":path, "start":0, "end":4800});
+    let mut job = soundcraft_engine::cmd::bounce_job(&e, &p).unwrap();
+    assert!(job.step(|| false).unwrap().is_none());
+    drop(job);
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    let result = e.execute("file.bounce_mix", &p).unwrap();
+    assert!(result["bytes"].as_u64().unwrap() > 0);
+    assert!(std::fs::read(&path).unwrap().starts_with(b"OggS"));
+    let _ = std::fs::remove_dir_all(dir);
+}

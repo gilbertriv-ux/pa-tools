@@ -138,3 +138,18 @@ fn usage_lists_the_root_flags() {
     let help = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(help.contains("--automation-read-root DIR") && help.contains("--automation-write-root DIR"), "{help}");
 }
+
+#[test]
+fn cli_bounces_native_opus_and_refuses_aac() {
+    let dir = tmpdir("opus");
+    let path = dir.join("mix.opus");
+    let out = run(&["run", "--demo", "--bounce", path.to_str().unwrap(), "--start", "0", "--end", "0.1"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read(path).unwrap().starts_with(b"OggS"));
+    let aac = dir.join("mix.m4a");
+    let out = run(&["run", "--demo", "--bounce", aac.to_str().unwrap(), "--end", "0.1"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("AAC export is not included"));
+    assert!(!aac.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (Audio: Ogg Opus and AAC/M4A write written as crates, not yet in Bounce; previously trivial: WAV: empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (Audio: Ogg Opus and AAC/M4A write written as crates, not yet in Bounce; previously trivial: WAV: empty data chunk with trailing metadata (#466)) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -85,3 +85,14 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | 2026-10-13 | trivial | WAV: empty data chunk with trailing metadata (#466) |
 | 2026-10-13 | minor | Fade curvature round-trips in sessions with a zero default for older files. Format version and readiness estimate unchanged |
 | 2026-10-10 | major | Created: format inventory against Pro Tools 2026.4.1's declared document types and import/bounce options |
+
+## 2026-10-30 Opus integration working patch
+
+Ogg Opus now has source wiring through the existing Bounce job and `file.bounce_mix`,
+CLI `--bounce mix.opus`, and control `bounce.start` / `bounce.status` / `bounce.cancel`.
+Only mono/stereo sources are accepted; AAC stays disabled. Compilation and runtime verification
+are pending because this environment has no Rust/Cargo toolchain. Desktop picker and release
+packaging are unchanged. Earlier codec-only CI is not evidence for this patch.
+See [audio-codecs.md](audio-codecs.md) for behavior, tests and remaining limitations.
+
+Revision: 2026-10-30 — added unverified Opus integration status; no readiness estimates changed.

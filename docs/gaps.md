@@ -1,6 +1,6 @@
 # Where Pa Tools falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-23 · **Last updated:** 2026-10-23 · **Change:** minor (G-21 shrunk: Ogg Opus and AAC export crates landed, not yet wired to Bounce; previously trivial: G-04 mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (G-21 shrunk: Ogg Opus and AAC export crates landed, not yet wired to Bounce; previously trivial: G-04 mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in Pa Tools. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -232,3 +232,14 @@ missing. Out of scope unless the owner decides otherwise.
 | 2026-10-12 | minor | G-01 shrunk: audio device, rate and buffer choice; opt-in ASIO |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
 | 2026-10-10 | major | Created from the full re-measure against Pro Tools Ultimate 2026.4.1: 22 ranked gaps with evidence and estimates |
+
+## 2026-10-30 Opus integration working patch
+
+Ogg Opus now has source wiring through the existing Bounce job and `file.bounce_mix`,
+CLI `--bounce mix.opus`, and control `bounce.start` / `bounce.status` / `bounce.cancel`.
+Only mono/stereo sources are accepted; AAC stays disabled. Compilation and runtime verification
+are pending because this environment has no Rust/Cargo toolchain. Desktop picker and release
+packaging are unchanged. Earlier codec-only CI is not evidence for this patch.
+See [audio-codecs.md](audio-codecs.md) for behavior, tests and remaining limitations.
+
+Revision: 2026-10-30 — added unverified Opus integration status; no readiness estimates changed.
